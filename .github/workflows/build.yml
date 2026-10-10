@@ -1,9 +1,11 @@
 # GitHub Actions：Windows 下用 Nuitka 编译 shunshu 成 standalone 目录。
 #
 # 触发方式：
-#   1. push 到 main 分支 → 跑测试 + 打包，产物上传到 Actions Artifacts
-#   2. push tag v*       → 跑测试 + 打包，自动创建 GitHub Release 并把 zip 挂上去
+#   1. push 到 main 分支 → 跑测试 + 打包 + 按 pyproject.toml 的版本号自动发布 Release
+#   2. push tag v*       → 同上，Release 挂在这个 tag 上
 #   3. 手动 dispatch      → 和 main 分支一样
+#
+# 也就是说：不需要在本地手动打 tag，改完代码把版本号往上推一次，Release 就跟着更新。
 #
 # 产物结构（folder 模式）：
 #   shunshu-{版本}-windows-amd64.zip
@@ -89,14 +91,28 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # ---------- Tag push 自动创建 Release ----------
-      - name: Create GitHub Release
+      # ---------- 发布标签：push main 用 pyproject 里的版本号，push tag 用 tag 名 ----------
+      - name: Resolve release tag
+        id: tag
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}" -like "refs/tags/v*") {
+            $name = "${{ github.ref_name }}"
+          } else {
+            $version = (Select-String -Path pyproject.toml -Pattern '^version = "(.+?)"').Matches.Groups[1].Value
+            $name = "v$version"
+          }
+          "name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Release tag: $name"
+
+      # ---------- 自动发布 Release（开源项目：每次 push 都要有可下载的 exe） ----------
+      # tag 不存在时 action-gh-release 会就地建 tag，不用本地手动打
+      - name: Publish GitHub Release
         id: create_release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Shunshu ${{ github.ref_name }}
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: Shunshu ${{ steps.tag.outputs.name }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

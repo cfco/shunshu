@@ -100,7 +100,9 @@ uv run shunshu
 
 ## 打包成 exe
 
-CI 在 `.github/workflows/build.yml`：push 到 `main` 用 Nuitka 编出 standalone 目录并上传 Artifacts，打 `v*` tag 额外把 zip 挂到 GitHub Release。同一个 `shunshu.exe` 兼任两件事——直接运行是起托盘，`shunshu.exe popup --payload <json>` 是主程序弹卡片时调的子命令（因此打包态判定要认 Nuitka 的 `__compiled__`，见 `notify.popup_command`）。编译参数以 workflow 里那条为准，本地跑同样的命令即可（需要先 `uv sync --group dev`）。
+不需要手动打包也不需要手动打 tag：CI（`.github/workflows/build.yml`）在每次 push 到 `main` 时都会跑测试、用 Nuitka 编出 standalone 目录，并按 `pyproject.toml` 里的版本号自动发布到 **Releases**（tag 不存在时由 CI 建）。所以发版动作就是「改版本号 + push」。手动打 `v*` tag 也能触发，用于补发某个版本。
+
+同一个 `shunshu.exe` 兼任两件事——直接运行是起托盘，`shunshu.exe popup --payload <json>` 是主程序弹卡片时调的子命令（因此打包态判定不能依赖 `sys.executable`，Nuitka 会把它伪造成一个不存在的 `python.exe`，见 `notify.popup_command`）。编译参数以 workflow 里那条为准，本地跑同样的命令即可（需要先 `uv sync --group dev`）。
 
 ## 设计与取舍
 
@@ -131,6 +133,7 @@ uv run pytest tests -q
 
 ## 变更记录
 
+- **0.6.3（2026-10-10）**：发版不再需要手动打 tag。CI 每次 push 到 `main` 都按 `pyproject.toml` 的版本号自动发布 Release（tag 缺失时由 action 就地创建），`v*` tag 触发保留用于补发。
 - **0.6.2（2026-10-10）**：编译版的卡片终于弹得出来。Nuitka 会把 `sys.executable` 伪造成产物目录下的 `python.exe`（**那个文件并不存在**，真实路径在 `sys.argv[0]`），于是 `Popen` 报 `WinError 2` 而被 `except OSError` 静默吞掉——托盘在跑、日志在写，就是没有卡片。现在打包态判定改成「argv[0] 是文件而 executable 不是」，起进程失败时把异常与实际命令写进 `alerts.log`，不再静默。已本地按 CI 同款参数编译并截图验证：启动检查卡正常弹出。
 - **0.6.1（2026-10-10）**：把 exe 真编出来跑通了。Nuitka 在 CI 非交互模式下会因「能否下载 Dependency Walker」默认答 no 而 FATAL，加 `--assume-yes-for-downloads`；入口改传包目录 `src/shunshu`（产物目录随之变成 `shunshu.dist`，CI 里 zip 那步的路径也跟着改）；`__main__.py` 被编译成顶层脚本后相对导入会 `ImportError`，加绝对导入兜底；打包态判定不再单靠 `sys.frozen`/`__compiled__`（Nuitka 只给入口模块注入），改用可执行文件名兜底，并加 `--no-deployment-flag=self-execution` 作为保险。
 - **0.6.0（2026-10-10）**：启动与打包态修好。`启动.bat` 改成纯 ASCII——之前被另存成 UTF-8 又在文件里 `chcp 65001`，cmd 按字节偏移续读 .bat 会跳歪，把注释碎片当命令执行（`'nshu' 不是内部或外部命令`），脚本其实一次都没跑起来；`run_forever()` 去掉重复的首轮，之前每次启动把所有站点连敲两遍；打包态判定补上 Nuitka 的 `__compiled__`（只认 PyInstaller 的 `sys.frozen` 会让 exe 弹不出卡片）；CI 的 `build.yml` 开头原本是 Python 三引号（YAML 解析不了，workflow 根本不会出现），改成 `#` 注释并给 Nuitka 带上 zhconv 词库；默认扫描间隔 30 分钟。
