@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -92,12 +93,16 @@ def spawn_card(payload: dict, index: int = 0, seconds: float = _CARD_SECONDS) ->
 
 
 def _is_compiled() -> bool:
-    """打包态判定：PyInstaller 设 `sys.frozen`，Nuitka 给每个模块注入 `__compiled__`。
+    """是否运行在打包出来的 exe 里。
 
-    两者都要认：只查 frozen 的话，Nuitka 编出来的 exe 会以为自己是源码态，
-    去拼 `[exe, "-m", "shunshu", "popup"]`，卡片就弹不出来。
+    PyInstaller 设 `sys.frozen`；Nuitka 只在入口模块注入 `__compiled__`，子模块里查不到
+    （实测编译版这里判 False，于是把卡片子进程拼成 `[exe, "-m", "shunshu", "popup"]`，
+    argparse 直接拒收，托盘的回执卡永远弹不出来）。所以再兜一层：`sys.executable`
+    不再是 python/pythonw 解释器本身，就说明已经在 exe 里了。
     """
-    return bool(getattr(sys, "frozen", False) or "__compiled__" in globals())
+    if getattr(sys, "frozen", False) or "__compiled__" in globals():
+        return True
+    return not os.path.basename(sys.executable).lower().startswith("python")
 
 
 def popup_command(payload: dict, index: int, seconds: float) -> list[str]:

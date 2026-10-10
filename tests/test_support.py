@@ -490,21 +490,34 @@ def test_a_failing_trust_store_hook_leaves_the_fetcher_working(monkeypatch):
     assert http.Fetcher("ua") is not None, "注入失败就退回 certifi，不能把抓取器一起弄挂"
 
 
-def test_popup_command_detects_nuitka_as_well_as_pyinstaller(monkeypatch):
-    """Nuitka 不设 sys.frozen，只认 frozen 的话编译版会把卡片子进程拼成 -m shunshu。"""
+def test_is_compiled_detects_the_exe_name(monkeypatch):
+    """Nuitka 不给子模块注入 __compiled__：判定要能靠可执行文件名兜底。"""
     import sys
 
     from shunshu import notify
 
-    monkeypatch.setitem(notify.__dict__, "__compiled__", object())
-    argv = notify.popup_command({"title": "t"}, 0, 12.0)
-    assert argv[:2] == [sys.executable, "popup"] and "-m" not in argv
-
-    monkeypatch.delitem(notify.__dict__, "__compiled__")
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setattr(sys, "executable", r"C:\py\pythonw.exe")
+    assert notify._is_compiled() is False
+    monkeypatch.setattr(sys, "executable", r"D:\shunshu\SHUNSHU.EXE")
+    assert notify._is_compiled() is True, "exe 名字大小写都要认"
+    monkeypatch.setattr(sys, "executable", r"C:\py\python.exe")
     monkeypatch.setattr(sys, "frozen", True, raising=False)
-    assert notify.popup_command({"title": "t"}, 0, 12.0)[:2] == [sys.executable, "popup"]
+    assert notify._is_compiled() is True, "PyInstaller 走 frozen 那条路"
+
+
+def test_popup_command_shape_follows_the_runtime(monkeypatch):
+    """源码态拼 -m shunshu，打包态拼 exe 子命令：拼错就永远弹不出卡片。"""
+    import sys
+
+    from shunshu import notify
 
     monkeypatch.delattr(sys, "frozen", raising=False)
-    source = notify.popup_command({"title": "t"}, 2, 12.0)
-    assert source[:4] == [sys.executable, "-m", "shunshu", "popup"]
-    assert source[source.index("--index") + 1] == "2"
+    monkeypatch.setattr(sys, "executable", r"D:\shunshu\shunshu.exe")
+    argv = notify.popup_command({"title": "t"}, 2, 12.0)
+    assert argv[:2] == [r"D:\shunshu\shunshu.exe", "popup"] and "-m" not in argv
+    assert argv[argv.index("--index") + 1] == "2"
+
+    monkeypatch.setattr(sys, "executable", r"C:\py\python.exe")
+    assert notify.popup_command({"title": "t"}, 0, 12.0)[:4] == \
+        [r"C:\py\python.exe", "-m", "shunshu", "popup"]

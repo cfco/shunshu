@@ -127,10 +127,11 @@ CI 在 `.github/workflows/build.yml`：push 到 `main` 用 Nuitka 编出 standal
 uv run pytest tests -q
 ```
 
-150 个用例，全用内存假站点（`tests/fixtures.py` 里的正常页/gbk 页/倒序页/分页页/广告堆页/跳板页/纯编号页），不联网、不弹真卡片也不起真 Tk 窗口（`tests/conftest.py` 里 autouse 把 `spawn_card` 换掉了，卡片点击逻辑用 `FakeRoot` 测）。代理相关的用例把 `Session.get` 换成假函数，因此也不真连代理。
+153 个用例，全用内存假站点（`tests/fixtures.py` 里的正常页/gbk 页/倒序页/分页页/广告堆页/跳板页/纯编号页），不联网、不弹真卡片也不起真 Tk 窗口（`tests/conftest.py` 里 autouse 把 `spawn_card` 换掉了，卡片点击逻辑用 `FakeRoot` 测）。代理相关的用例把 `Session.get` 换成假函数，因此也不真连代理。
 
 ## 变更记录
 
+- **0.6.1（2026-10-10）**：把 exe 真编出来跑通了。Nuitka 在 CI 非交互模式下会因「能否下载 Dependency Walker」默认答 no 而 FATAL，加 `--assume-yes-for-downloads`；入口改传包目录 `src/shunshu`（产物目录随之变成 `shunshu.dist`，CI 里 zip 那步的路径也跟着改）；`__main__.py` 被编译成顶层脚本后相对导入会 `ImportError`，加绝对导入兜底；打包态判定不再单靠 `sys.frozen`/`__compiled__`（Nuitka 只给入口模块注入），改用可执行文件名兜底，并加 `--no-deployment-flag=self-execution` 作为保险。
 - **0.6.0（2026-10-10）**：启动与打包态修好。`启动.bat` 改成纯 ASCII——之前被另存成 UTF-8 又在文件里 `chcp 65001`，cmd 按字节偏移续读 .bat 会跳歪，把注释碎片当命令执行（`'nshu' 不是内部或外部命令`），脚本其实一次都没跑起来；`run_forever()` 去掉重复的首轮，之前每次启动把所有站点连敲两遍；打包态判定补上 Nuitka 的 `__compiled__`（只认 PyInstaller 的 `sys.frozen` 会让 exe 弹不出卡片）；CI 的 `build.yml` 开头原本是 Python 三引号（YAML 解析不了，workflow 根本不会出现），改成 `#` 注释并给 Nuitka 带上 zhconv 词库；默认扫描间隔 30 分钟。
 - **0.5.0（2026-10-10）**：轮询与菜单收简。扫描间隔改成固定 5/10/30/60 分钟四选一，去掉「随机 3~10 分钟」与 ±15% 抖动；移除托盘的「暂停轮询」子菜单（要临时停手就用「暂停本书 / 暂停此源」）；目录正序还是倒序的判定阈值提成 `config.json` 的 `order_trend_threshold`（默认 0.6），不再写死在代码里。
 - **0.4.0（2026-10-10）**：拿真站跑出来的四个坑。① 只挂「下一页」的两页站以前永远看不到第二页——现在会跟着翻（只认同目录下的翻页链接）；② 「最新章节」改按目录排列取，站点把编号写乱时不猜编号；③ `notified_keys` 不再把还在目录里的章节忘掉（1600 章的书以前每轮都判「疑似重编号」，从此卡在 toc_reset）；刚开始多跟到一页时也不算重置。④ TLS 改用 Windows 系统证书库（新增 `truststore`），修掉「服务器少发中间证书」导致的 `CERTIFICATE_VERIFY_FAILED`——代理本来就是通的，卡的是证书链。书名显示也统一简体。

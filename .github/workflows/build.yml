@@ -49,21 +49,24 @@ jobs:
         run: uv run pytest tests/ -v
 
       # ---------- Nuitka 编译 ----------
-      # windows-latest 自带 MSVC，Nuitka 自动找到不需要 --zig
+      # --assume-yes-for-downloads：Nuitka 要用 Dependency Walker 分析扩展模块依赖，
+      # 会问「可以下载吗」，非交互模式下默认答 no 直接 FATAL
+      # 入口传包目录 src/shunshu 而不是 __main__.py：产物目录才是 shunshu.dist
       - name: Nuitka compile (standalone folder)
         run: |
           uv run python -m nuitka `
             --standalone `
+            --assume-yes-for-downloads `
             --windows-console-mode=disable `
             --enable-plugin=tk-inter `
             --include-package=shunshu `
             --include-package=pystray `
             --include-module=zhconv `
             --include-package-data=zhconv `
-            --include-package-data=certifi `
             --include-module=truststore `
             --output-dir=dist `
-            src/shunshu/__main__.py `
+            --no-deployment-flag=self-execution `
+            src/shunshu `
             --output-filename=shunshu.exe
 
       # ---------- 打包 zip ----------
@@ -71,7 +74,7 @@ jobs:
         shell: pwsh
         run: |
           $version = (Select-String -Path pyproject.toml -Pattern '^version = "(.+?)"').Matches.Groups[1].Value
-          $dir = "dist\__main__.dist"
+          $dir = "dist\shunshu.dist"
           $zip = "shunshu-$version-windows-amd64.zip"
           # 把 exe 提到根目录，_internal 放旁边，和 PyInstaller 产物结构一致
           Compress-Archive -Path "$dir\*" -DestinationPath $zip -CompressionLevel Optimal
