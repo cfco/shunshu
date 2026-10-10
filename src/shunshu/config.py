@@ -74,7 +74,7 @@ def data_dir() -> Path:
 
 @dataclass(slots=True)
 class Config:
-    poll_minutes: int = 5
+    poll_minutes: int = 30
     concurrency: int = 6
     same_host_delay_seconds: float = 2.0
     request_timeout_seconds: float = 15.0

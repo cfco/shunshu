@@ -517,6 +517,16 @@ def test_no_novels_round_is_harmless(app_state: AppState):
     assert app_state.startup_lines([])[0].startswith("书架为空")
 
 
+def test_run_forever_does_not_add_a_second_startup_round(app_state: AppState, monkeypatch):
+    """启动轮由托盘显式跑过，run_forever 不能再补一轮：那等于每次开机把所有站点连敲两遍。"""
+    rounds = []
+    monkeypatch.setattr(app_state, "run_round", lambda **kwargs: rounds.append(1) or [])
+    scheduler = Scheduler(app_state)
+    scheduler._stop.set()
+    scheduler.run_forever()
+    assert rounds == [], "进循环前不该先跑一轮"
+
+
 # ---------- 入口 ----------
 
 def test_cli_parser_defaults_to_run():

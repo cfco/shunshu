@@ -58,8 +58,11 @@ class Scheduler:
         return outcomes
 
     def run_forever(self) -> None:
-        """主循环：启动先跑一轮（force），之后按固定间隔循环。"""
-        self.run_once(force=True)
+        """主循环：按固定间隔一轮一轮跑。
+
+        启动那一轮由调用方（托盘）显式跑过并拿结果弹启动卡片，这里不能再补一轮，
+        否则每次开机都把书架里所有站点连敲两遍。
+        """
         while not self._stop.is_set():
             wait = self.next_wait_seconds()
             # _wake 用来响应「立即检查」的手动触发

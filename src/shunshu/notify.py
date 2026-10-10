@@ -91,8 +91,22 @@ def spawn_card(payload: dict, index: int = 0, seconds: float = _CARD_SECONDS) ->
     return code == 0
 
 
+def _is_compiled() -> bool:
+    """打包态判定：PyInstaller 设 `sys.frozen`，Nuitka 给每个模块注入 `__compiled__`。
+
+    两者都要认：只查 frozen 的话，Nuitka 编出来的 exe 会以为自己是源码态，
+    去拼 `[exe, "-m", "shunshu", "popup"]`，卡片就弹不出来。
+    """
+    return bool(getattr(sys, "frozen", False) or "__compiled__" in globals())
+
+
 def popup_command(payload: dict, index: int, seconds: float) -> list[str]:
-    head = [sys.executable, "popup"] if getattr(sys, "frozen", False) else [sys.executable, "-m", "shunshu", "popup"]
+    """构造拉起 popup 子进程的命令行。
+
+    源码态：python -m shunshu popup ...
+    打包态（Nuitka/PyInstaller）：shunshu.exe popup ...  ← 同一个 exe 通过子命令分流
+    """
+    head = [sys.executable, "popup"] if _is_compiled() else [sys.executable, "-m", "shunshu", "popup"]
     return [*head, "--payload", json.dumps(payload, ensure_ascii=False),
             "--index", str(index), "--seconds", f"{seconds:g}"]
 

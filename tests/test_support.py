@@ -279,9 +279,10 @@ def test_now_stamp_format():
 def test_config_defaults_written_on_first_load(tmp_path, monkeypatch):
     monkeypatch.setenv("SHUNSHU_DATA_DIR", str(tmp_path / "data"))
     cfg = load_config()
-    assert cfg.poll_minutes == 5 and cfg.notified_keys_keep == 500
+    assert cfg.poll_minutes == Config().poll_minutes and cfg.notified_keys_keep == 500
+    assert cfg.poll_minutes in (5, 10, 30, 60), "默认间隔得是托盘菜单里能选的那几个"
     saved = json.loads((tmp_path / "data" / "config.json").read_text(encoding="utf-8"))
-    assert saved["poll_minutes"] == 5
+    assert saved["poll_minutes"] == cfg.poll_minutes, "首轮写盘的默认值要和内存里一致"
     assert "加入书签" in saved["ad_exact_texts"]
 
 
@@ -487,3 +488,23 @@ def test_a_failing_trust_store_hook_leaves_the_fetcher_working(monkeypatch):
     monkeypatch.setattr(http, "_TRUST_STORE_DONE", False)
     monkeypatch.setitem(sys.modules, "truststore", SimpleNamespace(inject_into_ssl=boom))
     assert http.Fetcher("ua") is not None, "注入失败就退回 certifi，不能把抓取器一起弄挂"
+
+
+def test_popup_command_detects_nuitka_as_well_as_pyinstaller(monkeypatch):
+    """Nuitka 不设 sys.frozen，只认 frozen 的话编译版会把卡片子进程拼成 -m shunshu。"""
+    import sys
+
+    from shunshu import notify
+
+    monkeypatch.setitem(notify.__dict__, "__compiled__", object())
+    argv = notify.popup_command({"title": "t"}, 0, 12.0)
+    assert argv[:2] == [sys.executable, "popup"] and "-m" not in argv
+
+    monkeypatch.delitem(notify.__dict__, "__compiled__")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert notify.popup_command({"title": "t"}, 0, 12.0)[:2] == [sys.executable, "popup"]
+
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    source = notify.popup_command({"title": "t"}, 2, 12.0)
+    assert source[:4] == [sys.executable, "-m", "shunshu", "popup"]
+    assert source[source.index("--index") + 1] == "2"

@@ -1,9 +1,13 @@
 @echo off
-chcp 65001 >nul
 setlocal enableextensions
 cd /d "%~dp0"
 
-rem 顺手启动脚本：默认后台启动托盘常驻图标；debug 参数则前台运行方便排查异常
+rem shunshu launcher.
+rem Default: start the tray icon in the background, no console window.
+rem Debug:   run this file with the argument "debug" -> foreground, tracebacks stay visible.
+rem Keep this file ASCII-only. cmd re-reads a .bat by byte offset, so a mid-file
+rem "chcp 65001" combined with multi-byte text makes it resume at the wrong
+rem position and execute comment fragments as commands. Chinese docs: README.md.
 
 set "PYW=.venv\Scripts\pythonw.exe"
 set "PYEXE=.venv\Scripts\python.exe"
@@ -16,29 +20,29 @@ if errorlevel 1 exit /b 1
 
 :start
 start "" "%PYW%" -m shunshu run
-echo [shunshu] 后台启动完成，托盘图标即将出现。
-echo [shunshu] 右键托盘图标 - 退出
+echo [shunshu] started in background, the tray icon should appear shortly.
+echo [shunshu] to quit: right-click the tray icon, then exit.
 ping -n 4 127.0.0.1 >nul
 goto :eof
 
 :debug
 if not exist "%PYEXE%" call :prepare
 if errorlevel 1 exit /b 1
-echo [shunshu] 调试模式，前台运行
+echo [shunshu] debug mode, running in foreground; close this window to quit.
 "%PYEXE%" -m shunshu run
 goto :eof
 
 :prepare
 where uv >nul 2>nul
 if errorlevel 1 (
-    echo [shunshu] 没有 .venv 也没有 uv，请先安装 uv 后执行：uv sync
+    echo [shunshu] no .venv and no uv found. Install uv first, then run: uv sync
     pause
     exit /b 1
 )
-echo [shunshu] 正在准备虚拟环境并安装依赖 ...
+echo [shunshu] preparing the virtual environment, running uv sync ...
 uv sync
 if not exist "%PYW%" (
-    echo [shunshu] uv sync 之后仍然没有 %PYW%
+    echo [shunshu] still missing %PYW% after uv sync
     pause
     exit /b 1
 )
