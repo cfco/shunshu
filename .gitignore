@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 运行时数据与临时验证产物
+data/
+.tmp/
+.pytest_cache/
+cli.out
+dbg.utf8.out
