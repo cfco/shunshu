@@ -46,14 +46,23 @@ class Notifier:
         launch = _safe_url(url)
         payload = make_payload(title, lines=lines[:_CARD_LINES])
         self._record(title, lines, launch)
-        return spawn_card(payload) if self.enabled else False
+        return self._spawn(payload)
 
     # ---------- 内部 ----------
 
     def _present(self, payload: dict, record: list[str], index: int, url: str) -> bool:
         launch = _safe_url(url)
         self._record(payload["title"], record, launch)
-        return spawn_card(payload, index, _CARD_SECONDS) if self.enabled else False
+        return self._spawn(payload, index, _CARD_SECONDS)
+
+    def _spawn(self, payload: dict, index: int = 0, seconds: float = _CARD_SECONDS) -> bool:
+        """弹不出来时把原因补记一行：现场只有 alerts.log 一份东西可看。"""
+        if not self.enabled:
+            return False
+        if spawn_card(payload, index, seconds):
+            return True
+        self._record(f"{payload['title']} · 卡片没弹出", [LAST_SPAWN_ERROR or "原因未知"], "")
+        return False
 
     def _record(self, title: str, lines: list[str], url: str) -> None:
         if self.alerts_path is None:
@@ -74,21 +83,33 @@ def entry_rows(entries: list[ChapterEntry], read_keys: list[str] | None = None,
     return rows
 
 
+LAST_SPAWN_ERROR = ""
+
+
 def spawn_card(payload: dict, index: int = 0, seconds: float = _CARD_SECONDS) -> bool:
-    """拉起卡片进程；它活过了启动窗口就算弹出来了。"""
+    """拉起卡片进程；它活过了启动窗口就算弹出来了。
+
+    卡片是这工具唯一的反馈通道，起不来一定要留下原因，否则现场只能靠猜。
+    """
+    global LAST_SPAWN_ERROR
+    LAST_SPAWN_ERROR = ""
+    command = popup_command(payload, index, seconds)
     try:
         proc = subprocess.Popen(
-            popup_command(payload, index, seconds),
+            command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-    except OSError:
+    except OSError as exc:
+        LAST_SPAWN_ERROR = f"起进程失败 {type(exc).__name__}: {exc}（命令 {command[0]!r}）"
         return False
     try:
         code = proc.wait(timeout=_STARTUP_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
         return True
+    if code != 0:
+        LAST_SPAWN_ERROR = f"卡片进程秒退 exit={code}，命令 {command[1:3]}"
     return code == 0
 
 
@@ -105,13 +126,34 @@ def _is_compiled() -> bool:
     return not os.path.basename(sys.executable).lower().startswith("python")
 
 
+def _is_compiled() -> bool:
+    """是否运行在打包出来的 exe 里。
+
+    PyInstaller 设 `sys.frozen`。Nuitka 两件事都不按常理来：`__compiled__` 只注入入口
+    模块（子模块查不到），还把 `sys.executable` 伪造成产物目录下的 `python.exe`——那个
+    文件根本不存在，真实路径在 `sys.argv[0]`。所以判"exe 存在而解释器不存在"。
+    """
+    if getattr(sys, "frozen", False):
+        return True
+    invoked = sys.argv[0] if sys.argv else ""
+    return bool(invoked) and os.path.isfile(invoked) and not os.path.isfile(sys.executable or "")
+
+
+def _self_executable() -> str:
+    """打包态下拉起自己要用真正存在的可执行文件路径。"""
+    for path in (sys.argv[0] if sys.argv else "", sys.executable):
+        if path and os.path.isfile(path):
+            return os.path.abspath(path)
+    return sys.executable
+
+
 def popup_command(payload: dict, index: int, seconds: float) -> list[str]:
     """构造拉起 popup 子进程的命令行。
 
     源码态：python -m shunshu popup ...
     打包态（Nuitka/PyInstaller）：shunshu.exe popup ...  ← 同一个 exe 通过子命令分流
     """
-    head = [sys.executable, "popup"] if _is_compiled() else [sys.executable, "-m", "shunshu", "popup"]
+    head = [_self_executable(), "popup"] if _is_compiled() else [sys.executable, "-m", "shunshu", "popup"]
     return [*head, "--payload", json.dumps(payload, ensure_ascii=False),
             "--index", str(index), "--seconds", f"{seconds:g}"]
 

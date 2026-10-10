@@ -490,34 +490,63 @@ def test_a_failing_trust_store_hook_leaves_the_fetcher_working(monkeypatch):
     assert http.Fetcher("ua") is not None, "注入失败就退回 certifi，不能把抓取器一起弄挂"
 
 
-def test_is_compiled_detects_the_exe_name(monkeypatch):
-    """Nuitka 不给子模块注入 __compiled__：判定要能靠可执行文件名兜底。"""
+def test_is_compiled_reads_the_nuitka_layout(monkeypatch, tmp_path):
+    """Nuitka 把 sys.executable 伪造成目录里并不存在的 python.exe：判定要看文件在不在。"""
     import sys
 
     from shunshu import notify
 
+    exe = tmp_path / "shunshu.exe"
+    exe.write_bytes(b"")
     monkeypatch.delattr(sys, "frozen", raising=False)
-    monkeypatch.setattr(sys, "executable", r"C:\py\pythonw.exe")
-    assert notify._is_compiled() is False
-    monkeypatch.setattr(sys, "executable", r"D:\shunshu\SHUNSHU.EXE")
-    assert notify._is_compiled() is True, "exe 名字大小写都要认"
-    monkeypatch.setattr(sys, "executable", r"C:\py\python.exe")
-    monkeypatch.setattr(sys, "frozen", True, raising=False)
-    assert notify._is_compiled() is True, "PyInstaller 走 frozen 那条路"
+    monkeypatch.setattr(sys, "argv", [str(exe)])
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "python.exe"))
+    assert notify._is_compiled() is True
+    import os
+
+    assert os.path.normcase(notify._self_executable()) == os.path.normcase(str(exe))
+
+    interpreter = tmp_path / "pythonw.exe"
+    interpreter.write_bytes(b"")
+    monkeypatch.setattr(sys, "executable", str(interpreter))
+    monkeypatch.setattr(sys, "argv", [str(tmp_path / "__main__.py")])
+    assert notify._is_compiled() is False, "源码态解释器真的在，就不算打包"
 
 
-def test_popup_command_shape_follows_the_runtime(monkeypatch):
-    """源码态拼 -m shunshu，打包态拼 exe 子命令：拼错就永远弹不出卡片。"""
+def test_popup_command_shape_follows_the_runtime(monkeypatch, tmp_path):
+    """打包态拼 [exe, popup]，源码态拼 [python, -m, shunshu, popup]：拼错就永远弹不出卡。"""
+    import os
     import sys
 
     from shunshu import notify
 
+    exe = tmp_path / "shunshu.exe"
+    exe.write_bytes(b"")
     monkeypatch.delattr(sys, "frozen", raising=False)
-    monkeypatch.setattr(sys, "executable", r"D:\shunshu\shunshu.exe")
+    monkeypatch.setattr(sys, "argv", [str(exe)])
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "python.exe"))
     argv = notify.popup_command({"title": "t"}, 2, 12.0)
-    assert argv[:2] == [r"D:\shunshu\shunshu.exe", "popup"] and "-m" not in argv
+    assert os.path.normcase(argv[0]) == os.path.normcase(str(exe))
+    assert argv[1] == "popup" and "-m" not in argv
     assert argv[argv.index("--index") + 1] == "2"
 
-    monkeypatch.setattr(sys, "executable", r"C:\py\python.exe")
-    assert notify.popup_command({"title": "t"}, 0, 12.0)[:4] == \
-        [r"C:\py\python.exe", "-m", "shunshu", "popup"]
+    interpreter = tmp_path / "python.exe"
+    interpreter.write_bytes(b"")
+    monkeypatch.setattr(sys, "executable", str(interpreter))
+    monkeypatch.setattr(sys, "argv", [str(tmp_path / "__main__.py")])
+    assert notify.popup_command({"title": "t"}, 0, 12.0)[:4] ==         [str(interpreter), "-m", "shunshu", "popup"]
+
+
+def test_failed_card_spawn_is_recorded_with_a_reason(tmp_path, monkeypatch):
+    """卡片弹不出来不能静默：现场只有 alerts.log 一份东西可看。"""
+    from shunshu import notify
+
+    def failing(payload, index=0, seconds=12.0):
+        notify.LAST_SPAWN_ERROR = "起进程失败 FileNotFoundError: [WinError 2]"
+        return False
+
+    monkeypatch.setattr(notify, "spawn_card", failing)
+    path = tmp_path / "alerts.log"
+    assert notify.Notifier(alerts_path=path).show("《书》更新 1 章", ["第9章 新"]) is False
+    text = path.read_text(encoding="utf-8")
+    assert "卡片没弹出" in text and "FileNotFoundError" in text
