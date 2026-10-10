@@ -22,6 +22,10 @@ jobs:
   build:
     name: Windows Build
     runs-on: windows-latest
+    # 建 Release 需要写权限：默认的 GITHUB_TOKEN 只有读权限，
+    # 不写这行会在 Create GitHub Release 一步报 403 Resource not accessible by integration
+    permissions:
+      contents: write
     outputs:
       release_created: ${{ steps.create_release.outputs.id != '' }}
     steps:
@@ -32,7 +36,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-          cache: "uv"
+          # 不要写 cache: "uv"：setup-python 的内置缓存只认 pip/pipenv/cargo，
+          # 填 uv 会在这一步直接失败（Error: Caching for 'uv' is not supported）
 
       - name: Install uv
         run: pip install uv
@@ -51,8 +56,11 @@ jobs:
             --standalone `
             --windows-console-mode=disable `
             --enable-plugin=tk-inter `
+            --include-package=shunshu `
+            --include-package=pystray `
             --include-module=zhconv `
             --include-package-data=zhconv `
+            --include-package-data=certifi `
             --include-module=truststore `
             --output-dir=dist `
             src/shunshu/__main__.py `
