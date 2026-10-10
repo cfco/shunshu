@@ -7,10 +7,11 @@
 #
 # 也就是说：不需要在本地手动打 tag，改完代码把版本号往上推一次，Release 就跟着更新。
 #
-# 产物结构（folder 模式）：
-#   shunshu-{版本}-windows-amd64.zip
-#     ├── shunshu.exe            ← 主程序 + popup 子命令，同一个 exe
+# 产物（每次 push 都会发到 Releases，两种各一份）：
+#   shunshu-{版本}-windows-amd64.zip        ← folder 模式：exe + 运行时依赖目录
+#     ├── shunshu.exe                          主程序 + popup 子命令，同一个 exe
 #     └── 运行时依赖（含 zhconv 词库、Tk、pystray/PIL 后端）
+#   shunshu-{版本}-windows-amd64-onefile.exe ← 单文件模式：一个 exe 拷走即用
 
 name: Build
 
@@ -71,6 +72,34 @@ jobs:
             src/shunshu `
             --output-filename=shunshu.exe
 
+      # ---------- 单文件 exe ----------
+      # --onefile-cache-mode=cached：解包目录固定为 {CACHE_DIR}/{COMPANY}/{PRODUCT}/{VERSION}，
+      # 主进程与弹卡片的子进程共用同一份解包，不至于每弹一次卡都重解一遍；
+      # 因此必须给 company/product/version 元数据，否则该模式默认路径里的占位符无值可用
+      - name: Nuitka compile (single file)
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path pyproject.toml -Pattern '^version = "(.+?)"').Matches.Groups[1].Value
+          uv run python -m nuitka `
+            --onefile `
+            --onefile-cache-mode=cached `
+            --company-name=cfco `
+            --product-name=shunshu `
+            --product-version=$version `
+            --file-version=$version `
+            --assume-yes-for-downloads `
+            --windows-console-mode=disable `
+            --enable-plugin=tk-inter `
+            --include-package=shunshu `
+            --include-package=pystray `
+            --include-module=zhconv `
+            --include-package-data=zhconv `
+            --include-module=truststore `
+            --no-deployment-flag=self-execution `
+            --output-dir=dist-onefile `
+            src/shunshu `
+            --output-filename="shunshu-$version-windows-amd64-onefile.exe"
+
       # ---------- 打包 zip ----------
       - name: Package zip
         shell: pwsh
@@ -117,3 +146,4 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             shunshu-*.zip
+            dist-onefile/shunshu-*-onefile.exe
