@@ -335,7 +335,8 @@ def container_by_selector(page: Page, selector: str) -> Container:
     raise TocDetectError(f"手写的 selector 没有匹配到含链接的元素: {selector}", [])
 
 
-def build_chapters(links: list[LinkInfo], position_offset: int = 0) -> list[Chapter]:
+def build_chapters(links: list[LinkInfo], position_offset: int = 0,
+                   order_threshold: float = 0.6) -> list[Chapter]:
     """按 key 去重后交给 `ordered_chapters` 排新旧：目录里的出现顺序才是站点的说法。"""
     chapters: dict[str, Chapter] = {}
     for pos, info in enumerate(links):
@@ -348,17 +349,17 @@ def build_chapters(links: list[LinkInfo], position_offset: int = 0) -> list[Chap
             title=info.text, url=info.url, number=info.number,
             position=position_offset + pos, raw_title=info.raw_text,
         )
-    return ordered_chapters(list(chapters.values()))
+    return ordered_chapters(list(chapters.values()), order_threshold)
 
 
-def ordered_chapters(chapters: list[Chapter]) -> list[Chapter]:
+def ordered_chapters(chapters: list[Chapter], order_threshold: float = 0.6) -> list[Chapter]:
     """把「按目录出现顺序」的章节排成旧→新，并把 position 重排成名次（0 最旧）。
 
     站点自己把编号写乱时（正文排到 1564 章，末尾又另挂一块 184~190 章，
     那块才是最新）不能按编号排——认目录顺序，只用相邻编号的升降投票判断这本书
-    是正序排还是倒序排。
+    是正序排还是倒序排。order_threshold 控制投票阈值，从 Config 传入。
     """
-    trend = _order_trend(chapters)
+    trend = _order_trend(chapters, order_threshold)
     if trend == 0 and len(chapters) > 1 and all(c.number is not None for c in chapters):
         ordered = sorted(chapters, key=lambda c: (c.number or 0, c.position))
     else:
@@ -368,7 +369,7 @@ def ordered_chapters(chapters: list[Chapter]) -> list[Chapter]:
     return ordered
 
 
-def _order_trend(chapters: list[Chapter]) -> int:
+def _order_trend(chapters: list[Chapter], threshold: float = 0.6) -> int:
     """沿目录顺序编号整体在涨返回 +1，整体在跌（倒序站）返回 -1，看不出方向返回 0。"""
     nums = [c.number for c in chapters if c.number is not None]
     if len(nums) < 4:
@@ -378,9 +379,9 @@ def _order_trend(chapters: list[Chapter]) -> int:
     total = up + down
     if not total:
         return 0
-    if up / total > 0.6:
+    if up / total > threshold:
         return 1
-    if down / total > 0.6:
+    if down / total > threshold:
         return -1
     return 0
 

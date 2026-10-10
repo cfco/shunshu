@@ -465,20 +465,23 @@ def test_history_merges_records_from_every_source(app_state: AppState):
 
 # ---------- 轮询节奏 ----------
 
-def test_fixed_interval_applies_jitter(app_state: AppState):
-    app_state.set_poll_minutes(5)
-    scheduler = Scheduler(app_state)
-    waits = [scheduler.next_wait_seconds() for _ in range(50)]
-    assert all(255 <= w <= 345 for w in waits)
-    assert len({round(w) for w in waits}) > 1
+def test_fixed_interval_is_constant(app_state: AppState):
+    """固定间隔模式：返回值应该完全一致，不再有抖动。"""
+    for minutes in (5, 10, 30, 60):
+        app_state.set_poll_minutes(minutes)
+        scheduler = Scheduler(app_state)
+        waits = [scheduler.next_wait_seconds() for _ in range(10)]
+        expected = minutes * 60.0
+        assert all(w == expected for w in waits), f"poll_minutes={minutes} 应返回 {expected} 秒"
 
 
-def test_random_interval_stays_within_three_to_ten_minutes(app_state: AppState):
-    app_state.set_poll_minutes("random")
-    scheduler = Scheduler(app_state)
-    waits = [scheduler.next_wait_seconds() for _ in range(200)]
-    assert all(180 - 1 <= w <= 600 + 1 for w in waits)
-    assert max(waits) - min(waits) > 60
+def test_interval_supports_all_four_options(app_state: AppState):
+    """托盘菜单里 5/10/30/60 四个选项都能正确设置和读取。"""
+    for minutes in (5, 10, 30, 60):
+        app_state.set_poll_minutes(minutes)
+        assert app_state.cfg.poll_minutes == minutes
+        scheduler = Scheduler(app_state)
+        assert scheduler.next_wait_seconds() == minutes * 60.0
 
 
 def test_repeated_failures_are_skipped_by_backoff(app_state: AppState):
@@ -507,15 +510,6 @@ def test_success_clears_backoff(app_state: AppState):
     outcome = scheduler.run_once(force=True)[0]
     assert outcome.source.consecutive_failures == 0
     assert scheduler.due_skip_ids(__import__("time").time()) == set()
-
-
-def test_pause_and_resume_gate_the_loop(app_state: AppState):
-    scheduler = Scheduler(app_state)
-    assert scheduler.paused_until == 0
-    scheduler.pause(10)
-    assert scheduler.paused_until > __import__("time").time()
-    scheduler.resume()
-    assert scheduler.paused_until == 0
 
 
 def test_no_novels_round_is_harmless(app_state: AppState):

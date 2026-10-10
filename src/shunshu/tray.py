@@ -15,7 +15,7 @@ from .align import display_title
 from .app import AppState, DuplicateSource
 from .browser import open_in_default_browser
 from .clipboard import extract_url, read_text
-from .config import POLL_FIXED, POLL_RANDOM
+from .config import POLL_MINUTES
 from .instance import acquire_singleton
 from .http import proxy_label, system_proxy_for
 from .models import (
@@ -33,7 +33,7 @@ from .scheduler import Scheduler
 
 _CONFIRM_WINDOW_SECONDS = 10.0
 
-_INTERVAL_LABELS = {3: "3 分钟", 5: "5 分钟", 10: "10 分钟", POLL_RANDOM: "随机（3~10 分钟）"}
+_INTERVAL_LABELS = {5: "5 分钟", 10: "10 分钟", 30: "30 分钟", 60: "60 分钟"}
 
 
 def make_icon_image(state: str = "normal") -> Image.Image:
@@ -196,16 +196,6 @@ class TrayApp:
             self._flash("开启失败", "无法写入注册表 Run 项")
         self._rebuild_menu()
 
-    def act_pause(self, minutes: float | None, icon=None, item=None) -> None:
-        if minutes is None:
-            self.scheduler.resume()
-            self.scheduler.trigger_now()
-            self._status_hint = "轮询已恢复"
-        else:
-            self.scheduler.pause(minutes)
-            self._status_hint = f"暂停 {int(minutes)} 分钟"
-        self._rebuild_menu()
-
     def act_open_data_dir(self, icon=None, item=None) -> None:
         try:
             os.startfile(str(self.state.paths.root))  # type: ignore[attr-defined]
@@ -301,7 +291,6 @@ class TrayApp:
             pystray.MenuItem("重新加载配置", self.act_reload_config),
             pystray.MenuItem("立即检查全部", self.act_check_now),
             pystray.MenuItem("扫描间隔", pystray.Menu(self._interval_items)),
-            pystray.MenuItem("暂停轮询", pystray.Menu(self._pause_items)),
             pystray.MenuItem("开机自启", self.act_toggle_autostart,
                              checked=lambda item: autostart.is_enabled()),
             pystray.Menu.SEPARATOR,
@@ -383,8 +372,9 @@ class TrayApp:
                 else "代理 跟随系统（当前没有系统代理，直连）")
 
     def _interval_items(self):
+        """托盘菜单「扫描间隔」子菜单：固定四个选项，用户二选一。"""
         current = self.state.cfg.poll_minutes
-        for value in (*POLL_FIXED, POLL_RANDOM):
+        for value in POLL_MINUTES:
             yield pystray.MenuItem(
                 _INTERVAL_LABELS[value],
                 partial(self.act_set_interval, value),
@@ -395,11 +385,6 @@ class TrayApp:
     @staticmethod
     def _interval_checked(value, current, item=None) -> bool:
         return current == value
-
-    def _pause_items(self):
-        yield pystray.MenuItem("暂停 10 分钟", partial(self.act_pause, 10))
-        yield pystray.MenuItem("暂停 1 小时", partial(self.act_pause, 60))
-        yield pystray.MenuItem("恢复轮询", partial(self.act_pause, None))
 
     # ---------- 运行 ----------
 

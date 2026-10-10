@@ -54,13 +54,16 @@ def load_toc(fetcher: Fetcher, toc_url: str, rules: Rules, selector: str | None 
 
     merged: dict[str, Chapter] = {}
     dropped: list[DroppedLink] = []
+    # 目录正/倒序判断阈值，从 Config 读取
+    order_threshold = rules.cfg.order_trend_threshold
     for index, (_url, container) in enumerate(pages):
-        for chapter in build_chapters(container.links, position_offset=index * 100_000):
+        for chapter in build_chapters(container.links, position_offset=index * 100_000,
+                                      order_threshold=order_threshold):
             merged.setdefault(chapter.key, chapter)
         for info in container.dropped:
             dropped.append(DroppedLink(info.drop_reason or "unknown", info.text, info.url))
 
-    chapters = ordered_chapters(list(merged.values()))
+    chapters = ordered_chapters(list(merged.values()), order_threshold)
     toc = Toc(
         book_title=page.book_title,
         chapters=chapters,

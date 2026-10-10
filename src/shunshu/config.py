@@ -12,9 +12,8 @@ from pathlib import Path
 from .models import CN_LABEL_CHARS, CN_NUM_CHARS
 
 APP_NAME = "shunshu"
-POLL_FIXED = (3, 5, 10)
-POLL_RANDOM = "random"
-RANDOM_RANGE_MINUTES = (3, 10)
+# 托盘菜单里扫描间隔的固定选项：5/10/30/60 分钟，用户只能四选一
+POLL_MINUTES = (5, 10, 30, 60)
 
 # 整条文本命中即丢弃（归一化后比较）：目录页上的功能性链接与站名水印
 DEFAULT_AD_EXACT = [
@@ -75,9 +74,7 @@ def data_dir() -> Path:
 
 @dataclass(slots=True)
 class Config:
-    poll_minutes: int | str = 5
-    random_range_minutes: list[int] = field(default_factory=lambda: list(RANDOM_RANGE_MINUTES))
-    jitter_ratio: float = 0.15
+    poll_minutes: int = 5
     concurrency: int = 6
     same_host_delay_seconds: float = 2.0
     request_timeout_seconds: float = 15.0
@@ -91,6 +88,8 @@ class Config:
     notified_keys_keep: int = 500
     max_report_new_chapters: int = 30
     toc_reset_overlap_ratio: float = 0.35
+    # 目录正/倒序判断：编号升序占比超过此阈值就认作正序，低于 (1 - 阈值) 认作倒序
+    order_trend_threshold: float = 0.6
     failure_backoff_threshold: int = 5
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

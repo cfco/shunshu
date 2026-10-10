@@ -1,9 +1,9 @@
 @echo off
+chcp 65001 >nul
 setlocal enableextensions
 cd /d "%~dp0"
 
-rem Ë³ÊÖÆô¶¯½Å±¾£ºË«»÷ºóÌ¨ÆğÍĞÅÌ£¨²»Áô¿ØÖÆÌ¨´°¿Ú£©¡£
-rem ÅÅ´íÓÃ£ºÆô¶¯.bat debug   ¡ª¡ª ÓÃ´ø¿ØÖÆÌ¨µÄ·½Ê½Æô¶¯£¬Òì³£ÄÜÖ±½Ó¿´µ½¡£
+rem é¡ºæ‰‹å¯åŠ¨è„šæœ¬ï¼šé»˜è®¤åå°å¯åŠ¨æ‰˜ç›˜å¸¸é©»å›¾æ ‡ï¼›debug å‚æ•°åˆ™å‰å°è¿è¡Œæ–¹ä¾¿æ’æŸ¥å¼‚å¸¸
 
 set "PYW=.venv\Scripts\pythonw.exe"
 set "PYEXE=.venv\Scripts\python.exe"
@@ -16,29 +16,29 @@ if errorlevel 1 exit /b 1
 
 :start
 start "" "%PYW%" -m shunshu run
-echo [shunshu] ÒÑÔÚºóÌ¨Æô¶¯£¬ÍĞÅÌÀïÕÒÊé±¾Í¼±ê¡£
-echo [shunshu] ÍË³ö£ºÓÒ¼üÍ¼±ê - ÍË³ö¡£
+echo [shunshu] åå°å¯åŠ¨å®Œæˆï¼Œæ‰˜ç›˜å›¾æ ‡å³å°†å‡ºç°ã€‚
+echo [shunshu] å³é”®æ‰˜ç›˜å›¾æ ‡ - é€€å‡º
 ping -n 4 127.0.0.1 >nul
 goto :eof
 
 :debug
 if not exist "%PYEXE%" call :prepare
 if errorlevel 1 exit /b 1
-echo [shunshu] µ÷ÊÔÄ£Ê½£¨¹Ø±Õ´°¿Ú¼´ÍË³ö£©
+echo [shunshu] è°ƒè¯•æ¨¡å¼ï¼Œå‰å°è¿è¡Œ
 "%PYEXE%" -m shunshu run
 goto :eof
 
 :prepare
 where uv >nul 2>nul
 if errorlevel 1 (
-    echo [shunshu] ÕÒ²»µ½ .venv£¬Ò²Ã»ÓĞ uv¡£ÇëÏÈ°²×° uv£¬ÔÙÖ´ĞĞ£ºuv sync
+    echo [shunshu] æ²¡æœ‰ .venv ä¹Ÿæ²¡æœ‰ uvï¼Œè¯·å…ˆå®‰è£… uv åæ‰§è¡Œï¼šuv sync
     pause
     exit /b 1
 )
-echo [shunshu] Ê×´ÎÔËĞĞ£¬ÕıÔÚ°²×°ÒÀÀµ ...
+echo [shunshu] æ­£åœ¨å‡†å¤‡è™šæ‹Ÿç¯å¢ƒå¹¶å®‰è£…ä¾èµ– ...
 uv sync
 if not exist "%PYW%" (
-    echo [shunshu] uv sync Ö®ºóÈÔÈ»Ã»ÓĞ %PYW%
+    echo [shunshu] uv sync ä¹‹åä»ç„¶æ²¡æœ‰ %PYW%
     pause
     exit /b 1
 )
