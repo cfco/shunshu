@@ -570,3 +570,113 @@ def test_failed_card_spawn_is_recorded_with_a_reason(tmp_path, monkeypatch):
     assert notify.Notifier(alerts_path=path).show("《书》更新 1 章", ["第9章 新"]) is False
     text = path.read_text(encoding="utf-8")
     assert "卡片没弹出" in text and "FileNotFoundError" in text
+
+
+def test_card_survives_read_log_write_failure(paths, monkeypatch):
+    """主进程恰好把 read.jsonl 改名取走（drain）时追加会抛 OSError：
+    已读记不上就算了，卡片必须照常收起，不能卡在屏幕上关不掉。"""
+    import os as _os
+
+    from conftest import FakeRoot
+
+    from shunshu.popup import make_payload, open_chapter
+
+    def busy(path, record):
+        raise OSError(f"模拟文件被占用: {_os.fspath(path)}")
+
+    monkeypatch.setattr("shunshu.store.append_jsonl", busy)
+    monkeypatch.setattr("shunshu.browser.open_in_default_browser", lambda url: True)
+    monkeypatch.setenv("SHUNSHU_DATA_DIR", str(paths.root))
+    root = FakeRoot()
+    open_chapter(root, make_payload("《书》", novel="b1"),
+                 {"t": "第9章", "u": "https://x.com/9.html", "k": "000009|第9章"})
+    assert root.destroyed, "写已读失败不能拦住卡片收起"
+
+
+def test_fetcher_close_lets_queued_fetches_finish():
+    """换掉抓取器（点「重新加载配置」）不能取消还在排队的抓取。
+
+    正在跑的那一轮手里还攥着这些 future：取消了 f.result() 抛 CancelledError，
+    整轮的记账与提醒一起作废，那一轮的章节就此永远不再弹卡。
+    """
+    fetcher = Fetcher(user_agent="ua", workers=2)
+    pool = fetcher.pool(2)
+    queued = [pool.submit(lambda i=i: i) for i in range(6)]
+    fetcher.close()
+    assert [f.result() for f in queued] == [0, 1, 2, 3, 4, 5]
+
+
+def test_card_slots_are_shared_by_one_notifier(app_state, monkeypatch):
+    """槽位要跨轮、跨「托盘回执」与「更新卡」共用：每轮新建一份 Notifier 时，
+    两张卡各自都从 0 数起，12 秒内连来两批就叠在屏幕同一位置。"""
+    from shunshu.tray import TrayApp
+
+    indices = []
+    monkeypatch.setattr("shunshu.notify.spawn_card",
+                        lambda payload, index=0, seconds=12.0: indices.append(index) or True)
+    tray = TrayApp(app_state)
+    assert tray.notifier is app_state.notifier, "托盘和轮询得共用同一份槽位表"
+
+    app_state.notifier.show("第一批", ["第1章"])
+    tray._flash("回执", "点了一下")
+    assert indices == [0, 1]
+
+
+def test_drain_jsonl_moves_back_line_appended_after_first_read(paths: Paths, monkeypatch):
+    """改名取走之后卡片又追加一条已读：那条要搬回正主文件，不能连着 .draining 一起删。"""
+    from pathlib import Path as _Path
+
+    from shunshu import store
+
+    log = paths.read_log
+    log.write_text('{"novel":"n1","key":"000001|甲"}\n', encoding="utf-8")
+    real_open = _Path.open
+    injected = []
+
+    class LateWriter:
+        """第一次读出到内容后，模拟卡片正好往原位置追加一条（真实的竞态窗口）。"""
+
+        def __init__(self, fh):
+            self.fh = fh
+
+        def read(self, *args):
+            data = self.fh.read(*args)
+            if data and not injected:
+                injected.append(1)
+                with real_open(log, "ab") as fh:
+                    fh.write('{"novel":"n1","key":"000002|乙"}\n'.encode("utf-8"))
+            return data
+
+        def __getattr__(self, name):
+            return getattr(self.fh, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.fh.close()
+
+    monkeypatch.setattr(_Path, "open",
+                        lambda self, *a, **k: LateWriter(real_open(self, *a, **k)))
+    first = store.drain_jsonl(log)
+
+    assert [r["key"] for r in first] == ["000001|甲"]
+    assert log.exists(), "迟到的一条得留在正主文件里"
+    assert [r["key"] for r in store.drain_jsonl(log)] == ["000002|乙"]
+
+
+def test_show_logs_only_the_lines_the_card_displays(paths: Paths, monkeypatch):
+    """卡片只显示前 4 行，alerts.log 也只得记这 4 行：多记的跟现场对不上。"""
+    from shunshu.notify import _CARD_LINES
+
+    payloads = []
+    monkeypatch.setattr("shunshu.notify.spawn_card",
+                        lambda payload, index=0, seconds=12.0: payloads.append(payload) or True)
+    lines = [f"第{i}章 测试" for i in range(1, 8)]
+    assert Notifier(alerts_path=paths.alerts_log, enabled=True).show(
+        "顺手 · 启动检查", lines, "https://book.example.com/1/9.html") is True
+
+    assert payloads[0]["lines"] == lines[:_CARD_LINES]
+    text = paths.alerts_log.read_text(encoding="utf-8")
+    assert lines[0] in text and lines[_CARD_LINES] not in text
+    assert "https://book.example.com/1/9.html" in text, "跳转地址仍然要留档"

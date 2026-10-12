@@ -10,6 +10,7 @@ from .align import match_key
 from .http import FetchError, Fetcher, ProxyError
 from .models import (
     STATUS_BASELINE,
+    STATUS_CHECK_ERROR,
     STATUS_DISABLED,
     STATUS_NET_ERROR,
     STATUS_NO_CHANGE,
@@ -28,7 +29,15 @@ from .models import (
     site_key,
 )
 from .reader import LoadResult, load_toc
-from .store import Paths, append_jsonl, log_filtered, now_stamp, sleep_seconds, write_candidates
+from .store import (
+    Paths,
+    append_jsonl,
+    append_text,
+    log_filtered,
+    now_stamp,
+    sleep_seconds,
+    write_candidates,
+)
 from .toc_detect import TocDetectError
 
 
@@ -104,6 +113,25 @@ def check_source(novel: Novel, source: Source, rules: Rules, fetcher: Fetcher,
     return Outcome(novel=novel, source=source, status=STATUS_UPDATED, new_chapters=display,
                    recent=recent, new_count=len(new), latest=latest, message=f"更新 {len(new)} 章",
                    all_new=new)
+
+
+def check_source_safe(novel: Novel, source: Source, rules: Rules, fetcher: Fetcher,
+                      paths: Paths | None = None, *, skip: bool = False,
+                      prefetch: str | None = None) -> Outcome:
+    """`check_source` 的兜底外壳：连未预期的异常也归成这一个来源的失败结果。
+
+    `check_source` 只截得住它认得的那几类错误。别的一个异常（解析层崩了、来源的某个字段
+    被手改成没法用的形状）从工作线程逃出去，就会让 `check_all` 的 `f.result()` 重抛，
+    整轮的 `_collect` 不再执行——那一轮已经写进来源级 `notified_keys` 的章节就此永远不再
+    提醒，托盘还在、日志还在写，看不出来。宁可让这一个来源记一次失败，也不放弃整轮记账。
+    """
+    try:
+        return check_source(novel, source, rules, fetcher, paths, skip=skip, prefetch=prefetch)
+    except Exception as exc:  # 兜底要兜的就是「不知道会抛什么」这一类
+        detail = f"检查异常：{type(exc).__name__}: {exc}"
+        if paths is not None:
+            append_text(paths.runtime_log, f"{now_stamp()} 来源 {source.id} {detail}")
+        return _failure(novel, source, STATUS_CHECK_ERROR, detail, exc=detail, fatal_count=True)
 
 
 def _failure(novel: Novel, source: Source, status: str, message: str, *, exc: str | None = None,
@@ -253,7 +281,8 @@ def _check_group(items: list[tuple[Novel, Source]], host: str, rules: Rules, fet
     for index, (novel, source) in enumerate(items):
         if index:
             sleep_seconds(rules.cfg.same_host_delay_seconds)
-        out.append(check_source(novel, source, rules, fetcher, paths, skip=source.id in skip_ids))
+        out.append(check_source_safe(novel, source, rules, fetcher, paths,
+                                     skip=source.id in skip_ids))
     return out
 
 
@@ -280,17 +309,22 @@ def collect_alerts(novels: list[Novel], outcomes: list[Outcome], *, keep: int = 
         for outcome in own:
             if outcome.status != STATUS_UPDATED:
                 continue
+            # 跨来源比的是「离自己目录末尾多远」，不是目录名次：名次每个来源各编各的。
+            # 主源 1000 章里的第 62 章名次 999，只列最近 20 章的镜像里第 63 章名次 19，
+            # 直接比名次就会把旧的那章排在前面，卡片首行不再是最新章
+            count = outcome.source.chapter_count or 0
             for chapter in outcome.all_new:
                 key = match_key(chapter.number, chapter.title)
                 if key in seen:
                     continue
                 seen.add(key)
-                rank = (chapter.position, chapter.number if chapter.number is not None else -1)
-                candidates.append((rank, ChapterEntry(
+                number = chapter.number if chapter.number is not None else -1
+                rel_from_end = (count - 1 - chapter.position) if count else -chapter.position
+                candidates.append(((rel_from_end, -number), ChapterEntry(
                     k=key, t=chapter.title, u=chapter.url,
                     s=outcome.source.id, n=chapter.number, ts=now_stamp())))
-        # 先按目录名次（名次大＝新）排，跨来源名次撞平时再比章节号：主源第62章、镜像第63章时首行是 63
-        fresh = [entry for _, entry in sorted(candidates, key=lambda pair: pair[0], reverse=True)]
+        # 离末尾越近越新；两个来源各报一章、离末尾一样近时按章节号分先后
+        fresh = [entry for _, entry in sorted(candidates, key=lambda pair: pair[0])]
 
         baselines = [o for o in own if o.status == STATUS_BASELINE]
         for outcome in baselines:

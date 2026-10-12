@@ -61,10 +61,15 @@ def _place(root: tk.Tk, index: int, width: int = _WIDTH) -> None:
 def _mark_read(novel_id: str, chapter: dict) -> None:
     from .store import Paths, append_jsonl, now_stamp
 
-    append_jsonl(Paths().read_log, {
-        "ts": now_stamp(), "novel": novel_id, "key": chapter.get("k") or "",
-        "url": chapter.get("u") or "",
-    })
+    try:
+        append_jsonl(Paths().read_log, {
+            "ts": now_stamp(), "novel": novel_id, "key": chapter.get("k") or "",
+            "url": chapter.get("u") or "",
+        })
+    except OSError:
+        # 主进程恰好把 read.jsonl 改名取走（drain）的瞬间追加会失败：放弃记已读即可，
+        # 绝不能让异常冒出去打断 open_chapter 里的 root.destroy()，否则卡片关不掉
+        pass
 
 
 def open_chapter(root: tk.Tk, payload: dict, chapter: dict) -> None:

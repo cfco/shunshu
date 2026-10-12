@@ -114,7 +114,7 @@ def test_same_site_second_source_reuses_memory_without_probing(app_state: AppSta
     app_state.save_novels()
     fetcher = _NeedProxy()
     result = app_state.ensure_source_proxy(source2.id, fetcher)
-    assert result == ProbeResult(proxy="http://127.0.0.1:7890")
+    assert result == ProbeResult(proxy="http://127.0.0.1:7890", probed=False)
     assert fetcher.tried == []
     assert source2.proxy == "http://127.0.0.1:7890"
 
@@ -144,7 +144,9 @@ def test_manual_proxy_is_respected_and_never_probed(app_state: AppState):
     novel = app_state.add_novel("https://book.example/1/")
     novel.sources[0].proxy = "socks5://10.0.0.9:1080"
     result = app_state.ensure_source_proxy(novel.sources[0].id, _Boom())
-    assert result == ProbeResult(proxy="socks5://10.0.0.9:1080")
+    # probed=False：一个包都没试过。代理失效自动重探那条路靠它区分「探通了」和「没探」，
+    # 否则死掉的手写代理每轮到阈值就被清一次失败计数，永远退避不起来
+    assert result == ProbeResult(proxy="socks5://10.0.0.9:1080", probed=False)
 
 
 def test_missing_source_id_returns_none_without_error(app_state: AppState):
@@ -222,3 +224,27 @@ def test_tray_add_source_probes_before_first_check(app_state: AppState, monkeypa
     assert probed == ["source-9"]
     # 新来源探测时的 HTML 按「来源 id」为 key 透传（不是小说 id）
     assert calls == [{"ident": "novel-1", "prefetch": {"source-9": "<html>ok</html>"}}]
+
+
+def test_dead_manual_proxy_keeps_backing_off(app_state: AppState):
+    """手写的代理死了要照常进退避，不能被「假重探」说成已经探通了。
+
+    force 重探碰到手写覆盖时根本不发请求；把这种「没探」当成功，失败计数每轮到阈值
+    就被清零，死代理每 5 轮被重新敲一次，日志还会谎报改走了新代理。
+    """
+    from shunshu.models import Outcome, STATUS_PROXY_ERROR
+
+    novel = app_state.add_novel("https://book.example/1/")
+    source = novel.sources[0]
+    source.proxy = "socks5://10.0.0.9:1080"
+    threshold = app_state.cfg.failure_backoff_threshold
+    source.consecutive_failures = threshold
+    source.last_error = "10.0.0.9:1080 走不通"
+
+    app_state._reprobe_dead_proxies(
+        [Outcome(novel=novel, source=source, status=STATUS_PROXY_ERROR)])
+
+    assert source.consecutive_failures == threshold, "计数不能被清零，否则永远退避不起来"
+    assert source.last_error == "10.0.0.9:1080 走不通", "错误现场得留着"
+    if app_state.paths.runtime_log.exists():
+        assert "自动重探" not in app_state.paths.runtime_log.read_text(encoding="utf-8")

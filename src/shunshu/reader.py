@@ -48,20 +48,26 @@ def load_toc(fetcher: Fetcher, toc_url: str, rules: Rules, selector: str | None 
     page = parse_page(base_html, toc_url, rules)
     pages: list[tuple[str, Container]] = []
     if selector:
-        pages.append((toc_url, container_by_selector(page, selector)))
+        # 手写 selector 也要跟末页：分页站的最新章节就在最后一页，只敲首页永远看不到
+        first = container_by_selector(page, selector)
+        pages.append((toc_url, first))
+        followed = _follow_last_page(fetcher, page, first, rules, proxy,
+                                     select=lambda second: container_by_selector(second, selector))
     else:
-        pages.append((toc_url, pick_container(page, rules)))
-        followed = _follow_last_page(fetcher, page, pages[0][1], rules, proxy)
-        if followed:
-            pages.append(followed)
+        first = pick_container(page, rules)
+        pages.append((toc_url, first))
+        followed = _follow_last_page(fetcher, page, first, rules, proxy)
+    if followed:
+        pages.append(followed)
 
     merged: dict[str, Chapter] = {}
     dropped: list[DroppedLink] = []
     # 目录正/倒序判断阈值，从 Config 读取
     order_threshold = rules.cfg.order_trend_threshold
-    for index, (_url, container) in enumerate(pages):
-        for chapter in build_chapters(container.links, position_offset=index * 100_000,
-                                      order_threshold=order_threshold):
+    # 页序就靠 dict 的插入顺序传递（首页的章在前、跟到的那一页在后），
+    # 最后由 ordered_chapters 统一重排名次，不需要额外的偏移量
+    for _url, container in pages:
+        for chapter in build_chapters(container.links, order_threshold=order_threshold):
             merged.setdefault(chapter.key, chapter)
         for info in container.dropped:
             dropped.append(DroppedLink(info.drop_reason or "unknown", info.text, info.url))
@@ -78,7 +84,12 @@ def load_toc(fetcher: Fetcher, toc_url: str, rules: Rules, selector: str | None 
 
 
 def _follow_last_page(fetcher: Fetcher, page, container: Container, rules: Rules,
-                      proxy: str = ""):
+                      proxy: str = "", select=None):
+    """跟末页/最大数字页那一页，拿不到或认不出就当没有第二页，不影响首页结果。
+
+    select 给手写 selector 的分支用（第二页仍按同一个 selector 取容器）；
+    默认按首页容器的目录前缀自动打分。
+    """
     if rules.cfg.max_pages_followed < 1:
         return None
     last_url, numeric = find_page_urls(page, rules)
@@ -93,7 +104,8 @@ def _follow_last_page(fetcher: Fetcher, page, container: Container, rules: Rules
         return None
     second = parse_page(html, last_url, rules)
     try:
-        found = pick_container(second, rules, prefer_prefix=container.modal_prefix)
+        found = select(second) if select is not None else pick_container(
+            second, rules, prefer_prefix=container.modal_prefix)
     except TocDetectError:
         return None
     return (last_url, found)

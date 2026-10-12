@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -27,6 +28,9 @@ class Notifier:
         self.enabled = enabled
         # 每个卡片槽位的释放时刻（monotonic 秒）；过期的槽位在分配时顺手清掉
         self._slots: list[float] = []
+        # 定时轮与添加书源首轮可能在两条线程上同时弹卡：分配必须互斥，否则
+        # 两边各自数出同一个槽位号，两张卡叠在同一位置
+        self._slot_lock = threading.Lock()
 
     # ---------- 提醒入口 ----------
 
@@ -49,11 +53,12 @@ class Notifier:
 
     def _take_slot(self) -> int:
         """给下一张卡分一个当前没被占用的序号：12 秒内连来两批更新也不会上下重叠。"""
-        now = time.monotonic()
-        active = sorted(until for until in self._slots if until > now)
-        index = len(active)  # 存活中的卡片占着 0..n-1，新卡顺延到 n
-        self._slots = active + [now + _SLOT_HOLD_SECONDS]
-        return index
+        with self._slot_lock:
+            now = time.monotonic()
+            active = sorted(until for until in self._slots if until > now)
+            index = len(active)  # 存活中的卡片占着 0..n-1，新卡顺延到 n
+            self._slots = active + [now + _SLOT_HOLD_SECONDS]
+            return index
 
     def show(self, title: str, lines: list[str], url: str = "") -> bool:
         """普通提示（启动摘要、菜单操作反馈）：只有文字，没有可点章节。
@@ -61,8 +66,9 @@ class Notifier:
         同样走槽位分配：启动卡/菜单回执也可能和上一批没消失的更新卡撞位置。
         """
         launch = _safe_url(url)
-        payload = make_payload(title, lines=lines[:_CARD_LINES])
-        self._record(title, lines, launch)
+        shown = lines[:_CARD_LINES]  # 卡片只显示这几行，日志也记这几行，现场才对得上
+        payload = make_payload(title, lines=shown)
+        self._record(title, shown, launch)
         return self._spawn(payload, self._take_slot())
 
     # ---------- 内部 ----------

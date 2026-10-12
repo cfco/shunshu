@@ -76,6 +76,74 @@ def test_non_object_novel_entries_are_skipped_not_fatal(paths: Paths):
     assert store.LAST_LOAD_WARNINGS, "跳过的条目要有说明"
 
 
+def test_broken_nested_entries_do_not_block_startup(paths: Paths):
+    """「下一级」写坏同样不能崩：少一对花括号的 sources、缺 id 的那本，都只是这一条不好使。
+
+    Novel/Source.from_dict 以前会拿字符串当字典读（AttributeError）或因缺 id 抛
+    TypeError，异常一路冒出 AppState() —— 启动.bat 没有控制台，现象就是托盘根本不出现。
+    """
+    from shunshu import store
+
+    store.LAST_LOAD_WARNINGS.clear()
+    good = _make_novel().to_dict()
+    paths.novels.write_text(json.dumps({"version": 2, "novels": [
+        {"id": "n1", "title": "花括号掉了", "primary_id": "n1",
+         "sources": ["https://book.example.com/12_3456/"]},
+        {"title": "没有 id 的一本", "sources": []},
+        good,
+    ]}, ensure_ascii=False), encoding="utf-8")
+
+    novels = load_novels(paths)
+    assert [n.id for n in novels] == ["n1", good["id"]], "坏的那本跳过，其余照常"
+    assert novels[0].sources == []
+    warnings = "；".join(store.LAST_LOAD_WARNINGS)
+    assert "sources 里没有一条能用" in warnings
+    assert "没有 id" in warnings
+
+
+def test_source_field_types_are_normalized(paths: Paths):
+    """手改的名单与代理字段类型不对时归一成能用的形状，别把 TypeError 留给轮询。"""
+    paths.novels.write_text(json.dumps({"version": 2, "novels": [{
+        "id": "n1", "title": "书", "primary_id": "s1",
+        "read_keys": None, "alerted_keys": {"a": 1},
+        "chapter_index": [{"t": "没有 k 的行"}, {"k": "000123|甲", "t": "第1章 甲",
+                           "u": "https://x.example.com/1.html"}],
+        "sources": [{"toc_url": "https://x.example.com/1/", "proxy": 7890,
+                     "keep_keys": "https://x.example.com/2.html", "notified_keys": None}],
+    }]}, ensure_ascii=False), encoding="utf-8")
+
+    novel = load_novels(paths)[0]
+    source = novel.sources[0]
+    assert novel.read_keys == [] and novel.alerted_keys == []
+    assert [e.k for e in novel.chapter_index] == ["000123|甲"]
+    assert source.proxy == "7890" and source.keep_keys == ["https://x.example.com/2.html"]
+    assert source.notified_keys == [] and source.known_keys() == set()
+    # id 是从目录页 URL 补算的，来源照样能用
+    assert source.id == source_id_for("https://x.example.com/1/")
+
+
+def test_sources_without_toc_url_are_dropped_with_warning(paths: Paths):
+    """没有目录页网址的来源抓不了：丢掉并说明，别让 urlsplit 在半路上炸。"""
+    from shunshu import store
+
+    store.LAST_LOAD_WARNINGS.clear()
+    paths.novels.write_text(json.dumps({"version": 2, "novels": [{
+        "id": "n1", "title": "书", "primary_id": "s1",
+        "sources": [{"id": "bad", "proxy": ""}, {"id": "s1", "toc_url": fixtures.BASE_URL}],
+    }]}, ensure_ascii=False), encoding="utf-8")
+
+    novels = load_novels(paths)
+    assert [s.id for s in novels[0].sources] == ["s1"]
+    assert "没有 toc_url" in "；".join(store.LAST_LOAD_WARNINGS)
+
+
+def test_site_proxies_values_are_normalized_to_text():
+    """site_proxies 的值也得到读取层归一：数字 7890 会在抓取入口的 .strip() 上抛
+    AttributeError，而那句在重试的 try 之外，一次坏记忆能让每轮都空跑。"""
+    cfg = Config.from_dict({"site_proxies": {"book.example.com": 7890, "m.book.example.com": None}})
+    assert cfg.site_proxies == {"book.example.com": "7890", "m.book.example.com": ""}
+
+
 def test_broken_config_json_is_quarantined_and_defaults_rewritten(tmp_path, monkeypatch):
     """config.json 改坏：备份原文件，重写一份干净默认值，工具照常启动。"""
     monkeypatch.setenv("SHUNSHU_DATA_DIR", str(tmp_path / "data"))
@@ -115,3 +183,24 @@ def test_toc_reset_new_ratio_is_configurable():
     """重编号阈值从配置读，默认 0.6（新标识占当前目录 60% 以上才判疑似重编号）。"""
     assert Config().toc_reset_new_ratio == 0.6
     assert Config(toc_reset_new_ratio=0.8).toc_reset_new_ratio == 0.8
+
+
+def test_duplicate_source_ids_are_dropped_with_warning(paths: Paths):
+    """整个来源块被复制进另一本书时 id 会撞车：轮询结果按来源 id 存字典，两个来源只剩
+    一个有结果，另一本书从此再也不更新。加载阶段就当成坏数据挡掉并说明。"""
+    from shunshu import store
+
+    store.LAST_LOAD_WARNINGS.clear()
+    shared = {"id": "s1", "toc_url": "https://x.example.com/1/", "site": "x"}
+    paths.novels.write_text(json.dumps({"version": 2, "novels": [
+        {"id": "n1", "title": "书一", "primary_id": "s1", "sources": [dict(shared)]},
+        {"id": "n2", "title": "书二", "primary_id": "s1", "sources": [dict(shared)]},
+        {"id": "n1", "title": "又一本 n1", "primary_id": "s9",
+         "sources": [{"id": "s9", "toc_url": "https://y.example.com/2/"}]},
+    ]}, ensure_ascii=False), encoding="utf-8")
+
+    novels = load_novels(paths)
+    assert [n.id for n in novels] == ["n1", "n2"], "整本重复的那条不该进来"
+    assert novels[1].sources == [], "撞车的来源得挡掉"
+    warnings = "；".join(store.LAST_LOAD_WARNINGS)
+    assert "id 重复" in warnings and "整本重复" in warnings

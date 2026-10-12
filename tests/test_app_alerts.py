@@ -121,3 +121,16 @@ def test_tray_pending_counts_novels_not_sources(app_state: AppState):
 
     app = TrayApp(app_state)
     assert len(app._pending_alerts()) == 1, "两个来源更同一章，待读只算一本"
+
+
+def test_read_keys_cap_zero_keeps_nothing(app_state: AppState):
+    """notified_keys_keep=0 时 read_keys 必须保持为空：del [:-0] 等于 del [:0]，
+    一条都删不掉会让已读列表无限增长。"""
+    from shunshu.models import Chapter
+
+    novel = app_state.add_novel(fixtures.BASE_URL)
+    app_state.cfg.notified_keys_keep = 0
+    assert app_state.mark_read(novel.id, Chapter(title="第1章", url="https://book.example.com/1/1.html", number=1))
+    assert app_state.mark_read(novel.id, Chapter(title="第2章", url="https://book.example.com/1/2.html", number=2))
+    reloaded = app_state.novel(novel.id)
+    assert reloaded.read_keys == [], "上限为 0 时已读记录不能累积"

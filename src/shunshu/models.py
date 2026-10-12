@@ -15,6 +15,7 @@ STATUS_PARSE_FAILED = "parse_failed"
 STATUS_NET_ERROR = "net_error"
 STATUS_PROXY_ERROR = "proxy_error"
 STATUS_DISABLED = "disabled"
+STATUS_CHECK_ERROR = "check_error"
 
 _LABELS = {
     STATUS_BASELINE: "首次记录",
@@ -25,6 +26,7 @@ _LABELS = {
     STATUS_NET_ERROR: "网络错误",
     STATUS_PROXY_ERROR: "代理不可用",
     STATUS_DISABLED: "已暂停",
+    STATUS_CHECK_ERROR: "检查异常",
 }
 
 _MULTI_NUM_RE = re.compile(r"(\d+)")
@@ -51,6 +53,19 @@ _PREFIX_NUM_RE = re.compile(r"^\s*(\d{1,6})\s*(?:[\s、.．:：_\-–—]|$)")
 
 def status_label(status: str) -> str:
     return _LABELS.get(status, status)
+
+
+def _str_list(value) -> list[str]:
+    """手改的名单字段统一成字符串列表。
+
+    裸字符串当一条收下（README 让人「把该章 URL 填进 keep_keys」，漏打方括号是最常见的写法）；
+    null 与对象当空；列表里的数字转成文本，嵌套对象丢掉。
+    """
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item) for item in value if isinstance(item, (str, int, float))]
 
 
 def chinese_to_int(text: str) -> int | None:
@@ -280,8 +295,14 @@ class Source:
     def from_dict(cls, data: dict) -> Source:
         known = set(cls.__dataclass_fields__)
         payload = {k: v for k, v in data.items() if k in known}
-        # 代理是手改 json 写的，null 或漏引号不该让整本书读不出来
-        payload["proxy"] = str(payload.get("proxy") or "")
+        # novels.json 是要给人手改的：这几个字段写成 null、数字或漏了引号，都只是这一条不好使，
+        # 不该让 AttributeError 冒到加载循环外面把整个工具拦在启动阶段
+        for key in ("id", "toc_url", "site", "title", "proxy"):
+            payload[key] = str(payload.get(key) or "")
+        if payload.get("selector"):
+            payload["selector"] = str(payload["selector"])
+        for key in ("keep_keys", "drop_keys", "notified_keys"):
+            payload[key] = _str_list(payload.get(key))
         return cls(**payload)
 
 
@@ -343,7 +364,8 @@ class Novel:
     def mark_alerted(self, keys: list[str], keep: int = 500) -> None:
         existing = set(self.alerted_keys)
         merged = self.alerted_keys + [k for k in keys if k not in existing]
-        self.alerted_keys = merged[-keep:]
+        # keep=0 表示一个都不留：[-0:] 会退化成 [0:] 把整份留下来，必须显式清空
+        self.alerted_keys = merged[-keep:] if keep > 0 else []
 
     def add_to_index(self, entries: list[ChapterEntry], rows: int = 50) -> None:
         """索引只留最近 `rows` 章，新在前；同一章保留最先报它的那个来源。"""
@@ -363,12 +385,25 @@ class Novel:
     def from_dict(cls, data: dict) -> Novel:
         known = set(cls.__dataclass_fields__)
         payload = {k: v for k, v in data.items() if k in known}
-        payload["sources"] = [Source.from_dict(s) for s in data.get("sources") or []]
-        entry_fields = set(ChapterEntry.__dataclass_fields__)
-        payload["chapter_index"] = [
-            ChapterEntry(**{k: v for k, v in e.items() if k in entry_fields})
-            for e in data.get("chapter_index") or [] if isinstance(e, dict)
-        ]
+        payload["title"] = str(payload.get("title") or "")
+        payload["primary_id"] = str(payload.get("primary_id") or "")
+        payload["id"] = str(payload.get("id") or "")
+        # 来源被写成字符串（少打一对花括号）时丢掉那一条，别把整本带下水
+        raw_sources = payload.get("sources")
+        payload["sources"] = [Source.from_dict(s) for s in
+                              (raw_sources if isinstance(raw_sources, list) else [])
+                              if isinstance(s, dict)]
+        for key in ("read_keys", "alerted_keys"):
+            payload[key] = _str_list(payload.get(key))
+        raw_index = payload.get("chapter_index")
+        entries = []
+        for entry in (raw_index if isinstance(raw_index, list) else []):
+            # k 是跨源身份，没有它这行就没法去重，单行跳过
+            if isinstance(entry, dict) and entry.get("k"):
+                entries.append(ChapterEntry(k=str(entry["k"]), t=str(entry.get("t") or ""),
+                                            u=str(entry.get("u") or ""), s=str(entry.get("s") or ""),
+                                            n=entry.get("n"), ts=str(entry.get("ts") or "")))
+        payload["chapter_index"] = entries
         return cls(**payload)
 
 

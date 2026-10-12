@@ -335,8 +335,7 @@ def container_by_selector(page: Page, selector: str) -> Container:
     raise TocDetectError(f"手写的 selector 没有匹配到含链接的元素: {selector}", [])
 
 
-def build_chapters(links: list[LinkInfo], position_offset: int = 0,
-                   order_threshold: float = 0.6) -> list[Chapter]:
+def build_chapters(links: list[LinkInfo], order_threshold: float = 0.6) -> list[Chapter]:
     """按 key 去重后交给 `ordered_chapters` 排新旧：目录里的出现顺序才是站点的说法。"""
     chapters: dict[str, Chapter] = {}
     for pos, info in enumerate(links):
@@ -347,7 +346,7 @@ def build_chapters(links: list[LinkInfo], position_offset: int = 0,
             continue
         chapters[key] = Chapter(
             title=info.text, url=info.url, number=info.number,
-            position=position_offset + pos, raw_title=info.raw_text,
+            position=pos, raw_title=info.raw_text,
         )
     return ordered_chapters(list(chapters.values()), order_threshold)
 

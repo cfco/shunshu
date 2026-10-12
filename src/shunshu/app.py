@@ -24,7 +24,7 @@ from .models import (
     status_label,
     strip_www,
 )
-from .monitor import check_all, check_source, collect_alerts
+from .monitor import check_all, check_source_safe, collect_alerts
 from .notify import Notifier
 from .store import (
     Paths,
@@ -49,7 +49,14 @@ class AppState:
         self.paths = paths or Paths()
         self.paths.ensure()
         self._lock = threading.RLock()
+        # 整轮级互斥：check_one（添加书源的首轮检查）与 run_round（定时轮）不同时抓取，
+        # 避免同一个来源被两条线程同时抓、状态互相覆盖。与 AppState._lock 分开：
+        # 本锁跨网络请求持有，_lock 只保护数据结构
+        self._round_lock = threading.Lock()
         self.last_alerts: list[NovelAlert] = []
+        # 整个进程共用一个 Notifier：卡片槽位是按「最近 12.5 秒里占了几个位置」算的，
+        # 每轮新建一份就等于每轮都从 0 开始数，托盘回执与更新卡全挤在同一个位置
+        self.notifier = Notifier(self.paths.alerts_log)
         self.reload()
 
     # ---------- 配置与书架 ----------
@@ -99,8 +106,8 @@ class AppState:
                 workers=self._cfg.concurrency,
             )
             self.load_warnings = list(LAST_LOAD_WARNINGS)
-        # 旧抓取器的常驻连接池在锁外释放：不阻塞菜单。正在执行的抓取跑完为止不等（wait=False），
-        # 还在排队的直接取消——配置都重载了，替旧配置继续排队没有意义
+        # 旧抓取器的常驻连接池在锁外释放：不阻塞菜单。正在执行的与还在排队的抓取都让它跑完
+        # （wait=False 且不取消）——某一轮正攥着这些 future，取消会让整轮记账作废，见 Fetcher.close
         if old_fetcher is not None:
             close = getattr(old_fetcher, "close", None)
             if close is not None:
@@ -225,7 +232,10 @@ class AppState:
     def _remember_read(self, novel: Novel, key: str) -> None:
         novel.read_keys.append(key)
         cap = self._cfg.notified_keys_keep
-        if len(novel.read_keys) > cap:
+        if cap <= 0:
+            # cap=0 表示一个都不留：del [:-0] 等于 del [:0] 一条都删不掉，必须显式清空
+            novel.read_keys.clear()
+        elif len(novel.read_keys) > cap:
             del novel.read_keys[:-cap]
 
     def _absorb_read_marks(self) -> int:
@@ -280,11 +290,12 @@ class AppState:
             # （非空且不等于记忆）才算手写代理，永远不被自动探测覆盖
             manual = current and current != remembered
             if manual:
-                return ProbeResult(proxy=current)
+                # 尊重手写覆盖：一个包都没试，probed=False 让调用别说成「探出来是这个」
+                return ProbeResult(proxy=current, probed=False)
             if not force and remembered is not None:
                 source.proxy = remembered
                 save_novels(self.paths, self._novels)
-                return ProbeResult(proxy=remembered)
+                return ProbeResult(proxy=remembered, probed=False)
             user_agent = self._cfg.user_agent
             max_bytes = self._cfg.max_response_bytes
             toc_url = source.toc_url
@@ -310,6 +321,9 @@ class AppState:
 
         只在 consecutive_failures 恰好涨到阈值的这一轮触发：仍失败则计数继续涨，
         不会每轮都重探；恢复成功后计数清零，将来再坏到阈值还能再来一次。
+
+        只有真敲过门的结果才清失败计数：手写代理走的是「原样尊重」那条分支，根本没探，
+        把它当「重探成功」会让死代理每 5 轮被清零一次、永远退避不起来，日志还会谎报改走了新代理。
         """
         threshold = self._cfg.failure_backoff_threshold
         for outcome in outcomes:
@@ -318,7 +332,7 @@ class AppState:
             if outcome.source.consecutive_failures != threshold:
                 continue
             result = self.ensure_source_proxy(outcome.source.id, force=True)
-            if result is None:
+            if result is None or not result.probed:
                 continue
             with self._lock:
                 source = self._source_by_id(outcome.source.id)
@@ -352,48 +366,52 @@ class AppState:
         prefetch 形如 {来源id: 已抓回的首页 HTML}，添加书源时把代理探测那一下的
         响应透传过来复用，少敲一次门。
         """
-        with self._lock:
-            self._absorb_read_marks()
-            novel = find_novel(self._novels, ident)
-            if novel is None:
-                return []
-            plan = [(source, site_key(source.toc_url)) for source in novel.sources]
-            rules = self._rules
-            fetcher = self._fetcher
-        prefetch = prefetch or {}
-        outcomes: list[Outcome] = []
-        previous_host = ""
-        for source, host in plan:
-            if previous_host and host and host == previous_host:
-                # 同一本书的多个来源常挂在同一个域/同一个反代上，串起来打，别并发敲门
-                sleep_seconds(rules.cfg.same_host_delay_seconds)
-            previous_host = host
-            html = prefetch.get(source.id)
-            outcomes.append(check_source(novel, source, rules, fetcher, self.paths,
-                                         prefetch=html or None))
-        for outcome in outcomes:
-            self._log(outcome)
-        self._reprobe_dead_proxies(outcomes)
-        self._collect([novel], outcomes, notify)
-        return outcomes
+        # 整轮级互斥：定时轮正在跑时这里等它跑完再抓，同一来源绝不被两条线程同时抓
+        with self._round_lock:
+            with self._lock:
+                self._absorb_read_marks()
+                novel = find_novel(self._novels, ident)
+                if novel is None:
+                    return []
+                plan = [(source, site_key(source.toc_url)) for source in novel.sources]
+                rules = self._rules
+                fetcher = self._fetcher
+            prefetch = prefetch or {}
+            outcomes: list[Outcome] = []
+            previous_host = ""
+            for source, host in plan:
+                if previous_host and host and host == previous_host:
+                    # 同一本书的多个来源常挂在同一个域/同一个反代上，串起来打，别并发敲门
+                    sleep_seconds(rules.cfg.same_host_delay_seconds)
+                previous_host = host
+                html = prefetch.get(source.id)
+                outcomes.append(check_source_safe(novel, source, rules, fetcher, self.paths,
+                                                  prefetch=html or None))
+            for outcome in outcomes:
+                self._log(outcome)
+            self._reprobe_dead_proxies(outcomes)
+            self._collect([novel], outcomes, notify)
+            return outcomes
 
     def run_round(self, skip_ids: set[str] | None = None, notify: bool = True) -> list[Outcome]:
-        with self._lock:
-            self._absorb_read_marks()
-            novels = list(self._novels)
-            rules = self._rules
-            fetcher = self._fetcher
-        if not novels:
-            return []
-        results = check_all(novels, rules, fetcher, self.paths, skip_ids=skip_ids)
-        ordered = [results[s.id] for n in novels for s in n.sources if s.id in results]
-        for outcome in ordered:
-            self._log(outcome)
-        # 定时轮里发现代理彻底失效（到退避阈值）也自动重探一次：重探成功会清掉失败
-        # 计数，调度器随后算退避时自然不再跳过这个来源
-        self._reprobe_dead_proxies(ordered)
-        self._collect(novels, ordered, notify)
-        return ordered
+        # 整轮级互斥：与 check_one（添加书源首轮）互斥，同一来源不会被两条线程同时抓
+        with self._round_lock:
+            with self._lock:
+                self._absorb_read_marks()
+                novels = list(self._novels)
+                rules = self._rules
+                fetcher = self._fetcher
+            if not novels:
+                return []
+            results = check_all(novels, rules, fetcher, self.paths, skip_ids=skip_ids)
+            ordered = [results[s.id] for n in novels for s in n.sources if s.id in results]
+            for outcome in ordered:
+                self._log(outcome)
+            # 定时轮里发现代理彻底失效（到退避阈值）也自动重探一次：重探成功会清掉失败
+            # 计数，调度器随后算退避时自然不再跳过这个来源
+            self._reprobe_dead_proxies(ordered)
+            self._collect(novels, ordered, notify)
+            return ordered
 
     def _collect(self, novels: list[Novel], outcomes: list[Outcome], notify: bool) -> list[NovelAlert]:
         """把「各来源各自的新章」压成「这本书要提醒什么」，然后每本一张卡片。
@@ -405,7 +423,7 @@ class AppState:
             save_novels(self.paths, self._novels)
             self.last_alerts = alerts
         if notify:
-            Notifier(self.paths.alerts_log).notify_many(alerts)
+            self.notifier.notify_many(alerts)
         return alerts
 
     def _log(self, outcome: Outcome) -> None:

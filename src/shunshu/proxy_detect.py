@@ -50,10 +50,15 @@ class ProbeResult:
 
     html 是探测那一下抓回的目录页 HTML：首轮建档直接复用，省掉重复的一次敲门；
     站点虽可达但内容不可用（4xx/非 HTML 等）时留空串，首轮照常自己再抓。
+
+    probed 说明这个结论是不是真敲过门：套用已有记忆、或尊重手写代理时根本没探，
+    调用方不能把「没探」当成「探通了」——代理失效自动重探那条路就是靠它区分，
+    否则手写的死代理每轮到阈值就被清一次计数，永远退避不起来，日志还谎报改走了新代理。
     """
 
     proxy: str
     html: str = ""
+    probed: bool = True
 
 
 def _endpoint_key(candidate: str) -> tuple[str, int] | None:

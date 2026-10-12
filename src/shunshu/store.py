@@ -120,14 +120,63 @@ def load_novels(paths: Paths) -> list[Novel]:
         quarantine_broken_json(paths.novels, f"顶层类型是 {type(raw).__name__}，不是对象/数组")
         return []
     items = raw.get("novels", raw) if isinstance(raw, dict) else raw
+    if not isinstance(items, list):
+        LAST_LOAD_WARNINGS.append(
+            f"novels.json 里没有 novels 数组（是 {type(items).__name__}），本次按空书架启动")
+        return []
     novels: list[Novel] = []
+    seen_novel_ids: set[str] = set()
+    seen_source_ids: set[str] = set()
     for item in items:
         # 单本写坏不连累整架：跳过那一条并留警告，其余照常加载
-        if isinstance(item, dict):
-            novels.append(Novel.from_dict(item))
-        else:
+        if not isinstance(item, dict):
             LAST_LOAD_WARNINGS.append(f"novels.json 里有一条不是对象（{type(item).__name__}），已跳过")
+            continue
+        try:
+            novel = Novel.from_dict(item)
+        except (TypeError, ValueError, AttributeError) as exc:
+            LAST_LOAD_WARNINGS.append(
+                f"novels.json 里有一条读不出来（{type(exc).__name__}: {exc}），已跳过")
+            continue
+        if not novel.id:
+            LAST_LOAD_WARNINGS.append("novels.json 里有一条没有 id，已跳过")
+            continue
+        if novel.id in seen_novel_ids:
+            LAST_LOAD_WARNINGS.append(f"《{novel.title or novel.id}》整本重复（id 一样），已跳过")
+            continue
+        seen_novel_ids.add(novel.id)
+        # 小说 id 与来源 id 各查各的：add_novel 让新书的 novel.id 等于首源 id，
+        # 混在一个集合里会让每本书的第一个来源都「自己跟自己重复」
+        _repair_sources(novel, seen_source_ids)
+        if not novel.sources and item.get("sources"):
+            LAST_LOAD_WARNINGS.append(
+                f"《{novel.title or novel.id}》的 sources 里没有一条能用（写坏的已跳过）")
+        novels.append(novel)
     return novels
+
+
+def _repair_sources(novel: Novel, seen_source_ids: set[str]) -> None:
+    """补齐来源 id、丢掉抓不了的来源，并把重复的 id 挡在门外。
+
+    id 本就是目录页 URL 的 sha1 前 12 位，缺了就按 toc_url 补算。整个来源块被复制进
+    另一本书时 id 会撞车：轮询结果按来源 id 存字典，撞车的两个来源只剩一个有结果，
+    另一本书从此永远不更新，所以这里就当坏数据挡掉。
+    """
+    kept: list[Source] = []
+    for source in novel.sources:
+        if not source.toc_url:
+            LAST_LOAD_WARNINGS.append(
+                f"《{novel.title or novel.id}》有个来源没有 toc_url，已跳过该来源")
+            continue
+        if not source.id:
+            source.id = source_id_for(source.toc_url)
+        if source.id in seen_source_ids:
+            LAST_LOAD_WARNINGS.append(
+                f"《{novel.title or novel.id}》的来源 {source.site or source.id} id 重复，已跳过该来源")
+            continue
+        seen_source_ids.add(source.id)
+        kept.append(source)
+    novel.sources = kept
 
 
 def save_novels(paths: Paths, novels: list[Novel]) -> None:
@@ -237,8 +286,22 @@ def drain_jsonl(path: Path) -> list[dict]:
             path.rename(tmp)
         except OSError:
             return []
-        text = tmp.read_text(encoding="utf-8-sig")
+        try:
+            with tmp.open("rb") as fh:
+                data = fh.read()
+                # 读完到删除之间卡片又写了一条的：同一个句柄接着读能拿到，
+                # 原样搬回正主文件交给下一轮吸收，别连着 .draining 一起 unlink 掉
+                late = fh.read()
+        except OSError:
+            return []
+        if late:
+            try:
+                with path.open("ab") as fh:
+                    fh.write(late)
+            except OSError:
+                pass
         tmp.unlink(missing_ok=True)
+        text = data.decode("utf-8-sig", "replace")
     out: list[dict] = []
     for line in text.splitlines():
         line = line.strip()

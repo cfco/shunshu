@@ -163,7 +163,12 @@ class Config:
             if key not in cls.__dataclass_fields__ or value is None:
                 continue
             # 手改 config.json 把字典字段写成别的类型时别让整个工具起不来
-            if key == "site_proxies" and not isinstance(value, dict):
+            if key == "site_proxies":
+                # 值也要归一：写成 7890 这种数字会在 proxy_endpoints 的 .strip() 上抛
+                # AttributeError，而那句在抓取重试的 try 之外，能把整轮检查带走
+                if isinstance(value, dict):
+                    cfg.site_proxies = {str(host): str(proxy or "")
+                                        for host, proxy in value.items()}
                 continue
             coerced = _coerce_field(key, value)
             if coerced is None:
@@ -264,8 +269,8 @@ def load_config(create_if_missing: bool = True) -> Config:
 
 
 def save_config(cfg: Config) -> None:
-    path = config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(cfg.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    # 原子写复用 store 的实现（临时文件 + os.replace + 模块级写锁）；
+    # 延迟导入是因为 store 顶部要引本模块的 data_dir，顶层导入会成环
+    from .store import write_json_atomic
+
+    write_json_atomic(config_path(), cfg.to_dict())

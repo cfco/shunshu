@@ -147,6 +147,19 @@ def test_chapter_index_and_alert_ledger_round_trip():
     assert restored.site_of(entry.s) == "y.com"
 
 
+def test_mark_alerted_with_keep_zero_clears_the_ledger():
+    """keep=0 表示一个都不留：[-0:] 会退化成 [0:] 把整份留下，必须显式清空。"""
+    from shunshu.models import Novel
+
+    novel = Novel(id="a", alerted_keys=["000001|旧章"])
+    novel.mark_alerted(["000062|新章"], keep=0)
+    assert novel.alerted_keys == [], "上限为 0 时账本必须清空，而不是无限增长"
+
+    novel2 = Novel(id="b")
+    novel2.mark_alerted(["k1", "k2", "k3"], keep=2)
+    assert novel2.alerted_keys == ["k2", "k3"], "正常上限按尾部保留"
+
+
 def test_add_to_index_never_reassigns_a_chapter_to_a_later_source():
     """同一章后来的来源只能补充，不能改写归属；索引按新在前截断。"""
     from shunshu.models import ChapterEntry, Novel

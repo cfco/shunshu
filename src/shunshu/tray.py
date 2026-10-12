@@ -20,6 +20,7 @@ from .instance import acquire_singleton
 from .http import proxy_label
 from .models import (
     STATUS_BASELINE,
+    STATUS_CHECK_ERROR,
     STATUS_PARSE_FAILED,
     STATUS_PROXY_ERROR,
     STATUS_UPDATED,
@@ -28,7 +29,6 @@ from .models import (
     Source,
     status_label,
 )
-from .notify import Notifier
 from .scheduler import Scheduler
 
 _CONFIRM_WINDOW_SECONDS = 10.0
@@ -58,7 +58,8 @@ def make_icon_image(state: str = "normal") -> Image.Image:
 class TrayApp:
     def __init__(self, state: AppState | None = None):
         self.state = state or AppState()
-        self.notifier = Notifier(alerts_path=self.state.paths.alerts_log)
+        # 与轮询共用同一个 Notifier：不然托盘回执和更新卡片各自数各自的槽位，永远都从 0 开始
+        self.notifier = self.state.notifier
         self.scheduler = Scheduler(self.state, on_round=self._after_round)
         self.icon: pystray.Icon | None = None
         self._pending_delete: tuple[str, float] | None = None
@@ -111,13 +112,6 @@ class TrayApp:
             self._flash("配置已重新加载（有降级）", "；".join(warnings))
         else:
             self._flash("已重新加载配置", "data/config.json 与 data/novels.json 已生效")
-
-    def act_check_now(self, icon=None, item=None) -> None:
-        self._start_bg(self.scheduler.run_once, force=True)
-        self._flash("开始检查", f"{len(self.state.novels)} 本 {len(self.state.sources)} 个来源")
-
-    def act_check_novel(self, novel_id: str, icon=None, item=None) -> None:
-        self._start_bg(self._check_one_async, novel_id)
 
     def act_open_latest(self, novel_id: str, icon=None, item=None) -> None:
         novel = self.state.novel(novel_id)
@@ -219,7 +213,11 @@ class TrayApp:
         probed = self._probe_or_report(novel_id)
         if probed is None:
             return
-        prefetch = {novel_id: probed.html} if probed.html else None
+        # prefetch 必须按「来源 id」存（check_one 里按 source.id 取）：
+        # 新书的首源 id 恰好等于书 id，但那是 add_novel 的巧合，不能依赖
+        novel = self.state.novel(novel_id)
+        source_id = novel.sources[0].id if novel and novel.sources else novel_id
+        prefetch = {source_id: probed.html} if probed.html else None
         self._flash_outcomes(self.state.check_one(novel_id, prefetch=prefetch))
         self._rebuild_menu()
 
@@ -246,14 +244,10 @@ class TrayApp:
         self._flash(
             "连不上这个网站",
             "直连不通，也没试出可用的本机代理；可在 novels.json 给该来源手写 proxy，"
-            "或删掉 config.json 里 site_proxies 的该站记录后点「立即检查本书」重试",
+            "或删掉 config.json 里 site_proxies 的该站记录后重新添加一次重试",
         )
         self._rebuild_menu()
         return None
-
-    def _check_one_async(self, novel_id: str) -> None:
-        self._flash_outcomes(self.state.check_one(novel_id))
-        self._rebuild_menu()
 
     def _flash_outcomes(self, outcomes) -> None:
         """弹了卡片的就不再回执；无更新、解析失败、代理不通这些得说一声。"""
@@ -334,7 +328,6 @@ class TrayApp:
             pystray.MenuItem("添加小说（从剪贴板）", self.act_add_from_clipboard),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("重新加载配置", self.act_reload_config),
-            pystray.MenuItem("立即检查全部", self.act_check_now),
             pystray.MenuItem("扫描间隔", pystray.Menu(self._interval_items)),
             pystray.MenuItem("开机自启", self.act_toggle_autostart,
                              checked=lambda item: autostart.is_enabled()),
@@ -361,7 +354,8 @@ class TrayApp:
     def _source_state_text(self, source: Source) -> str:
         if not source.enabled:
             return "已暂停"
-        if source.status in (STATUS_UPDATED, STATUS_PARSE_FAILED, STATUS_PROXY_ERROR):
+        if source.status in (STATUS_UPDATED, STATUS_PARSE_FAILED, STATUS_PROXY_ERROR,
+                             STATUS_CHECK_ERROR):
             return source.status_detail or status_label(source.status)
         return status_label(source.status)
 
@@ -371,7 +365,6 @@ class TrayApp:
             return
         if novel.latest_chapter() is not None:
             yield pystray.MenuItem("打开最新章节", partial(self.act_open_latest, novel_id))
-        yield pystray.MenuItem("立即检查本书", partial(self.act_check_novel, novel_id))
         yield pystray.MenuItem("添加来源到本书（从剪贴板）",
                                partial(self.act_add_source_from_clipboard, novel_id))
         yield pystray.MenuItem("暂停本书" if all(s.enabled for s in novel.sources) else "恢复本书",

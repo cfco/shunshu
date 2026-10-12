@@ -5,17 +5,20 @@ from shunshu.config import Config
 from shunshu.http import FetchError, ProxyError
 from shunshu.models import (
     STATUS_BASELINE,
+    STATUS_CHECK_ERROR,
     STATUS_NET_ERROR,
     STATUS_PROXY_ERROR,
     STATUS_NO_CHANGE,
     STATUS_TOC_RESET,
     STATUS_UPDATED,
+    Chapter,
     Novel,
+    Outcome,
     Source,
     normalize_chapter_url,
     status_label,
 )
-from shunshu.monitor import check_source, collect_alerts
+from shunshu.monitor import check_all, check_source, check_source_safe, collect_alerts
 from shunshu.reader import load_toc
 from shunshu.store import read_jsonl, source_id_for
 
@@ -454,3 +457,106 @@ def test_big_toc_keeps_every_chapter_still_listed(paths):
 
     second = check_source(novel, first(novel), rules, fetcher, paths)
     assert second.status == STATUS_NO_CHANGE, "同一份目录不该第二轮就冒出 70 章更新"
+
+
+def test_unexpected_crash_is_isolated_to_one_source(paths):
+    """没预料到的异常只能砸中它自己那个来源，整轮的记账与提醒必须照跑。
+
+    这类异常（解析层崩、来源字段被手改成没法用的形状）不属于 check_source 认得的
+    任何一类错误，以前会从工作线程逃到 f.result() 再重抛，_collect 就此不执行：
+    那一轮已经写进来源级 notified_keys 的章节永远不会再提醒，托盘却毫无表示。
+    """
+    boom_url = "https://boom.example.com/1/"
+    bad = make_novel(boom_url)
+    good = make_novel("https://other.example.com/9/")
+
+    class Crasher(FakeFetcher):
+        def fetch_html(self, url: str, proxy: str = "") -> str:
+            if url == boom_url:
+                raise RuntimeError("解析层炸了")
+            return super().fetch_html(url, proxy)
+
+    fetcher = Crasher({good.sources[0].toc_url: fixtures.normal_html()})
+    outcomes = check_all([bad, good], RULES, fetcher, paths)
+
+    assert len(outcomes) == 2, "一个来源崩了不能带走另一个"
+    crashed = outcomes[bad.sources[0].id]
+    assert crashed.status == STATUS_CHECK_ERROR
+    assert "RuntimeError" in crashed.message
+    assert bad.sources[0].consecutive_failures == 1, "崩一次也算失败，要进退避"
+    assert outcomes[good.sources[0].id].status == STATUS_BASELINE
+    assert paths.runtime_log.read_text(encoding="utf-8").count("检查异常") == 1
+
+
+def test_check_source_safe_covers_the_single_book_path(paths):
+    """「添加书源首轮」走的是同一条兜底：意外异常不会把后台线程白死掉。"""
+    novel = make_novel()
+
+    class Crasher(FakeFetcher):
+        def fetch_html(self, url: str, proxy: str = "") -> str:
+            raise RuntimeError("解析层炸了")
+
+    outcome = check_source_safe(novel, first(novel), RULES, Crasher({}), paths)
+    assert outcome.status == STATUS_CHECK_ERROR
+    assert status_label(STATUS_CHECK_ERROR) == "检查异常"
+    assert "解析层炸了" in outcome.detail()
+
+
+def test_collect_alerts_orders_across_sources_by_distance_from_end():
+    """合卡首行取「离自己目录末尾最近」的那章，不是目录名次最大的那章。
+
+    主源列全目录（第62章名次 999），镜像只列最近 20 章（第63章名次 19）：
+    跨来源直接比名次会把旧一章排在前面，卡片首行就不是最新章。
+    """
+    novel = Novel(id="n1", title="书", primary_id="s1")
+    main = Source(id="s1", toc_url="https://a.example/1/", site="a", chapter_count=1000)
+    mirror = Source(id="s2", toc_url="https://b.example/1/", site="b", chapter_count=20)
+    novel.sources = [main, mirror]
+    c62 = Chapter(title="第62章 甲", url="https://a.example/1/62.html", number=62, position=999)
+    c63 = Chapter(title="第63章 乙", url="https://b.example/1/63.html", number=63, position=19)
+    outcomes = [Outcome(novel=novel, source=main, status=STATUS_UPDATED, all_new=[c62]),
+                Outcome(novel=novel, source=mirror, status=STATUS_UPDATED, all_new=[c63])]
+
+    alerts = collect_alerts([novel], outcomes)
+
+    assert [e.t for e in novel.chapter_index] == ["第63章 乙", "第62章 甲"]
+    assert [e.t for e in alerts[0].entries] == ["第63章 乙", "第62章 甲"]
+    assert alerts[0].origin_text() == "来自 b、a"
+
+
+def test_collect_alerts_same_relative_age_prefers_bigger_number():
+    """两个来源各报到「自己目录末尾同样远」的一章时，按章节号分新旧。"""
+    novel = Novel(id="n1", title="书", primary_id="s1")
+    main = Source(id="s1", toc_url="https://a.example/1/", site="a", chapter_count=100)
+    mirror = Source(id="s2", toc_url="https://b.example/1/", site="b", chapter_count=20)
+    novel.sources = [main, mirror]
+    late = Chapter(title="第63章 乙", url="https://a.example/1/63.html", number=63, position=99)
+    early = Chapter(title="第62章 甲", url="https://b.example/1/62.html", number=62, position=19)
+
+    collect_alerts([novel], [Outcome(novel=novel, source=main, status=STATUS_UPDATED, all_new=[late]),
+                             Outcome(novel=novel, source=mirror, status=STATUS_UPDATED, all_new=[early])])
+
+    assert [e.t for e in novel.chapter_index] == ["第63章 乙", "第62章 甲"]
+
+
+def test_handwritten_selector_also_follows_last_page():
+    """手写了 selector 也要跟末页：只敲首页的话，分页站的最新章节永远看不到。"""
+    result = load_toc(FakeFetcher({
+        fixtures.BASE_URL: fixtures.paged_first_html(),
+        fixtures.BASE_URL + "_20.html": fixtures.paged_last_html(),
+    }), fixtures.BASE_URL, RULES, selector="div.listmain dl")
+
+    assert result.toc.pages_followed == 2
+    assert result.toc.chapters[-1].title == "第六百章 大结局"
+    assert result.pages == [fixtures.BASE_URL, fixtures.BASE_URL + "_20.html"]
+
+
+def test_handwritten_selector_falls_back_when_second_page_differs():
+    """第二页结构不同、selector 认不出时退回只用首页，别把整次检查判成解析失败。"""
+    result = load_toc(FakeFetcher({
+        fixtures.BASE_URL: fixtures.paged_first_html(),
+        fixtures.BASE_URL + "_20.html": "<html><body><p>这一页没有目录</p></body></html>",
+    }), fixtures.BASE_URL, RULES, selector="div.listmain dl")
+
+    assert result.toc.pages_followed == 1
+    assert len(result.toc.chapters) == 60

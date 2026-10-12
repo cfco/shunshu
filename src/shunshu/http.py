@@ -212,12 +212,14 @@ class Fetcher:
     def close(self) -> None:
         """释放常驻池：重新加载配置换 Fetcher、进程退出时调用。假抓取器没有此方法，调用前先 getattr。
 
-        这里才取消还在排队的任务（cancel_futures）：调用方已经放弃这个抓取器，
-        排队的抓取没有继续跑的意义；正在执行的任务不受影响，跑完自然退出。
+        与 `pool()` 换池同一个口径：只关不停，**不取消还在排队的抓取**。正在跑的那一轮
+        手里还攥着这些 future，取消了 `f.result()` 就抛 CancelledError，整轮的记账
+        （`_collect`）跟着不执行——那一轮已经写进来源级 notified_keys 的章节就此永远不再提醒。
+        让旧池把已提交的任务跑完，线程自己退出，代价只是几次没人听的请求。
         """
         with self._pool_lock:
             if self._pool is not None:
-                self._pool.shutdown(wait=False, cancel_futures=True)
+                self._pool.shutdown(wait=False)
                 self._pool = None
                 self._pool_workers = 0
 

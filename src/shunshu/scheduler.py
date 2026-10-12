@@ -65,8 +65,7 @@ class Scheduler:
         """
         while not self._stop.is_set():
             wait = self.next_wait_seconds()
-            # 「立即检查」直接在独立线程里跑 run_once(force=True)，不动这个循环；
-            # _wake 现在只用于 stop() 立刻打断等待，让退出不用再等一个完整间隔
+            # _wake 只用于 stop() 立刻打断等待，让退出不用再等一个完整间隔
             if self._wake.wait(timeout=wait):
                 self._wake.clear()
             if self._stop.is_set():
