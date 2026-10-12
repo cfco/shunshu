@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .models import CN_LABEL_CHARS, CN_NUM_CHARS
+from .packaging import is_packaged, self_executable
 
 APP_NAME = "shunshu"
 # 托盘菜单里扫描间隔的固定选项：5/10/30/60 分钟，用户只能四选一
@@ -59,8 +59,14 @@ def normalize_text(text: str) -> str:
 
 
 def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
+    """程序基准目录：data/ 就建在它旁边。
+
+    打包态取真实 exe（sys.argv[0]）所在目录。Nuitka onefile 运行时 __file__ 位于
+    按版本变化的解包临时目录里，用它定位会导致每次升级后书架与 site_proxies 记忆
+    全部"丢失"。源码态向上找 pyproject.toml 所在的项目根。
+    """
+    if is_packaged():
+        return Path(self_executable()).parent
     for parent in Path(__file__).resolve().parents:
         if (parent / "pyproject.toml").exists():
             return parent
@@ -88,6 +94,8 @@ class Config:
     notified_keys_keep: int = 500
     max_report_new_chapters: int = 30
     toc_reset_overlap_ratio: float = 0.35
+    # 一次冒出的新标识占当前目录比例超过此值就判「疑似重编号」，只记录不提醒
+    toc_reset_new_ratio: float = 0.6
     # 目录正/倒序判断：编号升序占比超过此阈值就认作正序，低于 (1 - 阈值) 认作倒序
     order_trend_threshold: float = 0.6
     failure_backoff_threshold: int = 5
@@ -99,6 +107,9 @@ class Config:
     ad_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_AD_PATTERNS))
     title_suffixes: list[str] = field(default_factory=lambda: list(DEFAULT_TITLE_SUFFIXES))
     host_whitelist: list[str] = field(default_factory=list)
+    # 添加书源时自动探测的站点代理记忆：主机名（去 www）→ 代理 URL；
+    # 空串表示探测过、直连可达。同站点再添来源直接套用，不再探测。可手改/删键后重新探测。
+    site_proxies: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -107,8 +118,12 @@ class Config:
     def from_dict(cls, data: dict | None) -> Config:
         cfg = cls()
         for key, value in (data or {}).items():
-            if key in cls.__dataclass_fields__ and value is not None:
-                setattr(cfg, key, value)
+            if key not in cls.__dataclass_fields__ or value is None:
+                continue
+            # 手改 config.json 把字典字段写成别的类型时别让整个工具起不来
+            if key == "site_proxies" and not isinstance(value, dict):
+                continue
+            setattr(cfg, key, value)
         return cfg
 
     def compiled(self) -> Rules:
@@ -128,13 +143,28 @@ class Rules:
 
     @classmethod
     def build(cls, cfg: Config) -> Rules:
+        # 内置名单始终并进用户配置：老用户 config.json 里固化的旧名单也能收到版本更新
+        # 带来的新默认项；用户自己加的条目原样保留，按首次出现顺序去重
         return cls(
             cfg,
-            frozenset(filter(None, (normalize_text(t) for t in cfg.ad_exact_texts))),
-            _compile(cfg.ad_patterns, re.I),
-            _compile(cfg.title_suffixes, 0),
+            frozenset(filter(None, (
+                normalize_text(t) for t in _union_lists(DEFAULT_AD_EXACT, cfg.ad_exact_texts)))),
+            _compile(_union_lists(DEFAULT_AD_PATTERNS, cfg.ad_patterns), re.I),
+            _compile(_union_lists(DEFAULT_TITLE_SUFFIXES, cfg.title_suffixes), 0),
             frozenset((h or "").strip().lower() for h in cfg.host_whitelist),
         )
+
+
+def _union_lists(builtin: list[str], custom: list[str]) -> list[str]:
+    """内置项在前、用户项在后，按原文去重保序：内置名单更新所有用户都能立刻用上。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in [*builtin, *(custom or [])]:
+        if item is None or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
 
 
 def _compile(patterns: list[str], flags: int) -> list[re.Pattern]:
@@ -152,13 +182,36 @@ def config_path() -> Path:
 
 
 def load_config(create_if_missing: bool = True) -> Config:
+    """读 config.json；文件不存在就生成默认配置，手改坏了就隔离备份并退回默认值。
+
+    损坏时不让工具起不来：原文件改名成带时间戳的 .bak，重写一份干净默认配置，
+    降级说明经 store.LAST_LOAD_WARNINGS 交给托盘弹卡。
+    """
     path = config_path()
     if not path.exists():
         cfg = Config()
         if create_if_missing:
             save_config(cfg)
         return cfg
-    return Config.from_dict(json.loads(path.read_text(encoding="utf-8-sig")))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        from .store import quarantine_broken_json
+
+        quarantine_broken_json(path, f"{type(exc).__name__}: {exc}")
+        cfg = Config()
+        if create_if_missing:
+            save_config(cfg)  # 立刻补一份干净默认值，之后手改只有这一份文件
+        return cfg
+    if not isinstance(data, dict):
+        from .store import quarantine_broken_json
+
+        quarantine_broken_json(path, f"顶层类型是 {type(data).__name__}，不是 JSON 对象")
+        cfg = Config()
+        if create_if_missing:
+            save_config(cfg)
+        return cfg
+    return Config.from_dict(data)
 
 
 def save_config(cfg: Config) -> None:

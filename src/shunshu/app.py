@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .align import match_key
 from .config import Config, Rules, load_config, save_config
-from .http import Fetcher, assert_http_url
+from .http import Fetcher, assert_http_url, proxy_label
 from .models import (
     STATUS_BASELINE,
     STATUS_NO_CHANGE,
+    STATUS_PROXY_ERROR,
     STATUS_UPDATED,
     Chapter,
     Novel,
@@ -20,6 +22,7 @@ from .models import (
     host_label,
     site_key,
     status_label,
+    strip_www,
 )
 from .monitor import check_all, check_source, collect_alerts
 from .notify import Notifier
@@ -74,21 +77,33 @@ class AppState:
             return find_novel(self._novels, ident)
 
     def reload(self) -> None:
-        """重新读 data/config.json 与 data/novels.json：手工改完 selector 后托盘点「重新加载配置」即可生效。"""
+        """重新读 data/config.json 与 data/novels.json：手工改完 selector 后托盘点「重新加载配置」即可生效。
+
+        配置/书架 JSON 损坏时读取层会隔离备份并降级（默认配置/空书架），具体原因放在
+        self.load_warnings，由托盘弹卡告知，不让整个工具起不来。
+        """
+        from .store import LAST_LOAD_WARNINGS
+
         with self._lock:
+            LAST_LOAD_WARNINGS.clear()
             self._cfg = load_config()
             self._rules = self._cfg.compiled()
             self._novels = load_novels(self.paths)
-            if not self.paths.novels.exists() and self._novels:
-                # 读过一次 v1 书架：马上按 v2 落盘，之后手改只有 novels.json 一处
-                save_novels(self.paths, self._novels)
+            old_fetcher = getattr(self, "_fetcher", None)
             self._fetcher = Fetcher(
                 user_agent=self._cfg.user_agent,
                 timeout=self._cfg.request_timeout_seconds,
                 retries=self._cfg.request_retries,
                 backoff=self._cfg.retry_backoff_seconds,
                 max_bytes=self._cfg.max_response_bytes,
+                workers=self._cfg.concurrency,
             )
+            self.load_warnings = list(LAST_LOAD_WARNINGS)
+        # 旧抓取器的常驻连接池在锁外释放：不阻塞菜单，也不打断可能正在跑的一轮
+        if old_fetcher is not None:
+            close = getattr(old_fetcher, "close", None)
+            if close is not None:
+                close()
 
     def save_novels(self) -> None:
         with self._lock:
@@ -231,31 +246,134 @@ class AppState:
             save_novels(self.paths, self._novels)
         return changed
 
+    # ---------- 代理自动探测 ----------
+
+    @staticmethod
+    def _site_host(toc_url: str) -> str:
+        """站点代理记忆的 key：完整主机名去掉 www 前缀（m.book.example 这种子域保留）。"""
+        return strip_www(urlsplit(toc_url).hostname or "")
+
+    def ensure_source_proxy(self, source_id: str, fetcher=None, *,
+                            force: bool = False):
+        """确认这个站该直连还是走代理，结论写进配置后后续每轮照用。
+
+        判定顺序：
+        1. 来源手写的 proxy（novels.json，且与站点记忆不一致）→ 永远原样尊重，不探测；
+        2. 非 force 且 config.site_proxies 里已有该站记忆（含「直连」空串）→ 直接套用；
+        3. 其余情况 → 先直连，连不上再试本机代理，成功才把结论写进 config 和该来源。
+        全部不通返回 None（不记忆，下次还会再试）。探测在锁外执行，避免卡住菜单。
+
+        force=True 用于代理连续失败后的自动重探：忽略旧记忆重新探一遍，以便用户换了
+        代理客户端（7890 换成 10809）后自动愈合；手写代理仍然不覆盖。
+        返回值是 proxy_detect.ProbeResult（含探测时抓回的首页 HTML 供首轮复用）。
+        """
+        from .proxy_detect import ProbeResult, make_probe_fetcher, probe_url
+
+        with self._lock:
+            source = self._source_by_id(source_id)
+            if source is None:
+                return None
+            current = source.proxy.strip()
+            host = self._site_host(source.toc_url)
+            remembered = self._cfg.site_proxies.get(host)
+            # 与站点记忆相同的代理是当初自动写上去的，force 重探允许改；只有「自己写的」
+            # （非空且不等于记忆）才算手写代理，永远不被自动探测覆盖
+            manual = current and current != remembered
+            if manual:
+                return ProbeResult(proxy=current)
+            if not force and remembered is not None:
+                source.proxy = remembered
+                save_novels(self.paths, self._novels)
+                return ProbeResult(proxy=remembered)
+            user_agent = self._cfg.user_agent
+            max_bytes = self._cfg.max_response_bytes
+            toc_url = source.toc_url
+
+        probe = fetcher or make_probe_fetcher(user_agent, max_bytes)
+        result = probe_url(probe, toc_url)
+        if result is None:
+            return None
+
+        with self._lock:
+            # 探测期间用户可能点了「重新加载配置」：以锁内最新对象再定位一次
+            source = self._source_by_id(source_id)
+            host = self._site_host(toc_url)
+            self._cfg.site_proxies[host] = result.proxy
+            if source is not None:
+                source.proxy = result.proxy
+            save_config(self._cfg)
+            save_novels(self.paths, self._novels)
+        return result
+
+    def _reprobe_dead_proxies(self, outcomes: list[Outcome]) -> None:
+        """代理连续失败到退避阈值时自动重探一次，让「换了代理客户端」能自愈。
+
+        只在 consecutive_failures 恰好涨到阈值的这一轮触发：仍失败则计数继续涨，
+        不会每轮都重探；恢复成功后计数清零，将来再坏到阈值还能再来一次。
+        """
+        threshold = self._cfg.failure_backoff_threshold
+        for outcome in outcomes:
+            if outcome.status != STATUS_PROXY_ERROR:
+                continue
+            if outcome.source.consecutive_failures != threshold:
+                continue
+            result = self.ensure_source_proxy(outcome.source.id, force=True)
+            if result is None:
+                continue
+            with self._lock:
+                source = self._source_by_id(outcome.source.id)
+                if source is not None:
+                    source.consecutive_failures = 0
+                    source.last_error = None
+            append_text(
+                self.paths.runtime_log,
+                f"{now_stamp()} 来源 {outcome.source.site} 代理已失效，自动重探改走："
+                f"{proxy_label(result.proxy) or '直连'}",
+            )
+
     # ---------- 检查 ----------
 
     def set_fetcher(self, fetcher) -> None:
         """替换抓取器：测试注入假站点，或需要换代理/自定义会话时使用。"""
         with self._lock:
+            old = self._fetcher
             self._fetcher = fetcher
+        if old is not None and old is not fetcher:
+            close = getattr(old, "close", None)
+            if close is not None:
+                close()
 
-    def check_one(self, ident: str, notify: bool = True) -> list[Outcome]:
-        """检查一本书的所有来源：返回值按来源顺序，一本小说的多个来源一起看。"""
+    def check_one(self, ident: str, notify: bool = True,
+                  prefetch: dict[str, str] | None = None) -> list[Outcome]:
+        """检查一本书的所有来源：返回值按来源顺序，一本小说的多个来源一起看。
+
+        照 run_round 的「锁内取快照、锁外抓取」模式：网络请求（含同主机间隔 sleep）
+        不能持着全局锁做，否则托盘菜单在整本书抓完前完全卡死。
+        prefetch 形如 {来源id: 已抓回的首页 HTML}，添加书源时把代理探测那一下的
+        响应透传过来复用，少敲一次门。
+        """
         with self._lock:
             self._absorb_read_marks()
             novel = find_novel(self._novels, ident)
             if novel is None:
                 return []
-            outcomes: list[Outcome] = []
-            previous_host = ""
-            for source in novel.sources:
-                host = site_key(source.toc_url)
-                if previous_host and host and host == previous_host:
-                    # 同一本书的多个来源常挂在同一个域/同一个反代上，串起来打，别并发敲门
-                    sleep_seconds(self._rules.cfg.same_host_delay_seconds)
-                previous_host = host
-                outcomes.append(check_source(novel, source, self._rules, self._fetcher, self.paths))
+            plan = [(source, site_key(source.toc_url)) for source in novel.sources]
+            rules = self._rules
+            fetcher = self._fetcher
+        prefetch = prefetch or {}
+        outcomes: list[Outcome] = []
+        previous_host = ""
+        for source, host in plan:
+            if previous_host and host and host == previous_host:
+                # 同一本书的多个来源常挂在同一个域/同一个反代上，串起来打，别并发敲门
+                sleep_seconds(rules.cfg.same_host_delay_seconds)
+            previous_host = host
+            html = prefetch.get(source.id)
+            outcomes.append(check_source(novel, source, rules, fetcher, self.paths,
+                                         prefetch=html or None))
         for outcome in outcomes:
             self._log(outcome)
+        self._reprobe_dead_proxies(outcomes)
         self._collect([novel], outcomes, notify)
         return outcomes
 
@@ -271,6 +389,9 @@ class AppState:
         ordered = [results[s.id] for n in novels for s in n.sources if s.id in results]
         for outcome in ordered:
             self._log(outcome)
+        # 定时轮里发现代理彻底失效（到退避阈值）也自动重探一次：重探成功会清掉失败
+        # 计数，调度器随后算退避时自然不再跳过这个来源
+        self._reprobe_dead_proxies(ordered)
         self._collect(novels, ordered, notify)
         return ordered
 
@@ -327,9 +448,3 @@ class AppState:
             else:
                 lines.append(f"《{title}》{outcome.source.site} {outcome.detail()}")
         return lines
-
-    def toast_startup(self, outcomes: list[Outcome]) -> None:
-        """命令行调试时也能弹出启动摘要。"""
-        lines = [line for line in self.startup_lines(outcomes)[1:]]
-        launch = next((o.latest.url for o in outcomes if o.latest), "")
-        Notifier(self.paths.alerts_log).show("顺手 · 启动检查", lines, launch)

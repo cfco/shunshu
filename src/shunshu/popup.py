@@ -16,9 +16,12 @@ from tkinter import font as tkfont
 _WIDTH = 400
 _MARGIN_X = 24
 _MARGIN_Y = 44
+_MARGIN_BOTTOM = 24
 # 卡片高度只由「标题 1 行 + 最多 5 章 1 行」决定（长标题按像素截断，不换行），
 # 所以堆叠间距可以是固定值：小于最矮的满卡就会压住上一张。
 _CARD_GAP = 258
+# 一列卡片之间的横向间距（排满右列后向左换列）
+_COLUMN_GAP = 12
 _INNER_WIDTH = _WIDTH - 60
 _BG = "#22262e"
 _FG = "#f2f3f5"
@@ -33,12 +36,25 @@ def make_payload(title: str, lines: list[str] | None = None, chapters: list[dict
     return {"title": title, "lines": lines or [], "chapters": chapters or [], "novel": novel}
 
 
+def _rows_per_column(root: tk.Tk) -> int:
+    """按屏幕高度算右边缘这一列能放几张卡；屏幕再小也至少放 1 张。"""
+    available = root.winfo_screenheight() - _MARGIN_Y - _MARGIN_BOTTOM
+    return max(1, available // _CARD_GAP)
+
+
 def _place(root: tk.Tk, index: int, width: int = _WIDTH) -> None:
-    """先排布再量尺寸，否则 overrideredirect 窗口会塌成一条。"""
+    """先排布再量尺寸，否则 overrideredirect 窗口会塌成一条。
+
+    卡片从右下角向上堆叠：一列排满（按屏幕高度算行数）就向左换一列，
+    index 由 Notifier 按槽位分配，保证短时间内的多批卡片不会完全重叠。
+    """
     root.update_idletasks()
     height = root.winfo_reqheight()
-    x = max(0, root.winfo_screenwidth() - width - _MARGIN_X)
-    y = _MARGIN_Y + max(0, index) * _CARD_GAP
+    rows = _rows_per_column(root)
+    column, row = divmod(max(0, index), rows)
+    x = max(0, root.winfo_screenwidth() - width - _MARGIN_X
+            - column * (width + _COLUMN_GAP))
+    y = _MARGIN_Y + row * _CARD_GAP
     root.geometry(f"{width}x{height}+{x}+{y}")
 
 

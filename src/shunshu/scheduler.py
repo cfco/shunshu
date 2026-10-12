@@ -65,7 +65,8 @@ class Scheduler:
         """
         while not self._stop.is_set():
             wait = self.next_wait_seconds()
-            # _wake 用来响应「立即检查」的手动触发
+            # 「立即检查」直接在独立线程里跑 run_once(force=True)，不动这个循环；
+            # _wake 现在只用于 stop() 立刻打断等待，让退出不用再等一个完整间隔
             if self._wake.wait(timeout=wait):
                 self._wake.clear()
             if self._stop.is_set():
@@ -76,11 +77,6 @@ class Scheduler:
                 from .store import append_text, now_stamp
 
                 append_text(self.state.paths.runtime_log, f"{now_stamp()} 轮询异常: {exc!r}")
-
-    def trigger_now(self) -> None:
-        """手动「立即检查」：清掉所有退避时间并唤醒循环。"""
-        self._next_due.clear()
-        self._wake.set()
 
     def stop(self) -> None:
         """请求循环退出。"""

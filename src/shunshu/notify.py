@@ -3,29 +3,34 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .align import display_title
 from .models import ChapterEntry, NovelAlert
+from .packaging import is_packaged, self_executable
 from .popup import make_payload
 
 _CARD_CHAPTERS = 5
 _CARD_LINES = 4
 _STARTUP_GRACE_SECONDS = 0.5
 _CARD_SECONDS = 12.0
+# 槽位占用时长比卡片展示略长：两批更新间隔再短，新的一批也会排到没释放的槽位之后
+_SLOT_HOLD_SECONDS = _CARD_SECONDS + 0.5
 
 
 class Notifier:
     def __init__(self, alerts_path: Path | None = None, enabled: bool = True):
         self.alerts_path = alerts_path
         self.enabled = enabled
+        # 每个卡片槽位的释放时刻（monotonic 秒）；过期的槽位在分配时顺手清掉
+        self._slots: list[float] = []
 
     # ---------- 提醒入口 ----------
 
-    def notify_alert(self, alert: NovelAlert, index: int = 0) -> bool:
+    def notify_alert(self, alert: NovelAlert) -> bool:
         """一本小说一张卡片：行取这本书「最近的 5 章」，每行标出最先报这一章的来源。"""
         novel = alert.novel
         rows = entry_rows(novel.chapter_index, novel.read_keys, novel.site_of)
@@ -33,20 +38,31 @@ class Notifier:
             return False
         record = [row["t"] for row in entry_rows(alert.entries)][-_CARD_CHAPTERS:]
         return self._present(make_payload(alert.title(), chapters=rows, novel=novel.id),
-                             record, index, rows[0]["u"])
+                             record, self._take_slot(), rows[0]["u"])
 
     def notify_many(self, alerts: list[NovelAlert]) -> bool:
-        """每本一张卡片，纵向错开，不合并成一条。"""
-        for offset, alert in enumerate(alerts):
-            self.notify_alert(alert, offset)
+        """每本一张卡片，各自占一个未释放的槽位（popup 再按屏幕高度自动换列），不合并成一条。"""
+        for alert in alerts:
+            self.notify_alert(alert)
         return bool(alerts)
 
+    def _take_slot(self) -> int:
+        """给下一张卡分一个当前没被占用的序号：12 秒内连来两批更新也不会上下重叠。"""
+        now = time.monotonic()
+        active = sorted(until for until in self._slots if until > now)
+        index = len(active)  # 存活中的卡片占着 0..n-1，新卡顺延到 n
+        self._slots = active + [now + _SLOT_HOLD_SECONDS]
+        return index
+
     def show(self, title: str, lines: list[str], url: str = "") -> bool:
-        """普通提示（启动摘要、菜单操作反馈）：只有文字，没有可点章节。"""
+        """普通提示（启动摘要、菜单操作反馈）：只有文字，没有可点章节。
+
+        同样走槽位分配：启动卡/菜单回执也可能和上一批没消失的更新卡撞位置。
+        """
         launch = _safe_url(url)
         payload = make_payload(title, lines=lines[:_CARD_LINES])
         self._record(title, lines, launch)
-        return self._spawn(payload)
+        return self._spawn(payload, self._take_slot())
 
     # ---------- 内部 ----------
 
@@ -113,47 +129,14 @@ def spawn_card(payload: dict, index: int = 0, seconds: float = _CARD_SECONDS) ->
     return code == 0
 
 
-def _is_compiled() -> bool:
-    """是否运行在打包出来的 exe 里。
-
-    PyInstaller 设 `sys.frozen`；Nuitka 只在入口模块注入 `__compiled__`，子模块里查不到
-    （实测编译版这里判 False，于是把卡片子进程拼成 `[exe, "-m", "shunshu", "popup"]`，
-    argparse 直接拒收，托盘的回执卡永远弹不出来）。所以再兜一层：`sys.executable`
-    不再是 python/pythonw 解释器本身，就说明已经在 exe 里了。
-    """
-    if getattr(sys, "frozen", False) or "__compiled__" in globals():
-        return True
-    return not os.path.basename(sys.executable).lower().startswith("python")
-
-
-def _is_compiled() -> bool:
-    """是否运行在打包出来的 exe 里。
-
-    PyInstaller 设 `sys.frozen`。Nuitka 两件事都不按常理来：`__compiled__` 只注入入口
-    模块（子模块查不到），还把 `sys.executable` 伪造成产物目录下的 `python.exe`——那个
-    文件根本不存在，真实路径在 `sys.argv[0]`。所以判"exe 存在而解释器不存在"。
-    """
-    if getattr(sys, "frozen", False):
-        return True
-    invoked = sys.argv[0] if sys.argv else ""
-    return bool(invoked) and os.path.isfile(invoked) and not os.path.isfile(sys.executable or "")
-
-
-def _self_executable() -> str:
-    """打包态下拉起自己要用真正存在的可执行文件路径。"""
-    for path in (sys.argv[0] if sys.argv else "", sys.executable):
-        if path and os.path.isfile(path):
-            return os.path.abspath(path)
-    return sys.executable
-
-
 def popup_command(payload: dict, index: int, seconds: float) -> list[str]:
     """构造拉起 popup 子进程的命令行。
 
     源码态：python -m shunshu popup ...
     打包态（Nuitka/PyInstaller）：shunshu.exe popup ...  ← 同一个 exe 通过子命令分流
+    形态判定统一走 shunshu.packaging，别在本模块再猜 sys.frozen。
     """
-    head = [_self_executable(), "popup"] if _is_compiled() else [sys.executable, "-m", "shunshu", "popup"]
+    head = [self_executable(), "popup"] if is_packaged() else [sys.executable, "-m", "shunshu", "popup"]
     return [*head, "--payload", json.dumps(payload, ensure_ascii=False),
             "--index", str(index), "--seconds", f"{seconds:g}"]
 

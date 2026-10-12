@@ -7,7 +7,7 @@ import pytest
 import requests
 from conftest import FakeFetcher
 
-from shunshu.config import Config, load_config, normalize_text, save_config
+from shunshu.config import Config, load_config, normalize_text
 from shunshu.http import (
     Fetcher,
     FetchError,
@@ -26,7 +26,6 @@ from shunshu.store import (
     find_novel,
     load_novels,
     log_filtered,
-    migrate_v1,
     now_stamp,
     read_jsonl,
     save_novels,
@@ -88,6 +87,64 @@ def test_proxy_endpoints_reject_unusable_strings_with_clear_reason():
 def test_proxy_label_never_leaks_credentials():
     label = proxy_label("socks5://reader:secretpwd@127.0.0.1:7890")
     assert label == "socks5://127.0.0.1:7890"
+
+
+def test_fetcher_ignores_environment_proxy_by_default(monkeypatch):
+    """默认直连是硬约束：环境变量里挂着代理也不许读（trust_env=False 且 get 收到空 proxies）。
+
+    代理软件开着「系统代理」或 shell 里有 HTTP_PROXY 时，没手写 proxy 的来源必须照样直连，
+    否则国内站会被白白绕一圈，关了代理软件还会全体抓不动。
+    """
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:7890")
+
+    fetcher = Fetcher("test-ua", retries=0)
+    session = fetcher.session
+    assert session.trust_env is False
+
+    seen: dict = {}
+
+    class FakeResp:
+        status_code = 200
+        # 故意不带 charset：走 meta/utf-8/gb18030 探测，下面的字节按 gb18030 能解出非空文本
+        headers = {"Content-Type": "text/html"}
+
+        def close(self):
+            pass
+
+        def iter_content(self, chunk_size):
+            return [b"<html><body><a href='/1.html'>\xb5\xda1\xd5\xc2</a></body></html>"]
+
+    def fake_get(url, **kwargs):
+        seen.update(kwargs)
+        return FakeResp()
+
+    monkeypatch.setattr(session, "get", fake_get)
+    fetcher.fetch_html("https://book.example.com/")
+    assert seen.get("proxies") == {}, "没写 proxy 时不能把环境代理传给 requests"
+
+
+def test_fetcher_passes_manual_proxy_to_requests(monkeypatch):
+    """来源手写了 proxy 时，proxies 必须原样带到这一次请求（只影响这一个来源）。"""
+    fetcher = Fetcher("test-ua", retries=0)
+    seen: dict = {}
+
+    class FakeResp:
+        status_code = 200
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+        encoding = "utf-8"
+
+        def close(self):
+            pass
+
+        def iter_content(self, chunk_size):
+            return [b"<html><body><a href='/1.html'>chapter 1</a></body></html>"]
+
+    monkeypatch.setattr(fetcher.session, "get", lambda url, **kw: (seen.update(kw), FakeResp())[1])
+    fetcher.fetch_html("https://book.example.com/", proxy="http://127.0.0.1:7890")
+    assert seen.get("proxies") == {"http": "http://127.0.0.1:7890",
+                                   "https": "http://127.0.0.1:7890"}
 
 
 def test_dead_proxy_is_proxy_error_and_is_not_retried(monkeypatch):
@@ -215,29 +272,6 @@ def test_novels_write_leaves_no_tmp_file(paths: Paths):
     assert not list(paths.root.glob("*.tmp"))
 
 
-def test_v1_books_json_is_wrapped_into_single_source_novels(paths: Paths):
-    """旧书架的一本就是一个来源：包成单来源小说，id、已提醒记录原样保留。"""
-    paths.legacy_books.write_text(json.dumps({
-        "version": 1,
-        "books": [{"id": "abc", "title": "旧书", "toc_url": fixtures.BASE_URL,
-                   "site": "book.example.com", "baseline_set": True,
-                   "notified_keys": ["https://book.example.com/9999/1.html"],
-                   "read_keys": ["https://book.example.com/9999/2.html"]}],
-    }, ensure_ascii=False), encoding="utf-8")
-
-    novels = migrate_v1(paths)
-    assert len(novels) == 1
-    novel = novels[0]
-    assert novel.id == "abc" and novel.primary_id == "abc" and novel.title == "旧书"
-    assert novel.sources[0].notified_keys == ["https://book.example.com/9999/1.html"]
-    assert novel.sources[0].baseline_set is True
-    assert novel.read_keys == ["https://book.example.com/9999/2.html"]
-
-    save_novels(paths, novels)
-    again = load_novels(paths)
-    assert again[0].sources[0].toc_url == fixtures.BASE_URL
-
-
 def test_history_jsonl_roundtrip_and_bad_lines_ignored(paths: Paths):
     target = paths.source_history("abc", "def")
     append_jsonl(target, {"kind": "update", "chapters": [{"t": "第1章"}]})
@@ -296,8 +330,12 @@ def test_config_partial_file_keeps_defaults(tmp_path, monkeypatch):
 
 
 def test_invalid_user_regex_is_skipped_not_fatal():
+    # 内置 18 条始终合并进来，用户的坏正则跳过、好正则保留：18 + 1
+    from shunshu.config import DEFAULT_AD_PATTERNS
+
     rules = Config(ad_patterns=["(", "记住本站"]).compiled()
-    assert len(rules.patterns) == 1
+    assert len(rules.patterns) == len(DEFAULT_AD_PATTERNS) + 1
+    assert any(p.search("欢迎记住本站") for p in rules.patterns)
 
 
 def test_normalize_text_strips_zero_width():
@@ -447,21 +485,6 @@ def test_status_labels_are_chinese():
     assert status_label("unknown_x") == "unknown_x"
 
 
-def test_system_proxy_for_follows_the_environment(monkeypatch):
-    """不写 proxy 时走的就是系统代理：显示要跟着环境变，也要认 no_proxy 绕过表。"""
-    from shunshu.http import system_proxy_for
-
-    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7890")
-    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
-    monkeypatch.delenv("no_proxy", raising=False)
-    assert system_proxy_for("https://book.example.com/12_3456/") == "http://127.0.0.1:7890"
-
-    monkeypatch.setenv("no_proxy", "book.example.com")
-    assert system_proxy_for("https://book.example.com/12_3456/") == "", "被绕过的站就是直连"
-    assert system_proxy_for("https://other.example.com/") == "http://127.0.0.1:7890"
-    assert system_proxy_for("javascript:alert(1)") == "", "手改坏的网址不能让菜单崩"
-
-
 def test_fetcher_switches_tls_trust_to_the_system_store(monkeypatch):
     """验 TLS 要像浏览器一样会补中间证书：只发叶子证书的站才打得开。"""
     import sys
@@ -488,29 +511,6 @@ def test_a_failing_trust_store_hook_leaves_the_fetcher_working(monkeypatch):
     monkeypatch.setattr(http, "_TRUST_STORE_DONE", False)
     monkeypatch.setitem(sys.modules, "truststore", SimpleNamespace(inject_into_ssl=boom))
     assert http.Fetcher("ua") is not None, "注入失败就退回 certifi，不能把抓取器一起弄挂"
-
-
-def test_is_compiled_reads_the_nuitka_layout(monkeypatch, tmp_path):
-    """Nuitka 把 sys.executable 伪造成目录里并不存在的 python.exe：判定要看文件在不在。"""
-    import sys
-
-    from shunshu import notify
-
-    exe = tmp_path / "shunshu.exe"
-    exe.write_bytes(b"")
-    monkeypatch.delattr(sys, "frozen", raising=False)
-    monkeypatch.setattr(sys, "argv", [str(exe)])
-    monkeypatch.setattr(sys, "executable", str(tmp_path / "python.exe"))
-    assert notify._is_compiled() is True
-    import os
-
-    assert os.path.normcase(notify._self_executable()) == os.path.normcase(str(exe))
-
-    interpreter = tmp_path / "pythonw.exe"
-    interpreter.write_bytes(b"")
-    monkeypatch.setattr(sys, "executable", str(interpreter))
-    monkeypatch.setattr(sys, "argv", [str(tmp_path / "__main__.py")])
-    assert notify._is_compiled() is False, "源码态解释器真的在，就不算打包"
 
 
 def test_popup_command_shape_follows_the_runtime(monkeypatch, tmp_path):

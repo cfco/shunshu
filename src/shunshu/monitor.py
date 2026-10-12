@@ -34,7 +34,8 @@ from .toc_detect import TocDetectError
 
 
 def check_source(novel: Novel, source: Source, rules: Rules, fetcher: Fetcher,
-                 paths: Paths | None = None, *, skip: bool = False) -> Outcome:
+                 paths: Paths | None = None, *, skip: bool = False,
+                 prefetch: str | None = None) -> Outcome:
     if not source.enabled:
         return Outcome(novel=novel, source=source, status=STATUS_DISABLED, message="已暂停",
                        latest=source.latest_chapter())
@@ -45,7 +46,7 @@ def check_source(novel: Novel, source: Source, rules: Rules, fetcher: Fetcher,
 
     try:
         loaded = load_toc(fetcher, source.toc_url, rules, selector=source.selector,
-                          proxy=source.proxy)
+                          proxy=source.proxy, html=prefetch)
     except ProxyError as exc:
         return _failure(novel, source, STATUS_PROXY_ERROR, f"代理不可用：{exc}",
                         exc=str(exc), fatal_count=True)
@@ -89,12 +90,12 @@ def check_source(novel: Novel, source: Source, rules: Rules, fetcher: Fetcher,
     # 不是重编号，不能按「一次太多新章节」判成目录重置
     grew_pages = loaded.toc.pages_followed > source.pages_followed
     if not grew_pages and (len(new) > rules.cfg.max_report_new_chapters
-                           or len(new) > len(chapters) * 0.6):
+                           or len(new) > len(chapters) * rules.cfg.toc_reset_new_ratio):
         return _reset(novel, source, loaded, chapters, new, rules, paths,
                       f"一次出现 {len(new)} 个新章节标识，疑似章节重编号，已记录不提醒")
 
     latest = chapters[-1]
-    _commit(novel, source, loaded, chapters, latest, extra_keys=[c.key for c in new], rules=rules)
+    _commit(novel, source, loaded, chapters, latest, rules=rules)
     source.status = STATUS_UPDATED
     source.status_detail = f"新增 {len(new)} 章"
     display = new[-rules.cfg.history_display_cap:]
@@ -121,7 +122,7 @@ def _failure(novel: Novel, source: Source, status: str, message: str, *, exc: st
 def _baseline(novel: Novel, source: Source, loaded: LoadResult, chapters: list[Chapter],
               rules: Rules, paths: Paths | None) -> Outcome:
     latest = chapters[-1]
-    _commit(novel, source, loaded, chapters, latest, extra_keys=[], rules=rules)
+    _commit(novel, source, loaded, chapters, latest, rules=rules)
     source.baseline_set = True
     source.status = STATUS_BASELINE
     source.status_detail = "首次记录，未提醒"
@@ -136,7 +137,7 @@ def _baseline(novel: Novel, source: Source, loaded: LoadResult, chapters: list[C
 def _no_change(novel: Novel, source: Source, loaded: LoadResult, chapters: list[Chapter],
                rules: Rules, paths: Paths | None) -> Outcome:
     latest = chapters[-1]
-    _commit(novel, source, loaded, chapters, latest, extra_keys=[], rules=rules)
+    _commit(novel, source, loaded, chapters, latest, rules=rules)
     source.status = STATUS_NO_CHANGE
     source.status_detail = "无更新"
     return Outcome(novel=novel, source=source, status=STATUS_NO_CHANGE, latest=latest, message="无更新")
@@ -146,7 +147,7 @@ def _reset(novel: Novel, source: Source, loaded: LoadResult, chapters: list[Chap
            new: list[Chapter], rules: Rules, paths: Paths | None, why: str) -> Outcome:
     """目录重置/重编号：只更新状态和记录，不弹窗，避免整站改版刷屏。"""
     latest = chapters[-1]
-    _commit(novel, source, loaded, chapters, latest, extra_keys=[], rules=rules)
+    _commit(novel, source, loaded, chapters, latest, rules=rules)
     source.status = STATUS_TOC_RESET
     source.status_detail = why
     source.last_error = None
@@ -155,7 +156,7 @@ def _reset(novel: Novel, source: Source, loaded: LoadResult, chapters: list[Chap
 
 
 def _commit(novel: Novel, source: Source, loaded: LoadResult, chapters: list[Chapter],
-            latest: Chapter, *, extra_keys: list[str], rules: Rules) -> None:
+            latest: Chapter, *, rules: Rules) -> None:
     current = [c.key for c in chapters]
     current_set = set(current)
     retained = [k for k in source.notified_keys if k not in current_set]
@@ -163,8 +164,7 @@ def _commit(novel: Novel, source: Source, loaded: LoadResult, chapters: list[Cha
     # 这些老章节全当成新章节，永远在「疑似重编号」里出不来。上限只裁已经不在目录里的历史 key。
     tail = max(0, rules.cfg.notified_keys_keep)
     history = retained[-tail:] if tail else []
-    merged = [*current, *history, *[k for k in extra_keys if k not in current_set]]
-    source.notified_keys = list(dict.fromkeys(merged))
+    source.notified_keys = list(dict.fromkeys([*current, *history]))
     source.latest_title = latest.title
     source.latest_url = latest.url
     source.latest_number = latest.number
@@ -231,12 +231,20 @@ def check_all(novels: list[Novel], rules: Rules, fetcher: Fetcher, paths: Paths,
         outcomes = _check_group(items[0][1], items[0][0], rules, fetcher, paths, skip_ids)
     else:
         workers = max(1, min(rules.cfg.concurrency, len(items)))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        # 真 Fetcher 提供常驻池：工作线程与线程内 Session/keep-alive 跨轮复用；
+        # 测试注入的假抓取器没有 pool()，退回本轮临时池（用完即关，不留空闲线程）
+        pool_factory = getattr(fetcher, "pool", None)
+        pool = pool_factory(workers) if pool_factory is not None else ThreadPoolExecutor(
+            max_workers=workers)
+        try:
             futures = [
                 pool.submit(_check_group, group, host, rules, fetcher, paths, skip_ids)
                 for host, group in items
             ]
             outcomes = [o for group in (f.result() for f in futures) for o in group]
+        finally:
+            if pool_factory is None:
+                pool.shutdown(wait=False)
     return {o.source.id: o for o in outcomes}
 
 

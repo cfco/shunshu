@@ -11,10 +11,18 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import data_dir
-from .models import Novel, Source
+from .models import Novel
 
 _LOCK = threading.RLock()
 SCHEMA_VERSION = 2
+
+# 追加型日志（shunshu.log / filtered.log / alerts.log / history/*.jsonl）超过这个
+# 字节数就按行边界裁掉开头，只留尾部一段，避免长跑几年把磁盘吃掉
+_ROTATE_BYTES = 2 * 1024 * 1024
+_ROTATE_KEEP_RATIO = 0.75
+
+# 最近一次加载（config.json / novels.json）遇到的降级说明：AppState.reload 取走弹卡
+LAST_LOAD_WARNINGS: list[str] = []
 
 
 def now_stamp() -> str:
@@ -36,11 +44,6 @@ class Paths:
     @property
     def novels(self) -> Path:
         return self.root / "novels.json"
-
-    @property
-    def legacy_books(self) -> Path:
-        """v1 的书架文件：只在首次读到时转换成 novels.json。"""
-        return self.root / "books.json"
 
     @property
     def history(self) -> Path:
@@ -80,32 +83,47 @@ class Paths:
         self.candidates.mkdir(parents=True, exist_ok=True)
 
 
-def load_novels(paths: Paths) -> list[Novel]:
-    if paths.novels.exists():
-        with _LOCK:
-            raw = json.loads(paths.novels.read_text(encoding="utf-8-sig"))
-        items = raw.get("novels", raw) if isinstance(raw, dict) else raw
-        return [Novel.from_dict(item) for item in items]
-    return migrate_v1(paths)
+def quarantine_broken_json(path: Path, reason: str) -> Path | None:
+    """把读不动的 JSON 改名隔离成 .bak，腾出位置让上层重写一份干净默认值。
 
-
-def migrate_v1(paths: Paths) -> list[Novel]:
-    """v1 的一本 Book 就是一个来源：包成「一本小说挂一个来源」沿用原 id。
-
-    v1 的 read_keys 记的是归一化 URL，v2 已读改用跨源 match_key，旧标记比不中，
-    留着也不会误判成已读，会被 notified_keys_keep 上限自然挤掉。
+    文件名带时间戳：连续两次改坏也不会覆盖掉前一份现场。返回备份路径，失败返回 None。
     """
-    if not paths.legacy_books.exists():
+    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    backup = path.with_name(f"{path.name}.{stamp}.bak")
+    try:
+        path.replace(backup)
+    except OSError:
+        return None
+    LAST_LOAD_WARNINGS.append(
+        f"{path.name} 已损坏（{reason}），原文件备份为 {backup.name}，本次按空数据启动")
+    try:
+        append_text(path.parent / "shunshu.log", f"{now_stamp()} 配置降级：{path} {reason}")
+    except OSError:
+        pass
+    return backup
+
+
+def load_novels(paths: Paths) -> list[Novel]:
+    """读书架；novels.json 不存在返回空书架，手改坏了就隔离备份并按空书架启动。"""
+    if not paths.novels.exists():
         return []
     with _LOCK:
-        raw = json.loads(paths.legacy_books.read_text(encoding="utf-8-sig"))
-    items = raw.get("books", raw) if isinstance(raw, dict) else raw
+        try:
+            raw = json.loads(paths.novels.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            quarantine_broken_json(paths.novels, f"{type(exc).__name__}: {exc}")
+            return []
+    if not isinstance(raw, (dict, list)):
+        quarantine_broken_json(paths.novels, f"顶层类型是 {type(raw).__name__}，不是对象/数组")
+        return []
+    items = raw.get("novels", raw) if isinstance(raw, dict) else raw
     novels: list[Novel] = []
     for item in items:
-        source = Source.from_dict(item)
-        novels.append(Novel(id=source.id, title=source.title, sources=[source],
-                            primary_id=source.id, read_keys=list(item.get("read_keys") or []),
-                            created_at=source.created_at))
+        # 单本写坏不连累整架：跳过那一条并留警告，其余照常加载
+        if isinstance(item, dict):
+            novels.append(Novel.from_dict(item))
+        else:
+            LAST_LOAD_WARNINGS.append(f"novels.json 里有一条不是对象（{type(item).__name__}），已跳过")
     return novels
 
 
@@ -130,9 +148,31 @@ def write_json_atomic(path: Path, payload: dict) -> None:
         os.replace(tmp, path)
 
 
+def _rotate_if_needed(path: Path) -> None:
+    """追加前检查体积：超阈值就按行边界只留尾部，防止日志无限增长。
+
+    调用方必须已持有 _LOCK。裁剪失败（占用/权限）静默跳过，下一轮再试，
+    绝不能因为轮转日志这件小事把正常抓取流程弄挂。
+    """
+    try:
+        if not path.exists() or path.stat().st_size <= _ROTATE_BYTES:
+            return
+        keep_bytes = int(_ROTATE_BYTES * _ROTATE_KEEP_RATIO)
+        with path.open("rb") as fh:
+            fh.seek(max(0, path.stat().st_size - keep_bytes))
+            fh.readline()  # 丢掉落点所在的半行，保证留下的每行都完整
+            tail = fh.read()
+        tmp = path.with_name(path.name + ".trim")
+        tmp.write_bytes(tail)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def append_jsonl(path: Path, record: dict) -> None:
     with _LOCK:
         path.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_if_needed(path)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -183,6 +223,7 @@ def drain_jsonl(path: Path) -> list[dict]:
 def append_text(path: Path, text: str) -> None:
     with _LOCK:
         path.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_if_needed(path)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(text.rstrip() + "\n")
 

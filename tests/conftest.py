@@ -58,3 +58,14 @@ def paths(tmp_path: Path) -> Paths:
     instance = Paths(tmp_path / "data")
     instance.ensure()
     return instance
+
+
+@pytest.fixture
+def app_state(tmp_path, monkeypatch):
+    """全新临时 data 目录上的 AppState；各测试文件共用，添加/探测流程都靠它。"""
+    from shunshu.app import AppState
+
+    monkeypatch.setenv("SHUNSHU_DATA_DIR", str(tmp_path / "data"))
+    state = AppState(Paths(tmp_path / "data"))
+    state.reload()
+    return state

@@ -22,6 +22,10 @@ def acquire_singleton(name: str = MUTEX_NAME) -> bool:
     if _handle:
         return True
     kernel32 = windll.kernel32
+    # 不声明 restype 时 ctypes 默认按 int（32 位）返回，64 位系统上句柄高 32 位会被
+    # 截掉：高地址句柄会变成 0/假值或与别的句柄撞车，单实例闸门时灵时不灵
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
     _handle = kernel32.CreateMutexW(None, False, name)
     if not _handle:
         _handle = None

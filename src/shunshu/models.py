@@ -7,7 +7,6 @@ from dataclasses import asdict, dataclass, field
 from posixpath import normpath
 from urllib.parse import urlsplit
 
-STATUS_OK = "ok"
 STATUS_BASELINE = "baseline"
 STATUS_UPDATED = "updated"
 STATUS_NO_CHANGE = "no_change"
@@ -18,7 +17,6 @@ STATUS_PROXY_ERROR = "proxy_error"
 STATUS_DISABLED = "disabled"
 
 _LABELS = {
-    STATUS_OK: "正常",
     STATUS_BASELINE: "首次记录",
     STATUS_UPDATED: "有更新",
     STATUS_NO_CHANGE: "无更新",

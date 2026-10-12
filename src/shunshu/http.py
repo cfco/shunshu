@@ -5,10 +5,10 @@ from __future__ import annotations
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
 import requests
-from requests.utils import get_environ_proxies
 
 _META_CHARSET = re.compile(rb"""charset\s*=\s*["']?\s*([A-Za-z0-9_\-]+)""", re.I)
 _HTML_ESSENCE = re.compile(rb"<\s*(?:html|head|body|meta|div|table|dl|ul|p|a)\b", re.I)
@@ -19,6 +19,14 @@ _PROXY_TELL = re.compile(r"proxy|socks", re.I)
 
 class FetchError(Exception):
     """网络/响应层面的失败，monitor 会保留旧状态并按退避重试。"""
+
+
+class ConnectionFailureError(FetchError):
+    """连接根本没建立：连接被拒/超时/DNS 失败，一次 HTTP 响应都没拿到。
+
+    代理探测只在直连抛这个错时才改走代理；站点只要给了 HTTP 答复
+    （4xx/5xx/空页/非 HTML），就说明网络路径本身是通的，不该误记成"需要代理"。
+    """
 
 
 class ProxyError(FetchError):
@@ -59,20 +67,6 @@ def proxy_endpoints(proxy: str) -> dict[str, str]:
     if scheme not in PROXY_SCHEMES or not parts.hostname or port == 0:
         raise ProxyError(f"代理地址格式不对：{proxy_label(value)}（只支持 http:// 、https:// 、socks5://）")
     return {"http": value, "https": value}
-
-
-def system_proxy_for(url: str) -> str:
-    """这台机器当前对该网址生效的系统代理——就是浏览器用的那套（环境变量 + 注册表）。
-
-    来源没写 `proxy` 时 requests 走的正是这里，所以菜单要把它显示出来，否则看不出
-    一个国内站也被代理软件绕了一圈；绕过表（no_proxy）由 requests 一并算好。
-    """
-    try:
-        target = assert_http_url(url)
-        scheme = urlsplit(target).scheme.lower()
-        return str(get_environ_proxies(target, no_proxy=None).get(scheme) or "")
-    except (ValueError, OSError):
-        return ""
 
 
 _POOL_PREFIX = re.compile(r"^\s*(?:\w*(?:Connection|Pool))\(\s*host='[^']*'(?:,\s*port=\d+)?\s*\)\s*:\s*", re.I)
@@ -162,10 +156,14 @@ def use_system_trust_store() -> None:
 
 
 class Fetcher:
-    """并发检查时每线程各用一个 Session：requests.Session 不是线程安全的。"""
+    """并发检查时每线程各用一个 Session：requests.Session 不是线程安全的。
+
+    线程池本身常驻复用：工作线程不销毁，绑在 threading.local 上的 Session 才活得过
+    单轮检查，keep-alive 连接也能跨轮复用；每轮现建线程池等于每轮把连接池全部作废。
+    """
 
     def __init__(self, user_agent: str, timeout: float = 15.0, retries: int = 2,
-                 backoff: float = 3.0, max_bytes: int = 3_000_000):
+                 backoff: float = 3.0, max_bytes: int = 3_000_000, workers: int = 6):
         use_system_trust_store()
         self.timeout = timeout
         self.retries = max(0, int(retries))
@@ -178,6 +176,10 @@ class Fetcher:
             "Upgrade-Insecure-Requests": "1",
         }
         self._local = threading.local()
+        # 常驻并发池：workers 变化（重新加载配置）时关掉旧池再建，不中途改已建池的容量
+        self._pool: ThreadPoolExecutor | None = None
+        self._pool_workers = 0
+        self._pool_lock = threading.Lock()
 
     @property
     def session(self) -> requests.Session:
@@ -185,13 +187,40 @@ class Fetcher:
         if session is None:
             session = requests.Session()
             session.headers.update(self.headers)
+            # 禁止从环境变量（HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY）读取代理：
+            # 用户没手动给来源配 proxy 时直连，配了才走指定代理，行为更可控、速度更稳定
+            session.trust_env = False
             self._local.session = session
         return session
+
+    def pool(self, workers: int) -> ThreadPoolExecutor:
+        """返回与并发数等大的常驻线程池；并发配置变了就关旧池建新池。"""
+        workers = max(1, int(workers))
+        with self._pool_lock:
+            if self._pool is not None and self._pool_workers != workers:
+                # 不等手头任务：已提交的抓取让它跑完，只是后续轮次改用新池
+                self._pool.shutdown(wait=False, cancel_futures=True)
+                self._pool = None
+            if self._pool is None:
+                self._pool = ThreadPoolExecutor(max_workers=workers,
+                                                thread_name_prefix="shunshu-fetch")
+                self._pool_workers = workers
+            return self._pool
+
+    def close(self) -> None:
+        """释放常驻池：重新加载配置换 Fetcher、进程退出时调用。假抓取器没有此方法，调用前先 getattr。"""
+        with self._pool_lock:
+            if self._pool is not None:
+                self._pool.shutdown(wait=False, cancel_futures=True)
+                self._pool = None
+                self._pool_workers = 0
 
     def fetch_html(self, url: str, proxy: str = "") -> str:
         assert_http_url(url)
         endpoints = proxy_endpoints(proxy)
         last_error = "未知错误"
+        # 最后一次失败是不是"连接没建立"：决定最终抛 ConnectionFailureError 还是普通 FetchError
+        connection_failed = False
         for attempt in range(self.retries + 1):
             if attempt:
                 time.sleep(self.backoff * attempt)
@@ -199,9 +228,15 @@ class Fetcher:
                 resp = self.session.get(url, timeout=self.timeout, stream=True,
                                         allow_redirects=True, proxies=endpoints)
                 try:
-                    if resp.status_code >= 400:
+                    if resp.status_code >= 500:
+                        # 5xx 多为站点临时故障，退避后值得再试一次
                         last_error = f"HTTP {resp.status_code}"
+                        connection_failed = False
                         continue
+                    if resp.status_code >= 400:
+                        # 4xx 是站点的明确答复（永久搬家/反爬/不存在）：重试结果不会变，
+                        # 而且对探测来说"能回 4xx"证明这条网络路径是通的，直接失败
+                        raise FetchError(f"HTTP {resp.status_code}")
                     body = self._read_capped(resp)
                 finally:
                     resp.close()
@@ -211,27 +246,43 @@ class Fetcher:
                 charset = resp.encoding if "charset" in ctype.lower() else None
                 text = decode_body(body, charset)
                 if not text.strip():
-                    last_error = "响应内容为空"
-                    continue
+                    # 服务器给了响应但内容为空：属于"站点有答复"，不当连接失败，也不重试
+                    raise FetchError("响应内容为空")
                 return text
             except FetchError:
+                # 4xx/非 HTML/空页/超限：立即抛出，保持原类型（ConnectionFailureError 不会在这里产生）
                 raise
             except (requests.exceptions.ProxyError, requests.exceptions.InvalidSchema) as exc:
                 if not endpoints:
+                    # 直连理论上不会收到 ProxyError，保守按可重试的连接失败处理
                     last_error = f"{type(exc).__name__}: {exc}"
+                    connection_failed = True
                     continue
                 # 代理没启动 / socks 代理缺依赖：重试也不会好，直接报出去让人去改 novels.json
                 raise ProxyError(f"{proxy_label(proxy)} 走不通：{_proxy_hint(exc)}") from exc
-            except requests.exceptions.ConnectionError as exc:
+            except requests.exceptions.SSLError as exc:
+                # 注意 SSLError 在 requests 里继承自 ConnectionError，必须放在它前面截：
+                # SSL 握手失败时 TCP 已经连上，属于「站点有答复但证书不干净」，
+                # 不算连接失败，代理探测也不能据此把站推给代理
+                last_error = f"{type(exc).__name__}: {exc}"
+                connection_failed = False
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
                 # socks 走不通时 requests 只报 ConnectionError，但句子里一定带着 proxy/socks 这个词；
                 # 站点自己断链（RemoteDisconnected）不含它，仍按网络错误重试
                 if endpoints and _PROXY_TELL.search(str(exc)):
                     raise ProxyError(f"{proxy_label(proxy)} 走不通：{_proxy_hint(exc)}") from exc
                 last_error = f"{type(exc).__name__}: {exc}"
+                connection_failed = True
             except requests.RequestException as exc:
+                # SSL 等其它请求异常：尝试重试用尽后按普通 FetchError 报（站点给不出干净响应，
+                # 但区别于"连不上"，代理探测不会据此切代理）
                 last_error = f"{type(exc).__name__}: {exc}"
+                connection_failed = False
             except Exception as exc:  # 站点返回畸形内容时 requests 会抛各种底层异常
                 last_error = f"{type(exc).__name__}: {exc}"
+                connection_failed = False
+        if connection_failed:
+            raise ConnectionFailureError(last_error)
         raise FetchError(last_error)
 
     def _read_capped(self, resp: requests.Response) -> bytes:

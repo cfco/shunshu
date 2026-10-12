@@ -5,13 +5,20 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from .packaging import is_packaged, self_executable
+
 RUN_KEY = "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 VALUE_NAME = "shunshu"
 
 
 def current_command() -> str:
-    if getattr(sys, "frozen", False):
-        return f'"{Path(sys.executable)}" run'
+    """写进注册表 Run 项的启动命令。
+
+    打包态必须指向真实存在的 exe（Nuitka 下是 sys.argv[0]，不是伪造的
+    sys.executable\\python.exe），否则开机时静默拉起失败、自启形同虚设。
+    """
+    if is_packaged():
+        return f'"{self_executable()}" run'
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     interpreter = pythonw if pythonw.exists() else Path(sys.executable)
     return f'"{interpreter}" -m shunshu run'

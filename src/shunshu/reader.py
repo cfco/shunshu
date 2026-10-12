@@ -35,13 +35,16 @@ class LoadResult:
 
 
 def load_toc(fetcher: Fetcher, toc_url: str, rules: Rules, selector: str | None = None,
-             proxy: str = "") -> LoadResult:
+             proxy: str = "", html: str | None = None) -> LoadResult:
     """抓目录页并返回章节列表。
 
     只跟随「末页/最大数字页」这一页：分页站点里最新章节在最后一页，
     首页则用于提供稳定的章节总数，两页按 key 合并。
+
+    html 非 None 时直接用作首页 HTML：添加书源的代理探测刚抓过这一页，
+    首轮建档复用它，避免同一个目录页短时间内敲两次。
     """
-    base_html = fetcher.fetch_html(toc_url, proxy)
+    base_html = html if html is not None else fetcher.fetch_html(toc_url, proxy)
     page = parse_page(base_html, toc_url, rules)
     pages: list[tuple[str, Container]] = []
     if selector:

@@ -17,7 +17,7 @@ from .browser import open_in_default_browser
 from .clipboard import extract_url, read_text
 from .config import POLL_MINUTES
 from .instance import acquire_singleton
-from .http import proxy_label, system_proxy_for
+from .http import proxy_label
 from .models import (
     STATUS_BASELINE,
     STATUS_PARSE_FAILED,
@@ -82,7 +82,7 @@ class TrayApp:
         self.state.save_novels()
         self._rebuild_menu()
         # 不再单独提示「正在抓取」：首次检查完直接弹「已添加 + 最近 5 章」的卡片，那就是反馈
-        threading.Thread(target=self._check_new_novel, args=(novel.id,), daemon=True).start()
+        self._start_bg(self._check_new_novel, novel.id)
 
     def act_add_source_from_clipboard(self, novel_id: str, icon=None, item=None) -> None:
         """往已有的一本挂第二个来源：剪贴板里是另一个站的目录页网址。"""
@@ -100,19 +100,24 @@ class TrayApp:
             return
         self.state.save_novels()
         self._rebuild_menu()
-        threading.Thread(target=self._check_new_source, args=(novel_id, source.id), daemon=True).start()
+        self._start_bg(self._check_new_source, novel_id, source.id)
 
     def act_reload_config(self, icon=None, item=None) -> None:
         self.state.reload()
         self._rebuild_menu()
-        self._flash("已重新加载配置", "data/config.json 与 data/novels.json 已生效")
+        warnings = getattr(self.state, "load_warnings", [])
+        if warnings:
+            # JSON 被手改坏时不能只说"已生效"：把降级了什么（备份文件名）讲清楚
+            self._flash("配置已重新加载（有降级）", "；".join(warnings))
+        else:
+            self._flash("已重新加载配置", "data/config.json 与 data/novels.json 已生效")
 
     def act_check_now(self, icon=None, item=None) -> None:
-        threading.Thread(target=self.scheduler.run_once, kwargs={"force": True}, daemon=True).start()
+        self._start_bg(self.scheduler.run_once, force=True)
         self._flash("开始检查", f"{len(self.state.novels)} 本 {len(self.state.sources)} 个来源")
 
     def act_check_novel(self, novel_id: str, icon=None, item=None) -> None:
-        threading.Thread(target=self._check_one_async, args=(novel_id,), daemon=True).start()
+        self._start_bg(self._check_one_async, novel_id)
 
     def act_open_latest(self, novel_id: str, icon=None, item=None) -> None:
         novel = self.state.novel(novel_id)
@@ -210,17 +215,41 @@ class TrayApp:
     # ---------- 界面刷新 ----------
 
     def _check_new_novel(self, novel_id: str) -> None:
-        """新加的一本：卡片自己会说「已添加 + 最近 5 章」，这里只回执抓取失败。"""
-        self._flash_outcomes(self.state.check_one(novel_id))
+        """新加的一本：先确认这个站直连还是走代理，再抓取；成功时卡片会说「已添加 + 最近 5 章」。"""
+        probed = self._probe_or_report(novel_id)
+        if probed is None:
+            return
+        prefetch = {novel_id: probed.html} if probed.html else None
+        self._flash_outcomes(self.state.check_one(novel_id, prefetch=prefetch))
         self._rebuild_menu()
 
     def _check_new_source(self, novel_id: str, source_id: str) -> None:
-        """新来源首轮只建档不弹卡（那批章节多半是旧章），所以这里给一句回执。"""
-        outcomes = self.state.check_one(novel_id)
+        """新来源同样先探测代理；首轮只建档不弹卡（那批章节多半是旧章），这里给一句回执。"""
+        probed = self._probe_or_report(source_id)
+        if probed is None:
+            return
+        prefetch = {source_id: probed.html} if probed.html else None
+        outcomes = self.state.check_one(novel_id, prefetch=prefetch)
         outcome = next((o for o in outcomes if o.source.id == source_id), None)
         if outcome is not None:
             self._flash(f"已挂上来源 {outcome.source.site}", outcome.detail())
         self._rebuild_menu()
+
+    def _probe_or_report(self, source_id: str):
+        """添加时自动确认该站走法：直连/代理都不通时弹指引卡并返回 None，调用方不再跑首轮。
+
+        通了返回 ProbeResult：里面带着探测时抓回的首页 HTML，首轮建档直接复用。
+        """
+        result = self.state.ensure_source_proxy(source_id)
+        if result is not None:
+            return result
+        self._flash(
+            "连不上这个网站",
+            "直连不通，也没试出可用的本机代理；可在 novels.json 给该来源手写 proxy，"
+            "或删掉 config.json 里 site_proxies 的该站记录后点「立即检查本书」重试",
+        )
+        self._rebuild_menu()
+        return None
 
     def _check_one_async(self, novel_id: str) -> None:
         self._flash_outcomes(self.state.check_one(novel_id))
@@ -275,6 +304,22 @@ class TrayApp:
         if self.icon is not None:
             self.icon.menu = self.build_menu()
             self.icon.title = self._tooltip()
+
+    def _start_bg(self, fn, *args, **kwargs) -> None:
+        """所有后台动作统一从这里起线程：线程里抛异常（写盘失败、站点解析崩了等）
+        不能静默死掉，兜一张错误卡，现场才查得到。"""
+
+        def runner() -> None:
+            try:
+                fn(*args, **kwargs)
+            except Exception as exc:  # 后台线程没有上层兜底，不截住整个线程就白死了
+                try:
+                    self._flash(f"操作失败：{getattr(fn, '__name__', '后台任务')}",
+                                f"{type(exc).__name__}: {exc}")
+                except Exception:
+                    pass  # 弹卡本身再失败也不能把异常扔回线程外
+
+        threading.Thread(target=runner, daemon=True).start()
 
     def _flash(self, title: str, body: str) -> None:
         """托盘气泡在 Win11 已被砍掉，操作反馈统一走同一张卡片。"""
@@ -364,12 +409,10 @@ class TrayApp:
 
     @staticmethod
     def _proxy_state_text(source: Source) -> str:
-        """代理只能在 novels.json 里手写，这里把这一源实际走哪条路显示出来好核对。"""
+        """代理状态如实显示：没配就是直连（程序已禁用系统代理，环境变量/注册表都不走）。"""
         if source.proxy.strip():
             return f"代理 {proxy_label(source.proxy)}（手写覆盖）"
-        effective = system_proxy_for(source.toc_url)
-        return (f"代理 跟随系统 {proxy_label(effective)}" if effective
-                else "代理 跟随系统（当前没有系统代理，直连）")
+        return "代理 直连（不走系统代理）"
 
     def _interval_items(self):
         """托盘菜单「扫描间隔」子菜单：固定四个选项，用户二选一。"""
@@ -409,6 +452,8 @@ class TrayApp:
         self._sync_icon_state()
         self._rebuild_menu()
         body = [line for line in lines[1:1 + self.state.cfg.history_display_cap]]
+        # 启动时配置/书架发生过降级（坏 JSON 已备份）：把原因顶到启动卡最前面
+        body = [*getattr(self.state, "load_warnings", []), *body]
         launch = next((o.latest.url for o in outcomes if o.latest), "")
         self.notifier.show("顺手 · 启动检查", body or ["书架为空"], launch)
         self.scheduler.run_forever()
