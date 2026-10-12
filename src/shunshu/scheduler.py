@@ -31,13 +31,23 @@ class Scheduler:
         """返回所有还没到退避结束时间、本轮应该跳过的来源 id。"""
         return {sid for sid, due in self._next_due.items() if due > now}
 
-    def after_round(self, outcomes) -> None:
-        """根据本轮结果更新每个来源的退避时间表。"""
+    def after_round(self, outcomes, skipped: set[str] | None = None) -> None:
+        """根据本轮结果更新每个来源的退避时间表。
+
+        本轮被退避跳过的来源不重算 next_due：跳过的那一轮根本没抓取，consecutive_failures
+        不变，若每轮都把 next_due 推到 now + factor*interval（factor≥2），due 退得比时间
+        走得还快，来源就永远轮不到重试——连续失败到阈值的站会在本次进程里被永久跳过。
+        保持原 due 不动，到点自然解冻重试；真被重试且又失败时，下面的分支会按涨上来的
+        失败次数重算一个更长的退避。
+        """
+        skipped = skipped or set()
         interval = self.next_wait_seconds()
         threshold = self.state.cfg.failure_backoff_threshold
         now = time.time()
         for outcome in outcomes:
             source = outcome.source
+            if source.id in skipped:
+                continue
             if source.consecutive_failures >= threshold:
                 # 连续失败越多，跳过越长；封顶 8 倍间隔，避免永远跳不过去
                 factor = min(2 ** (source.consecutive_failures - threshold + 1), 8)
@@ -51,7 +61,7 @@ class Scheduler:
         with self._busy:
             skip = set() if force else self.due_skip_ids(time.time())
             outcomes = self.state.run_round(skip_ids=skip)
-            self.after_round(outcomes)
+            self.after_round(outcomes, skipped=skip)
             self.last_round_at = time.time()
         if self.on_round:
             self.on_round(outcomes)

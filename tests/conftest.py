@@ -45,7 +45,7 @@ class FakeRoot:
 @pytest.fixture(autouse=True)
 def no_real_cards(monkeypatch):
     """卡片是子进程 + 真窗口，测试里不能真弹，否则桌面被糊满。"""
-    monkeypatch.setattr("shunshu.notify.spawn_card", lambda payload, index=0, seconds=12.0: True)
+    monkeypatch.setattr("shunshu.notify.spawn_card", lambda payload, index=0, seconds=12.0: "")
 
 
 @pytest.fixture

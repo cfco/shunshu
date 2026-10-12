@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 
 import fixtures
-import pytest
 
 from shunshu.config import (
     DEFAULT_AD_EXACT,

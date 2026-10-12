@@ -196,3 +196,11 @@ def test_novel_display_title_is_simplified():
     novel = Novel(id="a", title="陣問長生", sources=[make_source("a", "https://x.com/1/", "x.com")])
     assert novel.display_title() == "阵问长生"
     assert novel.title == "陣問長生"
+
+
+def test_str_list_skips_bools():
+    """bool 是 int 的子类：`keep_keys: [true]` 这种手改笔误不能收成字符串 "True"。"""
+    from shunshu.models import _str_list
+
+    assert _str_list([True, False, 1, 2.5, "a"]) == ["1", "2.5", "a"]
+    assert _str_list((True,)) == []

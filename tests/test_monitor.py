@@ -55,6 +55,17 @@ def test_load_toc_survives_missing_last_page():
     assert len(result.toc.chapters) == 60
 
 
+def test_last_page_fetch_failure_leaves_a_log_line(paths):
+    """末页抓不到时留一行日志：光看结果分不清「站点本来就没分页」和「那一页抓挂了」。"""
+    load_toc(FakeFetcher({fixtures.BASE_URL: fixtures.paged_first_html()}),
+             fixtures.BASE_URL, RULES, paths=paths)
+    text = paths.runtime_log.read_text(encoding="utf-8")
+    assert "末页跟进" in text and "没抓到" in text
+
+    # 没传 paths 的老用法照常工作，只是不记日志
+    assert toc({fixtures.BASE_URL: fixtures.paged_first_html()}).toc.pages_followed == 1
+
+
 def test_first_check_creates_baseline_without_notifying():
     novel = make_novel()
     outcome = check_source(novel, first(novel), RULES,
@@ -393,6 +404,29 @@ def test_baseline_of_a_late_source_does_not_alert(paths):
     alert = collect_alerts([novel], [check_source(novel, mirror, RULES, fetcher, paths)])[0]
     assert alert.count == 1
     assert alert.entries[0].t == "第62章 慢镜像补上"
+
+
+def test_first_check_of_a_multi_source_novel_indexes_every_source(paths):
+    """新书一次挂两个来源、同轮各自首轮建档：两源的最近章节都要进索引。
+
+    只收第一个来源的 recent 会让第二个来源的章节从索引里消失，之后某轮它们冒出来
+    会被当成新章再报一遍。
+    """
+    novel = make_novel()
+    url_b = "https://mirror.example.com/12_3456/"
+    mirror = Source(id=source_id_for(url_b), toc_url=url_b, site="mirror.example.com")
+    novel.sources.append(mirror)
+    # 镜像只列最后 20 章、标题写法与主源不同（match_key 带标题，故各自成条）
+    mirror_titles = [f"第{i}章 镜像{i:04d}" for i in range(41, 61)]
+    fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html(),
+                           url_b: fixtures.normal_html(mirror_titles)})
+    outcomes = [check_source(novel, source, RULES, fetcher, paths) for source in novel.sources]
+    assert [o.status for o in outcomes] == [STATUS_BASELINE, STATUS_BASELINE]
+
+    alerts = collect_alerts([novel], outcomes)
+    assert len(alerts) == 1 and alerts[0].added is True
+    assert any(e.s == mirror.id for e in novel.chapter_index), "镜像首轮那几章也要进索引"
+    assert any(e.s == novel.sources[0].id for e in novel.chapter_index), "主源的章节也在"
 
 
 def test_same_host_sources_still_know_which_one_reported(paths):

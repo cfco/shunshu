@@ -238,7 +238,7 @@ def config_path() -> Path:
     return data_dir() / "config.json"
 
 
-def load_config(create_if_missing: bool = True) -> Config:
+def load_config() -> Config:
     """读 config.json；文件不存在就生成默认配置，手改坏了就隔离备份并退回默认值。
 
     损坏时不让工具起不来：原文件改名成带时间戳的 .bak，重写一份干净默认配置，
@@ -247,8 +247,7 @@ def load_config(create_if_missing: bool = True) -> Config:
     path = config_path()
     if not path.exists():
         cfg = Config()
-        if create_if_missing:
-            save_config(cfg)
+        save_config(cfg)
         return cfg
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -257,16 +256,14 @@ def load_config(create_if_missing: bool = True) -> Config:
 
         quarantine_broken_json(path, f"{type(exc).__name__}: {exc}")
         cfg = Config()
-        if create_if_missing:
-            save_config(cfg)  # 立刻补一份干净默认值，之后手改只有这一份文件
+        save_config(cfg)  # 立刻补一份干净默认值，之后手改只有这一份文件
         return cfg
     if not isinstance(data, dict):
         from .store import quarantine_broken_json
 
         quarantine_broken_json(path, f"顶层类型是 {type(data).__name__}，不是 JSON 对象")
         cfg = Config()
-        if create_if_missing:
-            save_config(cfg)
+        save_config(cfg)
         return cfg
     return Config.from_dict(data)
 

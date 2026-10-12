@@ -82,9 +82,10 @@ class Notifier:
         """弹不出来时把原因补记一行：现场只有 alerts.log 一份东西可看。"""
         if not self.enabled:
             return False
-        if spawn_card(payload, index, seconds):
+        error = spawn_card(payload, index, seconds)
+        if not error:
             return True
-        self._record(f"{payload['title']} · 卡片没弹出", [LAST_SPAWN_ERROR or "原因未知"], "")
+        self._record(f"{payload['title']} · 卡片没弹出", [error], "")
         return False
 
     def _record(self, title: str, lines: list[str], url: str) -> None:
@@ -106,16 +107,13 @@ def entry_rows(entries: list[ChapterEntry], read_keys: list[str] | None = None,
     return rows
 
 
-LAST_SPAWN_ERROR = ""
+def spawn_card(payload: dict, index: int = 0, seconds: float = _CARD_SECONDS) -> str:
+    """拉起卡片进程；返回空串＝已经交给系统了，非空串＝弹不出来的原因。
 
-
-def spawn_card(payload: dict, index: int = 0, seconds: float = _CARD_SECONDS) -> bool:
-    """拉起卡片进程；它活过了启动窗口就算弹出来了。
-
-    卡片是这工具唯一的反馈通道，起不来一定要留下原因，否则现场只能靠猜。
+    卡片是这工具唯一的反馈通道，起不来一定要留下原因，否则现场只能靠猜。原因走
+    返回值、不走模块级变量：定时轮和「添加小说」可能同时各起一张卡，共享变量会让
+    两边的失败原因串行，alerts.log 里就记到别人头上。
     """
-    global LAST_SPAWN_ERROR
-    LAST_SPAWN_ERROR = ""
     command = popup_command(payload, index, seconds)
     try:
         proc = subprocess.Popen(
@@ -125,15 +123,12 @@ def spawn_card(payload: dict, index: int = 0, seconds: float = _CARD_SECONDS) ->
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except OSError as exc:
-        LAST_SPAWN_ERROR = f"起进程失败 {type(exc).__name__}: {exc}（命令 {command[0]!r}）"
-        return False
+        return f"起进程失败 {type(exc).__name__}: {exc}（命令 {command[0]!r}）"
     try:
         code = proc.wait(timeout=_STARTUP_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
-        return True
-    if code != 0:
-        LAST_SPAWN_ERROR = f"卡片进程秒退 exit={code}，命令 {command[1:3]}"
-    return code == 0
+        return ""   # 活过了启动窗口就算弹出来了（卡片自己会按时收起）
+    return "" if code == 0 else f"卡片进程秒退 exit={code}，命令 {command[1:3]}"
 
 
 def popup_command(payload: dict, index: int, seconds: float) -> list[str]:

@@ -6,7 +6,6 @@ from shunshu.toc_detect import (
     build_chapters,
     clean_title,
     container_by_selector,
-    detect_book_title,
     find_page_urls,
     parse_page,
     pick_container,

@@ -54,7 +54,7 @@ def check_source(novel: Novel, source: Source, rules: Rules, fetcher: Fetcher,
 
     try:
         loaded = load_toc(fetcher, source.toc_url, rules, selector=source.selector,
-                          proxy=source.proxy, html=prefetch)
+                          proxy=source.proxy, html=prefetch, paths=paths)
     except ProxyError as exc:
         return _failure(novel, source, STATUS_PROXY_ERROR, f"代理不可用：{exc}",
                         exc=str(exc), fatal_count=True)
@@ -311,6 +311,18 @@ _INDEX_ROWS = 50
 _ALERTED_KEYS_KEEP = 500
 
 
+def _chapter_rank(chapter: Chapter, count: int) -> tuple[int, int]:
+    """跨来源混排用的「新旧」序：离自己目录末尾越近越新，一样近时章节号大的在前。
+
+    比的是「离自己目录末尾多远」而不是目录名次——名次每个来源各编各的：主源 1000 章
+    里的第 62 章名次 999，只列最近 20 章的镜像里第 63 章名次 19，直接比名次就会把旧的
+    那章排在前面，卡片首行不再是最新章。
+    """
+    rel_from_end = (count - 1 - chapter.position) if count else -chapter.position
+    number = chapter.number if chapter.number is not None else -1
+    return (rel_from_end, -number)
+
+
 def collect_alerts(novels: list[Novel], outcomes: list[Outcome], *, keep: int = _ALERTED_KEYS_KEEP,
                    index_rows: int = _INDEX_ROWS) -> list[NovelAlert]:
     """把「每个来源各自的新章」压成「这本小说真正要提醒的章节」。
@@ -330,18 +342,13 @@ def collect_alerts(novels: list[Novel], outcomes: list[Outcome], *, keep: int = 
         for outcome in own:
             if outcome.status != STATUS_UPDATED:
                 continue
-            # 跨来源比的是「离自己目录末尾多远」，不是目录名次：名次每个来源各编各的。
-            # 主源 1000 章里的第 62 章名次 999，只列最近 20 章的镜像里第 63 章名次 19，
-            # 直接比名次就会把旧的那章排在前面，卡片首行不再是最新章
             count = outcome.source.chapter_count or 0
             for chapter in outcome.all_new:
                 key = match_key(chapter.number, chapter.title)
                 if key in seen:
                     continue
                 seen.add(key)
-                number = chapter.number if chapter.number is not None else -1
-                rel_from_end = (count - 1 - chapter.position) if count else -chapter.position
-                candidates.append(((rel_from_end, -number), ChapterEntry(
+                candidates.append((_chapter_rank(chapter, count), ChapterEntry(
                     k=key, t=chapter.title, u=chapter.url,
                     s=outcome.source.id, n=chapter.number, ts=now_stamp())))
         # 离末尾越近越新；两个来源各报一章、离末尾一样近时按章节号分先后
@@ -353,11 +360,22 @@ def collect_alerts(novels: list[Novel], outcomes: list[Outcome], *, keep: int = 
 
         added = not novel.chapter_index and bool(baselines)
         if added:
-            baseline = baselines[0]
-            fresh = [ChapterEntry(k=match_key(c.number, c.title), t=c.title, u=c.url,
-                                  s=baseline.source.id, n=c.number, ts=now_stamp())
-                     for c in baseline.recent]
-            latest = baseline.latest
+            # 一本新书可能同时挂好几个来源（手改 novels.json 一次写进两个，或启动首轮
+            # 一起建档）：各来源的「最近几章」都要收进索引，按 `_chapter_rank` 混排去重，
+            # 卡片才列得出最新那 5 章。只取 baselines[0] 会让其余来源的章节从索引里消失，
+            # 之后某轮它们冒出来会被当成新章报一遍。
+            picked: dict[str, tuple[tuple[int, int], ChapterEntry]] = {}
+            for outcome in baselines:
+                count = outcome.source.chapter_count or 0
+                for chapter in outcome.recent:
+                    key = match_key(chapter.number, chapter.title)
+                    if key in picked:
+                        continue
+                    picked[key] = (_chapter_rank(chapter, count), ChapterEntry(
+                        k=key, t=chapter.title, u=chapter.url,
+                        s=outcome.source.id, n=chapter.number, ts=now_stamp()))
+            fresh = [entry for _, entry in sorted(picked.values(), key=lambda pair: pair[0])]
+            latest = novel.latest_chapter()
         elif fresh:
             novel.mark_alerted([e.k for e in fresh], keep=keep)
             latest = novel.latest_chapter()

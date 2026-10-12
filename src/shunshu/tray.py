@@ -165,7 +165,8 @@ class TrayApp:
         """删来源同样点两次；只剩最后一个来源时等于把整本移出书架。"""
         key = f"{novel_id}#{source_id}"
         novel = self.state.novel(novel_id)
-        site = novel.source(source_id).site if novel and novel.source(source_id) else source_id
+        source = novel.source(source_id) if novel else None
+        site = source.site if source else source_id
         if self._armed(key):
             self.state.remove_source(novel_id, source_id)
             self.state.save_novels()
@@ -215,13 +216,13 @@ class TrayApp:
 
     def _check_new_novel(self, novel_id: str) -> None:
         """新加的一本：先确认这个站直连还是走代理，再抓取；成功时卡片会说「已添加 + 最近 5 章」。"""
-        probed = self._probe_or_report(novel_id)
-        if probed is None:
-            return
-        # prefetch 必须按「来源 id」存（check_one 里按 source.id 取）：
+        # 探测与 prefetch 都按「来源 id」走（ensure_source_proxy 与 check_one 都按 source.id 取）：
         # 新书的首源 id 恰好等于书 id，但那是 add_novel 的巧合，不能依赖
         novel = self.state.novel(novel_id)
         source_id = novel.sources[0].id if novel and novel.sources else novel_id
+        probed = self._probe_or_report(source_id)
+        if probed is None:
+            return
         prefetch = {source_id: probed.html} if probed.html else None
         self._flash_outcomes(self.state.check_one(novel_id, prefetch=prefetch))
         self._rebuild_menu()
@@ -449,9 +450,11 @@ class TrayApp:
         self._status_hint = lines[0] if lines else self._status_hint
         self._sync_icon_state()
         self._rebuild_menu()
-        body = [line for line in lines[1:1 + self.state.cfg.history_display_cap]]
-        # 启动时配置/书架发生过降级（坏 JSON 已备份）：把原因顶到启动卡最前面
-        body = [*getattr(self.state, "load_warnings", []), *body]
+        # 启动时配置/书架发生过降级（坏 JSON 已备份）：把原因顶到启动卡最前面。
+        # 逐本行不再按 history_display_cap 切一刀——那个配置管的是菜单里列几条更新记录，
+        # 跟启动卡显示几行是两码事；整段交给 notifier.show() 按卡片硬上限截断
+        # （见 notify._CARD_LINES），多算出来的行也只是白算
+        body = [*getattr(self.state, "load_warnings", []), *lines[1:]]
         launch = next((o.latest.url for o in outcomes if o.latest), "")
         self.notifier.show("顺手 · 启动检查", body or ["书架为空"], launch)
         self.scheduler.run_forever()

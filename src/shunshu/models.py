@@ -58,13 +58,15 @@ def _str_list(value) -> list[str]:
     """手改的名单字段统一成字符串列表。
 
     裸字符串当一条收下（README 让人「把该章 URL 填进 keep_keys」，漏打方括号是最常见的写法）；
-    null 与对象当空；列表里的数字转成文本，嵌套对象丢掉。
+    null 与对象当空；列表里的数字转成文本，嵌套对象丢掉。bool 要显式排掉：它是 int 的
+    子类，`keep_keys: [true]` 这种手改笔误会收成字符串 "True"，看着像合法配置。
     """
     if isinstance(value, str):
         return [value] if value.strip() else []
     if not isinstance(value, (list, tuple)):
         return []
-    return [str(item) for item in value if isinstance(item, (str, int, float))]
+    return [str(item) for item in value
+            if isinstance(item, (str, int, float)) and not isinstance(item, bool)]
 
 
 def chinese_to_int(text: str) -> int | None:

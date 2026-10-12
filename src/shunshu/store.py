@@ -341,8 +341,6 @@ def log_filtered(paths: Paths, source: Source, dropped: list[tuple[str, str, str
 
 def write_candidates(paths: Paths, novel: Novel, source: Source, candidates: list,
                      note: str = "") -> None:
-    from .toc_detect import Candidate
-
     blocks: list[str] = [
         f"# 《{novel.title or novel.id}》来源 {source.site or source.id} 目录识别失败候选容器",
         f"# 生成时间: {now_stamp()}",
@@ -352,7 +350,6 @@ def write_candidates(paths: Paths, novel: Novel, source: Source, candidates: lis
         blocks.append(f"# 说明: {note}")
     blocks.append("# 选一个最像的，把它的 CSS 填进 data/novels.json 里该书 sources 中本源的 \"selector\"，然后托盘「重新加载配置」。")
     for i, cand in enumerate(candidates or [], 1):
-        assert isinstance(cand, Candidate)
         blocks.append(f"\n## 候选 {i}\n{cand.describe()}")
     blocks.append("\n# 被过滤掉的链接（前 40 条）：确认误杀后把对应 URL 填进本源 keep_keys")
     write_text_atomic(paths.source_candidates(source.id), "\n".join(blocks) + "\n")

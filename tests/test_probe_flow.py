@@ -248,3 +248,27 @@ def test_dead_manual_proxy_keeps_backing_off(app_state: AppState):
     assert source.last_error == "10.0.0.9:1080 走不通", "错误现场得留着"
     if app_state.paths.runtime_log.exists():
         assert "自动重探" not in app_state.paths.runtime_log.read_text(encoding="utf-8")
+
+
+def test_skipped_proxy_error_source_is_not_reprobed(app_state: AppState, monkeypatch):
+    """被退避跳过的那一轮不触发代理重探：那一轮根本没敲门，重探是白敲（最坏约一分钟）。
+
+    跳过轮的 outcome 仍带着 proxy_error 状态与到阈值的失败计数，run_round 必须按 skip_ids
+    把它从重探名单里剔掉，否则死代理每个跳过轮都被重探一次。
+    """
+    from shunshu.models import STATUS_PROXY_ERROR
+
+    novel = app_state.add_novel("https://proxy-book.example/1/")
+    source = novel.sources[0]
+    source.proxy = "http://127.0.0.1:7890"
+    source.status = STATUS_PROXY_ERROR
+    source.consecutive_failures = app_state.cfg.failure_backoff_threshold
+
+    reprobed: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        app_state, "ensure_source_proxy",
+        lambda sid, fetcher=None, *, force=False: reprobed.append((sid, force)) or None)
+
+    app_state.run_round(skip_ids={source.id}, notify=False)
+
+    assert reprobed == [], "被跳过的来源这一轮没抓取，不该触发重探"

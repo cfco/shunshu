@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import socket
 
-import pytest
-
 from shunshu.http import ConnectionFailureError, FetchError, ProxyError
 from shunshu import proxy_detect
 from shunshu.proxy_detect import (

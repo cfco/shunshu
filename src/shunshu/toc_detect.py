@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup, Tag
 
 from .config import AD_NODE_HINT, CHAPTER_HINT, Rules, normalize_text
-from .models import Candidate, Chapter, Toc, normalize_chapter_url, parse_chapter_number, site_key, strip_www
+from .models import Candidate, Chapter, normalize_chapter_url, parse_chapter_number, site_key, strip_www
 
 _PAGE_TEXT_RE = re.compile(r"^\s*(\d{1,4})\s*$")
 _LAST_PAGE_TEXTS = {"末页", "最后一页", "最后", "末"}

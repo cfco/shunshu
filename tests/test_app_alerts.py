@@ -15,7 +15,7 @@ def test_same_chapter_from_two_sources_pops_one_card(app_state: AppState, monkey
     """镜像站先更「第61章 風雪夜歸人」，主源随后更同一章：只提醒一次，卡片写明是谁报的。"""
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or True)
+                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
     url_b = "https://mirror-novel.net/12_3456/"
     novel = app_state.add_novel(fixtures.BASE_URL)
     app_state.add_source(novel.id, url_b)
@@ -40,7 +40,7 @@ def test_same_chapter_from_two_sources_pops_one_card(app_state: AppState, monkey
 def test_two_sources_updating_different_chapters_share_one_card(app_state: AppState, monkeypatch):
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or True)
+                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
     url_b = "https://mirror-novel.net/12_3456/"
     novel = app_state.add_novel(fixtures.BASE_URL)
     app_state.add_source(novel.id, url_b)
@@ -65,7 +65,7 @@ def test_slow_mirror_baseline_blocks_its_old_chapters_from_alerting(app_state: A
     """主源已经到 60 章，慢镜像建基线时只有 40 章：它更到 41 章不该当成新章节刷屏。"""
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or True)
+                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
     url_b = "https://mirror-novel.net/12_3456/"
     novel = app_state.add_novel(fixtures.BASE_URL)
     app_state.add_source(novel.id, url_b)

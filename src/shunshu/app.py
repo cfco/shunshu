@@ -3,17 +3,13 @@
 from __future__ import annotations
 
 import threading
-from pathlib import Path
 from urllib.parse import urlsplit
 
 from .align import match_key
 from .config import Config, Rules, load_config, save_config
 from .http import Fetcher, assert_http_url, proxy_label
 from .models import (
-    STATUS_BASELINE,
-    STATUS_NO_CHANGE,
     STATUS_PROXY_ERROR,
-    STATUS_UPDATED,
     Chapter,
     Novel,
     NovelAlert,
@@ -91,27 +87,34 @@ class AppState:
         """
         from .store import LAST_LOAD_WARNINGS
 
-        with self._lock:
-            LAST_LOAD_WARNINGS.clear()
-            self._cfg = load_config()
-            self._rules = self._cfg.compiled()
-            self._novels = load_novels(self.paths)
-            old_fetcher = getattr(self, "_fetcher", None)
-            self._fetcher = Fetcher(
-                user_agent=self._cfg.user_agent,
-                timeout=self._cfg.request_timeout_seconds,
-                retries=self._cfg.request_retries,
-                backoff=self._cfg.retry_backoff_seconds,
-                max_bytes=self._cfg.max_response_bytes,
-                workers=self._cfg.concurrency,
-            )
-            self.load_warnings = list(LAST_LOAD_WARNINGS)
-        # 旧抓取器的常驻连接池在锁外释放：不阻塞菜单。正在执行的与还在排队的抓取都让它跑完
-        # （wait=False 且不取消）——某一轮正攥着这些 future，取消会让整轮记账作废，见 Fetcher.close
-        if old_fetcher is not None:
-            close = getattr(old_fetcher, "close", None)
-            if close is not None:
-                close()
+        # 整轮级互斥：换 fetcher / 换 novels 必须与进行中的一轮串行。否则 reload 会在某轮
+        # 抓取途中 close() 掉它正攥着的连接池（pool.submit 抛 RuntimeError 掀掉整轮），或让
+        # 该轮把状态改到已被替换掉的旧 novel 对象上（存盘写的是新书架，这一轮记账丢失、甚至
+        # 下一章重复弹卡）。reload 已在后台线程执行，这里等一轮跑完再换可接受；锁序
+        # _round_lock→_lock 与 run_round/check_one 一致，不会死锁。
+        with self._round_lock:
+            with self._lock:
+                LAST_LOAD_WARNINGS.clear()
+                self._cfg = load_config()
+                self._rules = self._cfg.compiled()
+                self._novels = load_novels(self.paths)
+                old_fetcher = getattr(self, "_fetcher", None)
+                self._fetcher = Fetcher(
+                    user_agent=self._cfg.user_agent,
+                    timeout=self._cfg.request_timeout_seconds,
+                    retries=self._cfg.request_retries,
+                    backoff=self._cfg.retry_backoff_seconds,
+                    max_bytes=self._cfg.max_response_bytes,
+                    workers=self._cfg.concurrency,
+                )
+                self.load_warnings = list(LAST_LOAD_WARNINGS)
+            # 旧抓取器的常驻连接池在 _lock 外、但仍在 _round_lock 内释放：此刻没有一轮在跑，
+            # close() 不会打断进行中的抓取。wait=False 且不取消，已排队的任务让它自然跑完，
+            # 见 Fetcher.close
+            if old_fetcher is not None:
+                close = getattr(old_fetcher, "close", None)
+                if close is not None:
+                    close()
 
     def save_novels(self) -> None:
         with self._lock:
@@ -389,7 +392,11 @@ class AppState:
                                                   prefetch=html or None))
             for outcome in outcomes:
                 self._log(outcome)
-            self._collect([novel], outcomes, notify)
+            alerts = self._collect([novel], outcomes)
+        # 弹卡放到整轮锁外：spawn 每张卡要等最多 0.5 秒确认没秒退，持锁会把定时轮和
+        # 另一次添加堵在 _round_lock 上
+        if notify:
+            self.notifier.notify_many(alerts)
         # 代理重探要敲网络（最坏能拖到一分钟），放到整轮锁外做：不然用户在重探进行时
         # 添加小说，check_one 会一直等这把锁，添加看起来像卡住了。重探只改 proxy 和
         # 失败计数、不碰抓取状态，与随后开始的下一轮并发也无害。
@@ -397,6 +404,7 @@ class AppState:
         return outcomes
 
     def run_round(self, skip_ids: set[str] | None = None, notify: bool = True) -> list[Outcome]:
+        skip_ids = skip_ids or set()
         # 整轮级互斥：与 check_one（添加书源首轮）互斥，同一来源不会被两条线程同时抓
         with self._round_lock:
             with self._lock:
@@ -410,23 +418,29 @@ class AppState:
             ordered = [results[s.id] for n in novels for s in n.sources if s.id in results]
             for outcome in ordered:
                 self._log(outcome)
-            self._collect(novels, ordered, notify)
+            alerts = self._collect(novels, ordered)
+        # 弹卡放到整轮锁外：spawn 每张卡要等最多 0.5 秒确认没秒退，持锁会把「添加小说」的
+        # 首轮检查和下一轮都堵在 _round_lock 上（一次大批更新能堵好几秒）
+        if notify:
+            self.notifier.notify_many(alerts)
         # 定时轮里发现代理彻底失效（到退避阈值）也自动重探一次：放到整轮锁外做，理由同
         # check_one。重探成功会清掉失败计数，调度器随后算退避时自然不再跳过这个来源。
-        self._reprobe_dead_proxies(ordered)
+        # 只认真敲过门的来源：被退避跳过的那一轮 outcome 仍带着 proxy_error 状态与到阈值的
+        # 失败计数，不过滤会让死代理在每个跳过轮都被重探一次（一次最坏约一分钟）。
+        self._reprobe_dead_proxies([o for o in ordered if o.source.id not in skip_ids])
         return ordered
 
-    def _collect(self, novels: list[Novel], outcomes: list[Outcome], notify: bool) -> list[NovelAlert]:
-        """把「各来源各自的新章」压成「这本书要提醒什么」，然后每本一张卡片。
+    def _collect(self, novels: list[Novel], outcomes: list[Outcome]) -> list[NovelAlert]:
+        """把「各来源各自的新章」压成「这本书要提醒什么」，记账并存盘，返回要弹的卡片。
 
-        去重要在没有卡片的那一轮也做：`--no-toast` 只是不弹，不代表下一章以后还能再报一遍。
+        只记账、不弹卡：弹卡由调用方放到整轮锁外做（spawn 每张卡要阻塞确认没秒退，
+        不能持着 _round_lock）。去重在 notify=False 的那一轮也照做——不弹不代表下一章
+        以后还能再报一遍。
         """
         with self._lock:
             alerts = collect_alerts(novels, outcomes, keep=self._rules.cfg.notified_keys_keep)
             save_novels(self.paths, self._novels)
             self.last_alerts = alerts
-        if notify:
-            self.notifier.notify_many(alerts)
         return alerts
 
     def _log(self, outcome: Outcome) -> None:
@@ -452,20 +466,15 @@ class AppState:
         return records[:limit]
 
     def startup_lines(self, outcomes: list[Outcome]) -> list[str]:
-        """启动提示的内容：无更新只报最后一章，有更新逐章列标题。"""
+        """启动提示的内容：无更新只报最后一章，有更新逐章列标题。
+
+        逐本那行直接复用 `Outcome.summary()`：「更新 N 章 / 首次记录 / 无更新」这些
+        说法只在那一处维护，章节名也统一走简体（`display_title`）。这里只负责在行首
+        标明是哪个来源报的——一本书挂多个来源时启动摘要是逐来源一行，得能分清。
+        """
         if not outcomes:
             return ["书架为空：复制小说目录页链接后用托盘「添加小说（从剪贴板）」"]
         lines = [f"共监控 {len({o.novel.id for o in outcomes})} 本 {len(outcomes)} 个来源"]
         for outcome in outcomes:
-            title = outcome.novel.display_title()
-            if outcome.status == STATUS_UPDATED:
-                names = " / ".join(c.title for c in outcome.new_chapters)
-                more = f"（共 {outcome.total_new} 章）" if outcome.total_new > len(outcome.new_chapters) else ""
-                lines.append(f"《{title}》{outcome.source.site} 有更新，{outcome.total_new} 章{more}：{names}")
-            elif outcome.status == STATUS_BASELINE:
-                lines.append(f"《{title}》{outcome.source.site} 首次记录：最后一章 {outcome.source.latest_title or '未知'}")
-            elif outcome.status == STATUS_NO_CHANGE:
-                lines.append(f"《{title}》{outcome.source.site} 无更新：最后一章 {outcome.source.latest_title or '未知'}")
-            else:
-                lines.append(f"《{title}》{outcome.source.site} {outcome.detail()}")
+            lines.append(f"{outcome.source.site} · {outcome.summary()}")
         return lines

@@ -446,7 +446,7 @@ def test_card_does_not_mark_read_when_browser_fails(paths: Paths, monkeypatch):
 def test_notifier_records_alerts_log(paths: Paths, monkeypatch):
     calls = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: calls.append((payload, index)) or True)
+                        lambda payload, index=0, seconds=12.0: calls.append((payload, index)) or "")
     notifier = Notifier(alerts_path=paths.alerts_log, enabled=True)
     assert notifier.show("书", ["第9章 新"]) is True
     assert calls[0][0]["title"] == "书" and calls[0][0]["lines"] == ["第9章 新"]
@@ -457,7 +457,7 @@ def test_notifier_records_alerts_log(paths: Paths, monkeypatch):
 def test_notifier_can_be_silenced(paths: Paths, monkeypatch):
     calls = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: calls.append(payload) or True)
+                        lambda payload, index=0, seconds=12.0: calls.append(payload) or "")
     notifier = Notifier(alerts_path=paths.alerts_log, enabled=False)
     assert notifier.show("书", ["第9章 新"]) is False
     assert calls == []
@@ -469,7 +469,7 @@ def test_notifier_rejects_non_http_chapter_url(paths: Paths, monkeypatch):
 
     calls = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: calls.append(payload) or True)
+                        lambda payload, index=0, seconds=12.0: calls.append(payload) or "")
     source = Source(id="b1", toc_url="https://x.com/1/", site="x.com")
     entry = ChapterEntry(k="000009|第9章", t="第9章", u="javascript:alert(1)", s="b1")
     novel = Novel(id="b1", title="书", sources=[source], primary_id="b1", chapter_index=[entry])
@@ -481,8 +481,6 @@ def test_notifier_rejects_non_http_chapter_url(paths: Paths, monkeypatch):
 
 def test_second_instance_backs_off_with_a_card(tmp_path, monkeypatch):
     """重复启动不该多出第二个托盘图标：拿不到互斥体时 run() 提示完就退出。"""
-    import pytest
-
     from shunshu import instance, tray
     from shunshu.app import AppState
     from shunshu.store import Paths
@@ -492,7 +490,7 @@ def test_second_instance_backs_off_with_a_card(tmp_path, monkeypatch):
 
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or True)
+                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
     monkeypatch.setattr(tray, "acquire_singleton", lambda: False)
     app = tray.TrayApp(AppState(Paths(tmp_path / "data")))
     app.run()
@@ -562,8 +560,7 @@ def test_failed_card_spawn_is_recorded_with_a_reason(tmp_path, monkeypatch):
     from shunshu import notify
 
     def failing(payload, index=0, seconds=12.0):
-        notify.LAST_SPAWN_ERROR = "起进程失败 FileNotFoundError: [WinError 2]"
-        return False
+        return "起进程失败 FileNotFoundError: [WinError 2]"
 
     monkeypatch.setattr(notify, "spawn_card", failing)
     path = tmp_path / "alerts.log"
@@ -613,7 +610,7 @@ def test_card_slots_are_shared_by_one_notifier(app_state, monkeypatch):
 
     indices = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: indices.append(index) or True)
+                        lambda payload, index=0, seconds=12.0: indices.append(index) or "")
     tray = TrayApp(app_state)
     assert tray.notifier is app_state.notifier, "托盘和轮询得共用同一份槽位表"
 
@@ -671,7 +668,7 @@ def test_show_logs_only_the_lines_the_card_displays(paths: Paths, monkeypatch):
 
     payloads = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: payloads.append(payload) or True)
+                        lambda payload, index=0, seconds=12.0: payloads.append(payload) or "")
     lines = [f"第{i}章 测试" for i in range(1, 8)]
     assert Notifier(alerts_path=paths.alerts_log, enabled=True).show(
         "顺手 · 启动检查", lines, "https://book.example.com/1/9.html") is True

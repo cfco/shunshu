@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fixtures
-import pytest
 from conftest import FakeFetcher
 
 from shunshu.align import match_key
@@ -27,10 +26,10 @@ def test_startup_lines_report_last_chapter_when_no_update(app_state: AppState):
     app_state.set_fetcher(FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()}))
     first = app_state.run_round()
     lines = app_state.startup_lines(first)
-    assert "首次记录：最后一章 第60章" in lines[1]
+    assert "首次记录" in lines[1] and "第60章" in lines[1]
 
     again = app_state.run_round()
-    assert "无更新：最后一章 第60章" in app_state.startup_lines(again)[1]
+    assert "无更新" in app_state.startup_lines(again)[1] and "第60章" in app_state.startup_lines(again)[1]
 
 
 def test_startup_lines_name_proxy_failure_separately(app_state: AppState):
@@ -68,7 +67,7 @@ def test_startup_lines_list_every_new_chapter_title(app_state: AppState):
                                                         "第61章 风起", "第62章 云涌", "第63章 终局"]))
     outcomes = app_state.run_round(notify=False)
     line = app_state.startup_lines(outcomes)[1]
-    assert "有更新，3 章" in line
+    assert "更新 3 章" in line
     assert all(name in line for name in ("第61章 风起", "第62章 云涌", "第63章 终局"))
 
 
@@ -90,7 +89,7 @@ def test_notify_many_uses_one_card_per_book(app_state: AppState, monkeypatch):
 
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append((payload, index)) or True)
+                        lambda payload, index=0, seconds=12.0: cards.append((payload, index)) or "")
     notifier = Notifier(alerts_path=app_state.paths.alerts_log, enabled=True)
     assert notifier.notify_many(app_state.last_alerts) is True
 
@@ -108,7 +107,7 @@ def test_notifier_slot_skips_a_slot_still_held_from_earlier_batch(app_state: App
 
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(index) or True)
+                        lambda payload, index=0, seconds=12.0: cards.append(index) or "")
     notifier = Notifier(alerts_path=app_state.paths.alerts_log, enabled=True)
     # 手动占住 0 号槽（模拟上一批卡片还在屏幕上）
     notifier._slots = [time_mod.monotonic() + 100]
@@ -135,7 +134,7 @@ def test_adding_a_book_pops_card_with_latest_five(app_state: AppState, monkeypat
     """新加的一本要立刻弹最近 5 章：确认认对了书，也能顺手点开开始读。"""
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or True)
+                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
     app_state.set_fetcher(FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()}))
     novel = app_state.add_novel(fixtures.BASE_URL)
     outcomes = app_state.check_one(novel.id)
@@ -155,7 +154,7 @@ def test_adding_a_book_pops_card_with_latest_five(app_state: AppState, monkeypat
 def test_failed_first_check_pops_no_card(app_state: AppState, monkeypatch):
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or True)
+                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
     app_state.set_fetcher(FakeFetcher({}))  # 全部 URL 报网络错误
     novel = app_state.add_novel(fixtures.BASE_URL)
     assert [o.status for o in app_state.check_one(novel.id)] == [STATUS_NET_ERROR]
@@ -177,7 +176,7 @@ def test_card_shows_five_latest_not_just_new(app_state: AppState, monkeypatch):
     """只更新 1 章时卡片也要凑满最近 5 章，才能看出哪几章漏读。"""
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or True)
+                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
     fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()})
     app_state.add_novel(fixtures.BASE_URL)
     app_state.set_fetcher(fetcher)
@@ -198,7 +197,7 @@ def test_card_click_flows_through_read_log_into_next_card(app_state: AppState, m
 
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or True)
+                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
     fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()})
     novel = app_state.add_novel(fixtures.BASE_URL)
     app_state.set_fetcher(fetcher)
@@ -228,7 +227,7 @@ def test_read_state_is_shared_across_sources(app_state: AppState, monkeypatch):
     """已读记在小说级：繁体站那边读过「第61章」，简体站这张卡片里同一章也是灰的。"""
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or True)
+                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
     url_b = "https://mirror-novel.net/12_3456/"
     simple = [*fixtures.CHAPTERS, "第61章 风雪夜归人"]
     traditional = [f"第{i}章 測試章節{i:04d}" for i in range(1, 61)] + ["第61章 風雪夜歸人"]
@@ -256,7 +255,7 @@ def test_silent_round_still_records_the_alert(app_state: AppState, monkeypatch):
     """`--no-toast` 只是这一轮不弹，章节照样记账，下一轮不该再弹一遍。"""
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or True)
+                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
     fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()})
     app_state.add_novel(fixtures.BASE_URL)
     app_state.set_fetcher(fetcher)
@@ -321,6 +320,53 @@ def test_success_clears_backoff(app_state: AppState):
     outcome = scheduler.run_once(force=True)[0]
     assert outcome.source.consecutive_failures == 0
     assert scheduler.due_skip_ids(__import__("time").time()) == set()
+
+
+def test_after_round_leaves_skipped_source_due_untouched(app_state: AppState):
+    """被退避跳过的那一轮不重算 next_due：否则 due 每轮往后退，来源永远轮不到重试。"""
+    from shunshu.models import Outcome
+
+    novel = app_state.add_novel(fixtures.BASE_URL)
+    source = novel.sources[0]
+    source.consecutive_failures = app_state.cfg.failure_backoff_threshold
+    scheduler = Scheduler(app_state)
+    outcome = Outcome(novel=novel, source=source, status=STATUS_NET_ERROR)
+
+    scheduler.after_round([outcome])  # 真被检查且到阈值：设一个退避 due
+    due_once = scheduler._next_due[source.id]
+    assert due_once is not None
+
+    scheduler.after_round([outcome], skipped={source.id})  # 下一轮被跳过
+    assert scheduler._next_due[source.id] == due_once, "跳过的轮不该把退避 due 往后推"
+
+
+def test_backoff_expires_and_source_is_retried(app_state: AppState, monkeypatch):
+    """端到端：连续失败到阈值后先被跳过，但退避到点必须重新抓取，不能被永久跳过。"""
+    import shunshu.scheduler as sched_mod
+
+    novel = app_state.add_novel(fixtures.BASE_URL)
+    app_state.set_fetcher(FakeFetcher({}))  # 一直失败
+    scheduler = Scheduler(app_state)
+    threshold = app_state.cfg.failure_backoff_threshold
+    interval = scheduler.next_wait_seconds()
+
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(sched_mod.time, "time", lambda: clock["t"])
+
+    for _ in range(threshold):  # 用 force 把失败计数顶到阈值
+        scheduler.run_once(force=True)
+    assert novel.sources[0].consecutive_failures == threshold
+
+    # 之后按真实节奏一轮一轮跑：记录每轮是否真的敲了站点（calls 增长即没被跳过）
+    fetched = []
+    for _ in range(12):
+        clock["t"] += interval
+        before = len(app_state._fetcher.calls)
+        scheduler.run_once()
+        fetched.append(len(app_state._fetcher.calls) > before)
+
+    assert fetched[0] is False, "刚到阈值后应先被跳过一轮（退避仍生效）"
+    assert any(fetched), "退避到点后来源必须被重试，不能被永久跳过"
 
 
 def test_run_forever_does_not_add_a_second_startup_round(app_state: AppState, monkeypatch):
