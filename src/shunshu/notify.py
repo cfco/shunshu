@@ -36,7 +36,8 @@ class Notifier:
         rows = entry_rows(novel.chapter_index, novel.read_keys, novel.site_of)
         if not rows:
             return False
-        record = [row["t"] for row in entry_rows(alert.entries)][-_CARD_CHAPTERS:]
+        # 日志记的就是卡片上显示的那几行：alerts.log 要能对上现场，别记另一套章节
+        record = [row["t"] for row in rows]
         return self._present(make_payload(alert.title(), chapters=rows, novel=novel.id),
                              record, self._take_slot(), rows[0]["u"])
 

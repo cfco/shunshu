@@ -140,7 +140,8 @@ def build_card(root: tk.Tk, payload: dict) -> None:
               font=(_FONT, 9), padx=12, pady=2).pack(side="right")
 
 
-def show(payload: dict, index: int = 0, seconds: float = 10.0) -> None:
+def show(payload: dict, index: int = 0, seconds: float = 12.0) -> None:
+    """卡片进程主流程：默认展示时长与 notify._CARD_SECONDS 保持一致（12 秒）。"""
     root = tk.Tk(className="shunshu")
     root.title("顺手")
     build_card(root, payload)
@@ -153,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="shunshu.popup", description="顺手更新提醒卡片")
     parser.add_argument("--payload", required=True, help="make_payload 生成的 JSON 字符串")
     parser.add_argument("--index", type=int, default=0, help="多本同时更新时的纵向堆叠序号")
-    parser.add_argument("--seconds", type=float, default=10.0)
+    parser.add_argument("--seconds", type=float, default=12.0)
     args = parser.parse_args(argv)
     show(json.loads(args.payload), args.index, args.seconds)
     return 0

@@ -78,6 +78,48 @@ def data_dir() -> Path:
     return Path(override) if override else _base_dir() / "data"
 
 
+# 需要 int / float 类型的配置字段：手改 config.json 时可能写成 "30"、30.5 甚至 "abc"，
+# 读入时统一按这两张名单做类型归一，转不动就退回内置默认值
+_INT_FIELDS = frozenset({
+    "poll_minutes", "concurrency", "request_retries", "max_response_bytes",
+    "min_container_links", "min_chapterish_links", "max_pages_followed",
+    "history_display_cap", "notified_keys_keep", "max_report_new_chapters",
+    "failure_backoff_threshold",
+})
+_FLOAT_FIELDS = frozenset({
+    "same_host_delay_seconds", "request_timeout_seconds", "retry_backoff_seconds",
+    "toc_reset_overlap_ratio", "toc_reset_new_ratio", "order_trend_threshold",
+})
+_LIST_FIELDS = frozenset({
+    "ad_exact_texts", "ad_patterns", "title_suffixes", "host_whitelist",
+})
+
+
+def _coerce_field(key: str, value):
+    """把手改配置的值转成字段该有的类型；转不动返回 None，调用方保留内置默认值。
+
+    不做这层归一的话，poll_minutes 写成字符串会在 scheduler.next_wait_seconds()
+    的 float() 上抛 ValueError——那句在轮询主循环的 try 之外，会把轮询线程直接打死：
+    托盘还在、日志不再写、永远不再检查，且没有任何提示。
+    """
+    if key in _INT_FIELDS:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+    if key in _FLOAT_FIELDS:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    if key in _LIST_FIELDS:
+        return [str(item) for item in value] if isinstance(value, (list, tuple)) else None
+    if key == "user_agent":
+        text = str(value).strip()
+        return text or None
+    return value
+
+
 @dataclass(slots=True)
 class Config:
     poll_minutes: int = 30
@@ -123,7 +165,14 @@ class Config:
             # 手改 config.json 把字典字段写成别的类型时别让整个工具起不来
             if key == "site_proxies" and not isinstance(value, dict):
                 continue
-            setattr(cfg, key, value)
+            coerced = _coerce_field(key, value)
+            if coerced is None:
+                # 类型不对/转不动：保留内置默认值，不让坏值流到下游（见 _coerce_field 注释）
+                continue
+            setattr(cfg, key, coerced)
+        # 扫描间隔只认托盘菜单那四个固定选项：手改出 7 这种值时归到最接近的选项，
+        # 保证菜单有勾选、调度器算出的等待秒数也在预期范围内
+        cfg.poll_minutes = min(POLL_MINUTES, key=lambda v: abs(v - cfg.poll_minutes))
         return cfg
 
     def compiled(self) -> Rules:

@@ -391,10 +391,6 @@ class Outcome:
     known_keys: list[str] = field(default_factory=list)
 
     @property
-    def should_notify(self) -> bool:
-        return self.status == STATUS_UPDATED
-
-    @property
     def total_new(self) -> int:
         """新章节总数：new_chapters 受显示条数上限截断，计数不能用它。"""
         return self.new_count or len(self.new_chapters)

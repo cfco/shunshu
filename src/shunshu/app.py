@@ -99,7 +99,8 @@ class AppState:
                 workers=self._cfg.concurrency,
             )
             self.load_warnings = list(LAST_LOAD_WARNINGS)
-        # 旧抓取器的常驻连接池在锁外释放：不阻塞菜单，也不打断可能正在跑的一轮
+        # 旧抓取器的常驻连接池在锁外释放：不阻塞菜单。正在执行的抓取跑完为止不等（wait=False），
+        # 还在排队的直接取消——配置都重载了，替旧配置继续排队没有意义
         if old_fetcher is not None:
             close = getattr(old_fetcher, "close", None)
             if close is not None:
@@ -136,10 +137,9 @@ class AppState:
             novel = find_novel(self._novels, novel_ident)
             if novel is None:
                 raise ValueError(f"找不到《{novel_ident}》")
+            # 新挂来源不写书名：Source.title 创建时恒为空，取名留给首轮抓取（monitor._commit）
             source = Source(id=sid, toc_url=url, site=host_label(url), created_at=now_stamp())
             novel.sources.append(source)
-            if not novel.title and source.title:
-                novel.title = source.title
             return source
 
     def _source_by_id(self, sid: str) -> Source | None:

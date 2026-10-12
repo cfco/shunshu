@@ -150,10 +150,11 @@ uv run shunshu
 uv run pytest tests -q
 ```
 
-199 个用例，全用内存假站点（`tests/fixtures.py` 里的正常页/gbk 页/倒序页/分页页/广告堆页/跳板页/纯编号页），不联网、不弹真卡片也不起真 Tk 窗口（`tests/conftest.py` 里 autouse 把 `spawn_card` 换掉了，卡片点击逻辑用 `FakeRoot` 测）。代理相关的用例把 `Session.get` 换成假函数，因此也不真连代理。
+200 个用例，全用内存假站点（`tests/fixtures.py` 里的正常页/gbk 页/倒序页/分页页/广告堆页/跳板页/纯编号页），不联网、不弹真卡片也不起真 Tk 窗口（`tests/conftest.py` 里 autouse 把 `spawn_card` 换掉了，卡片点击逻辑用 `FakeRoot` 测）。代理相关的用例把 `Session.get` 换成假函数，因此也不真连代理。
 
 ## 变更记录
 
+- **0.7.1（2026-10-12）**：第三轮代码审计的小修。① 手改 `config.json` 的坏值不再流到下游：int/float/list 字段读入时按名单做类型归一，转不动就退回内置默认值——`poll_minutes` 写成 `"30分"` 这类字符串以前会在 `scheduler.next_wait_seconds()` 的 `float()` 上抛异常，把轮询主循环的线程直接打死（托盘还在、日志不再写、永远不再检查且无提示）；`poll_minutes` 归一到托盘菜单的 5/10/30/60 四个固定选项，菜单永远有勾选。② 并发数变更时不再 `cancel_futures`：换池只关不停，排队中的抓取在旧池跑完，不再打断进行中的一轮（`close()` 仍取消排队任务，注释写明两处语义区别）。③ 修复 `store.log_filtered` 注解引用未导入的 `Source`（靠 `__future__` 掩盖的 NameError）。④ `alerts.log` 改记卡片实际显示的那几行，与现场对得上。⑤ `read_jsonl` 只读文件尾部 256KB，不再整读 2MB 轮转的 history 文件。⑥ 清理死代码（`align.key_of`、`monitor.describe_outcome`、`Outcome.should_notify`、`add_source` 里恒假的书名赋值），修正两处注释笔误，`popup --seconds` 默认值统一为 12 秒。用例 199 → 200（新增配置坏值回退与归一的回归测试）。
 - **0.7.0（2026-10-12）**：第二轮代码审计的一轮系统性加固。① 打包态判定收敛到新模块 `packaging.py`（PyInstaller/Nuitka 统一），修掉 Nuitka onefile 升级后 `data/` 目录跟着解包临时目录跑、书架与代理记忆「丢失」，以及打包版开机自启写入不存在的 `python.exe` 两个问题；版本号改从包元数据读，只以 `pyproject.toml` 为单一来源。② 抓取错误细分：新增 `ConnectionFailureError`（连接被拒/超时/DNS），**4xx 不重试**、5xx 重试、SSL 错误不再被误判成连不上；代理探测只在连接级失败时才切代理（临时 503/403 不会再把站直连记忆误改成走代理），探测抓回的首页 HTML 复用给首轮建档，目录页少敲一次门。③ 代理候选按 host:port 归一去重（同端口 http/https 只探一个）；来源代理连续失败到退避阈值自动重探一次，换代理客户端后能自愈。④ 健壮性：`config.json`/`novels.json` 改坏自动改名 `.bak` 隔离并按默认值启动（启动卡/回执写明原因），日志超 2MB 按行轮转；并发线程池常驻复用，「立即检查本书」改为锁外抓取不再卡死托盘菜单；后台动作线程统一异常兜底并弹错误卡。⑤ 卡片槽位按时长分配（12 秒内两批更新不再重叠），一列排满自动向左换列；重编号阈值提成配置项 `toc_reset_new_ratio`；内置广告名单改为始终与用户配置合并，版本更新自带的新默认项对老用户立即生效；单实例互斥体句柄补 64 位类型声明；清理一批死代码。真实站点（一个直连不通、需走本机 7890 代理的站）端到端复验通过，用例 180 → 199（`tests/test_app.py` 按功能拆成 rounds/alerts/sources 三个文件）。
 - **0.6.4（2026-10-10）**：Releases 多一个单文件版。CI 在 folder 包之外再用 `--onefile` 编一个 exe 一起发布；单文件用 `--onefile-cache-mode=cached` + 产品元数据，让主进程与弹卡片的子进程共用同一份解包目录。本地已编译并截图验证：单文件版托盘正常、卡片能弹出。
 - **0.6.3（2026-10-10）**：发版不再需要手动打 tag。CI 每次 push 到 `main` 都按 `pyproject.toml` 的版本号自动发布 Release（tag 缺失时由 action 就地创建），`v*` tag 触发保留用于补发。

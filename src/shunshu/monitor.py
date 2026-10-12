@@ -26,7 +26,6 @@ from .models import (
     normalize_chapter_url,
     parse_chapter_number,
     site_key,
-    status_label,
 )
 from .reader import LoadResult, load_toc
 from .store import Paths, append_jsonl, log_filtered, now_stamp, sleep_seconds, write_candidates
@@ -313,7 +312,3 @@ def collect_alerts(novels: list[Novel], outcomes: list[Outcome], *, keep: int = 
         novel.add_to_index(fresh, rows=index_rows)
         alerts.append(NovelAlert(novel=novel, entries=fresh, added=added, latest=latest))
     return alerts
-
-
-def describe_outcome(outcome: Outcome) -> str:
-    return f"[{status_label(outcome.status)}] {outcome.summary()}"

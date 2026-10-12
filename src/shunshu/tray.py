@@ -415,7 +415,7 @@ class TrayApp:
         return "代理 直连（不走系统代理）"
 
     def _interval_items(self):
-        """托盘菜单「扫描间隔」子菜单：固定四个选项，用户二选一。"""
+        """托盘菜单「扫描间隔」子菜单：固定四个选项，用户四选一。"""
         current = self.state.cfg.poll_minutes
         for value in POLL_MINUTES:
             yield pystray.MenuItem(

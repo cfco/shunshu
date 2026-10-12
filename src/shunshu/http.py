@@ -198,8 +198,10 @@ class Fetcher:
         workers = max(1, int(workers))
         with self._pool_lock:
             if self._pool is not None and self._pool_workers != workers:
-                # 不等手头任务：已提交的抓取让它跑完，只是后续轮次改用新池
-                self._pool.shutdown(wait=False, cancel_futures=True)
+                # 不等手头任务也不取消：已提交（含还在排队）的抓取让它在旧池里跑完，
+                # 只是后续轮次改用新池。这里若 cancel_futures，正在跑的那一轮里
+                # 排队中的来源会抛 CancelledError 把整轮检查打断
+                self._pool.shutdown(wait=False)
                 self._pool = None
             if self._pool is None:
                 self._pool = ThreadPoolExecutor(max_workers=workers,
@@ -208,7 +210,11 @@ class Fetcher:
             return self._pool
 
     def close(self) -> None:
-        """释放常驻池：重新加载配置换 Fetcher、进程退出时调用。假抓取器没有此方法，调用前先 getattr。"""
+        """释放常驻池：重新加载配置换 Fetcher、进程退出时调用。假抓取器没有此方法，调用前先 getattr。
+
+        这里才取消还在排队的任务（cancel_futures）：调用方已经放弃这个抓取器，
+        排队的抓取没有继续跑的意义；正在执行的任务不受影响，跑完自然退出。
+        """
         with self._pool_lock:
             if self._pool is not None:
                 self._pool.shutdown(wait=False, cancel_futures=True)

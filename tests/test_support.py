@@ -323,10 +323,30 @@ def test_config_defaults_written_on_first_load(tmp_path, monkeypatch):
 def test_config_partial_file_keeps_defaults(tmp_path, monkeypatch):
     monkeypatch.setenv("SHUNSHU_DATA_DIR", str(tmp_path / "data"))
     (tmp_path / "data").mkdir(parents=True)
-    (tmp_path / "data" / "config.json").write_text(json.dumps({"poll_minutes": 3}), encoding="utf-8")
+    (tmp_path / "data" / "config.json").write_text(json.dumps({"poll_minutes": 10}), encoding="utf-8")
     cfg = load_config()
-    assert cfg.poll_minutes == 3
+    assert cfg.poll_minutes == 10
     assert cfg.ad_exact_texts == Config().ad_exact_texts
+
+
+def test_config_bad_values_fall_back_or_snap_to_choices(tmp_path, monkeypatch):
+    """手改 config.json 的坏值不能流到下游：poll_minutes 非法会打死轮询线程（见 _coerce_field）。"""
+    monkeypatch.setenv("SHUNSHU_DATA_DIR", str(tmp_path / "data"))
+    (tmp_path / "data").mkdir(parents=True)
+    (tmp_path / "data" / "config.json").write_text(json.dumps({
+        "poll_minutes": "30分",          # 转不动 → 退回默认 30
+        "concurrency": "6",              # 数字字符串 → 转成 int 6
+        "request_timeout_seconds": "abc",  # 转不动 → 退回默认 15.0
+        "ad_patterns": "not-a-list",     # 类型不对 → 退回内置默认
+    }), encoding="utf-8")
+    cfg = load_config()
+    assert cfg.poll_minutes == 30
+    assert cfg.concurrency == 6
+    assert cfg.request_timeout_seconds == 15.0
+    assert cfg.ad_patterns == Config().ad_patterns
+    # 四选项之外的值归到最接近的选项：菜单有勾选、调度器算出的秒数也在预期范围内
+    (tmp_path / "data" / "config.json").write_text(json.dumps({"poll_minutes": 7}), encoding="utf-8")
+    assert load_config().poll_minutes == 5
 
 
 def test_invalid_user_regex_is_skipped_not_fatal():

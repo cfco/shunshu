@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import data_dir
-from .models import Novel
+from .models import Novel, Source
 
 _LOCK = threading.RLock()
 SCHEMA_VERSION = 2
@@ -23,6 +23,9 @@ _ROTATE_KEEP_RATIO = 0.75
 
 # 最近一次加载（config.json / novels.json）遇到的降级说明：AppState.reload 取走弹卡
 LAST_LOAD_WARNINGS: list[str] = []
+
+# read_jsonl 只从文件尾部读这么多个字节：够取最后几十行即可，不整读 2MB 轮转文件
+_READ_TAIL_BYTES = 256 * 1024
 
 
 def now_stamp() -> str:
@@ -177,11 +180,39 @@ def append_jsonl(path: Path, record: dict) -> None:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def _tail_lines(path: Path) -> list[str]:
+    """只读文件尾部一段再按行切：history jsonl 单文件可轮转到 2MB，
+    而 read_jsonl 每次只要最后几十行，整读全文再切尾太浪费（书多时反复读几 MB）。
+
+    尾段不够取时最多少返回几行（不会多给），256KB 远大于实际需要的几十行。
+    解码失败的半行按替换符吞掉，交给下面的 json 解析去跳过。
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+    if size <= _READ_TAIL_BYTES:
+        try:
+            return path.read_text(encoding="utf-8-sig").splitlines()
+        except OSError:
+            return []
+    try:
+        with path.open("rb") as fh:
+            fh.seek(size - _READ_TAIL_BYTES)
+            chunk = fh.read()
+    except OSError:
+        return []
+    nl = chunk.find(b"\n")
+    if nl < 0:
+        return []  # 一整段没有换行，说明不是有效的行式日志
+    return chunk[nl + 1:].decode("utf-8", "replace").splitlines()
+
+
 def read_jsonl(path: Path, limit: int = 50) -> list[dict]:
     if not path.exists():
         return []
     with _LOCK:
-        lines = path.read_text(encoding="utf-8-sig").splitlines()
+        lines = _tail_lines(path)
     out: list[dict] = []
     for line in lines[-limit:]:
         line = line.strip()

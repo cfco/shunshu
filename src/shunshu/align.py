@@ -8,12 +8,8 @@ from __future__ import annotations
 
 import re
 from functools import lru_cache
-from typing import TYPE_CHECKING
 
 from .models import strip_chapter_label
-
-if TYPE_CHECKING:  # 只给类型注解用，避免运行时把 models 拖进来
-    from .models import Chapter
 
 _CANON_MAX = 24
 
@@ -72,7 +68,3 @@ def match_key(number: int | None, title: str) -> str:
     if not core:
         core = f"#{number}" if number is not None else "?"
     return f"{number:06d}|{core}" if number is not None else f"?|{core}"
-
-
-def key_of(chapter: Chapter) -> str:
-    return match_key(chapter.number, chapter.title)
