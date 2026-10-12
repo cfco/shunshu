@@ -132,6 +132,9 @@ class Config:
     min_container_links: int = 8
     min_chapterish_links: int = 3
     max_pages_followed: int = 1
+    # 提示文案里每本书最多列几章（启动摘要逐章列标题、历史记录取尾部）：
+    # 卡片本身另有硬上限（提醒卡 5 章 / 文字卡 4 行，见 notify._CARD_CHAPTERS/_CARD_LINES），
+    # 所以把它调到 4 以上只影响日志与历史内容深度，卡片可见行数不会再变。
     history_display_cap: int = 10
     notified_keys_keep: int = 500
     max_report_new_chapters: int = 30

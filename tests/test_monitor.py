@@ -195,6 +195,27 @@ def test_keep_keys_restores_filtered_ad_like_link(paths):
     assert fake_key in source.notified_keys
 
 
+def test_keep_keys_restores_an_old_chapter_without_becoming_the_latest(paths):
+    """捞回的是一章旧章时，不能因为它排在末尾就被当成「最新章节」。"""
+    html = f"""<!DOCTYPE html><html><head><title>捞回旧章这本书</title></head>
+<body><div class="listmain"><dl>
+{fixtures.toc_links(fixtures.CHAPTERS[:30])}
+  <DD class="ad"><A href="199.html">第5章 被广告容器误杀的旧章</A></DD>
+</dl></div></body></html>"""
+    novel = make_novel()
+    source = first(novel)
+    fetcher = FakeFetcher({fixtures.BASE_URL: html})
+    check_source(novel, source, RULES, fetcher, paths)
+    assert source.latest_number == 30  # 基线：目录里真正的最后一章
+
+    source.keep_keys = [normalize_chapter_url("https://book.example.com/12_3456/199.html")]
+    outcome = check_source(novel, source, RULES, fetcher, paths)
+
+    assert any(c.number == 5 for c in outcome.new_chapters)  # 捞回的旧章要当新章报一次
+    assert source.latest_number == 30, "捞回旧章不能顶掉最新章节"
+    assert source.latest_title == "第30章 测试章节0030"
+
+
 def test_source_proxy_is_handed_to_the_fetcher():
     novel = make_novel()
     source = first(novel)

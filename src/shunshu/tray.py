@@ -104,6 +104,11 @@ class TrayApp:
         self._start_bg(self._check_new_source, novel_id, source.id)
 
     def act_reload_config(self, icon=None, item=None) -> None:
+        # 读两个 JSON + 新建抓取器要动磁盘和 ssl，放在菜单线程上会把右键菜单顶住一小会儿，
+        # 统一丢给后台线程（和其它菜单动作一个口径）
+        self._start_bg(self._reload_config_bg)
+
+    def _reload_config_bg(self) -> None:
         self.state.reload()
         self._rebuild_menu()
         warnings = getattr(self.state, "load_warnings", [])

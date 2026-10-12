@@ -107,11 +107,9 @@ def check_source(novel: Novel, source: Source, rules: Rules, fetcher: Fetcher,
     source.status = STATUS_UPDATED
     source.status_detail = f"新增 {len(new)} 章"
     display = new[-rules.cfg.history_display_cap:]
-    # 卡片要显示「最近的 5 章」而不是「新来的 5 章」：混进旧章才能看出哪几章漏读
-    recent = list(reversed(chapters))[:rules.cfg.history_display_cap]
     _history(paths, novel, source, "update", new, latest)
     return Outcome(novel=novel, source=source, status=STATUS_UPDATED, new_chapters=display,
-                   recent=recent, new_count=len(new), latest=latest, message=f"更新 {len(new)} 章",
+                   new_count=len(new), latest=latest, message=f"更新 {len(new)} 章",
                    all_new=new)
 
 
@@ -212,19 +210,42 @@ def _apply_manual_keys(source: Source, loaded: LoadResult) -> list[Chapter]:
     drop = {k.strip() for k in source.drop_keys if k.strip()}
     chapters = {c.key: c for c in loaded.toc.chapters}
 
+    # 捞回的先收在一边，删完 drop 再插回目录原位。不能直接挂到末尾：_commit 取
+    # chapters[-1] 当「最新章节」，捞回一章旧的就把它算成最新章节，latest_url /
+    # 托盘「打开最新章节」/ 基线快照全跟着错。
+    restored: list[Chapter] = []
     for item in loaded.dropped:
         if item.reason in ("bad_scheme", "bad_href") or not item.text:
             continue
         key = normalize_chapter_url(item.url)
+        if key in chapters:
+            continue
         if key in keep or item.text in keep or item.url in keep:
-            chapters.setdefault(key, Chapter(title=item.text, url=item.url,
-                                             number=parse_chapter_number(item.text)))
+            restored.append(Chapter(title=item.text, url=item.url,
+                                    number=parse_chapter_number(item.text)))
 
     for key, chapter in list(chapters.items()):
         if key in drop or chapter.title in drop or chapter.url in drop:
             del chapters[key]
 
-    return list(chapters.values())
+    ordered = list(chapters.values())
+    for chapter in restored:
+        ordered = _insert_by_number(ordered, chapter)
+    return ordered
+
+
+def _insert_by_number(chapters: list[Chapter], chapter: Chapter) -> list[Chapter]:
+    """把捞回的章节按编号插回原位：停在本章之前（末尾编号都比它小就追加到末尾）。
+
+    只在有编号时按编号插。编号读不出来的站（站点编号本来就乱）只能追加到末尾——
+    那种站「哪章最新」本来就不靠编号判断，硬猜反而更糟。
+    """
+    if chapter.number is None:
+        return [*chapters, chapter]
+    for index, existing in enumerate(chapters):
+        if existing.number is not None and existing.number > chapter.number:
+            return [*chapters[:index], chapter, *chapters[index:]]
+    return [*chapters, chapter]
 
 
 def _history(paths: Paths | None, novel: Novel, source: Source, kind: str,

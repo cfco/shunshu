@@ -29,7 +29,6 @@ _LABELS = {
     STATUS_CHECK_ERROR: "检查异常",
 }
 
-_MULTI_NUM_RE = re.compile(r"(\d+)")
 _RANGE_RE = re.compile(r"^(\d+)\s*[-~—]\s*\d+$")
 _CN_DIGITS = {
     "零": 0, "〇": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,

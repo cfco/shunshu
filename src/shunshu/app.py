@@ -389,9 +389,12 @@ class AppState:
                                                   prefetch=html or None))
             for outcome in outcomes:
                 self._log(outcome)
-            self._reprobe_dead_proxies(outcomes)
             self._collect([novel], outcomes, notify)
-            return outcomes
+        # 代理重探要敲网络（最坏能拖到一分钟），放到整轮锁外做：不然用户在重探进行时
+        # 添加小说，check_one 会一直等这把锁，添加看起来像卡住了。重探只改 proxy 和
+        # 失败计数、不碰抓取状态，与随后开始的下一轮并发也无害。
+        self._reprobe_dead_proxies(outcomes)
+        return outcomes
 
     def run_round(self, skip_ids: set[str] | None = None, notify: bool = True) -> list[Outcome]:
         # 整轮级互斥：与 check_one（添加书源首轮）互斥，同一来源不会被两条线程同时抓
@@ -407,11 +410,11 @@ class AppState:
             ordered = [results[s.id] for n in novels for s in n.sources if s.id in results]
             for outcome in ordered:
                 self._log(outcome)
-            # 定时轮里发现代理彻底失效（到退避阈值）也自动重探一次：重探成功会清掉失败
-            # 计数，调度器随后算退避时自然不再跳过这个来源
-            self._reprobe_dead_proxies(ordered)
             self._collect(novels, ordered, notify)
-            return ordered
+        # 定时轮里发现代理彻底失效（到退避阈值）也自动重探一次：放到整轮锁外做，理由同
+        # check_one。重探成功会清掉失败计数，调度器随后算退避时自然不再跳过这个来源。
+        self._reprobe_dead_proxies(ordered)
+        return ordered
 
     def _collect(self, novels: list[Novel], outcomes: list[Outcome], notify: bool) -> list[NovelAlert]:
         """把「各来源各自的新章」压成「这本书要提醒什么」，然后每本一张卡片。
