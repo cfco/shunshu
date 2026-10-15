@@ -330,6 +330,33 @@ def test_collect_alerts_trims_index_and_alerted_keys(paths):
     assert len(novel.alerted_keys) == 3
 
 
+def test_alerted_ledger_keeps_the_newest_chapters_of_a_big_batch(paths):
+    """补更的章数超过账本上限时，留下来的必须是最新那几章：将来追上来的是目录末尾那几章，
+    不是开头那几章。留住旧的会让慢半拍的镜像把已经弹过卡的最新章节再报一遍。"""
+    novel = make_novel()
+    url_b = "https://mirror.example.com/12_3456/"
+    mirror = Source(id=source_id_for(url_b), toc_url=url_b, site="mirror.example.com")
+    novel.sources.append(mirror)
+    batch = [f"第{i}章 补更大批量{i:04d}" for i in range(61, 69)]
+    fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html(),
+                           url_b: fixtures.normal_html(list(fixtures.CHAPTERS))})
+    for source in novel.sources:
+        check_source(novel, source, RULES, fetcher, paths)
+
+    # 主源一次冒出 8 章，账本上限只有 5：被挤掉的必须是第 61~63 章（旧的）
+    fetcher.add(fixtures.BASE_URL, fixtures.normal_html([*fixtures.CHAPTERS, *batch]))
+    outcomes = [check_source(novel, s, RULES, fetcher, paths) for s in novel.sources]
+    alert = collect_alerts([novel], outcomes, keep=5)[0]
+    assert alert.count == 8
+    assert sorted(int(k.split("|")[0]) for k in novel.alerted_keys) == [64, 65, 66, 67, 68]
+
+    # 镜像现在才追上同一批：第 66~68 章上一轮已经弹过卡，不该再报
+    fetcher.add(url_b, fixtures.normal_html([*fixtures.CHAPTERS, *batch]))
+    outcomes = [check_source(novel, s, RULES, fetcher, paths) for s in novel.sources]
+    alert = collect_alerts([novel], outcomes, keep=5)[0]
+    assert [e.n for e in alert.entries] == [63, 62, 61], "只报账本里没有了的那几章旧章，新在前"
+
+
 def test_novel_alert_title_names_the_reporting_source(paths):
     """镜像站先更就说镜像站，并且点明主源还没更；主源随后补上同一章时不再重复提醒。"""
     novel = make_novel()

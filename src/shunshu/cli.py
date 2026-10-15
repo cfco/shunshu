@@ -24,6 +24,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _report_crash(exc: BaseException) -> None:
+    """启动崩了要把话留下来：编译版用 `--windows-console-mode=disable`，没有控制台，
+    traceback 不落到文件上就是彻底无声（数据目录本身写不动时，连 data/ 都指不上）。
+
+    顺序：`data/shunshu.log` → 系统临时目录；卡片是尽力而为，弹不出也不能盖掉已写的日志。
+    """
+    import tempfile
+    import traceback
+    from pathlib import Path
+
+    from . import __version__
+    from .store import Paths, append_text, now_stamp
+
+    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    paths = Paths()
+    for target in (paths.runtime_log, Path(tempfile.gettempdir()) / "shunshu-crash.log"):
+        try:
+            append_text(target, f"{now_stamp()} 启动失败（v{__version__}）:\n{detail}")
+            break
+        except OSError:
+            continue
+    try:
+        from .notify import Notifier
+
+        Notifier(paths.alerts_log).show(
+            "顺手启动失败",
+            [f"v{__version__}", f"{type(exc).__name__}: {exc}", f"详情见 {paths.runtime_log}"],
+            "")
+    except Exception:
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -33,10 +65,15 @@ def main(argv: list[str] | None = None) -> int:
         show(json.loads(args.payload), args.index, args.seconds)
         return 0
 
-    from .app import AppState
-    from .tray import TrayApp
+    try:
+        from .app import AppState
+        from .tray import TrayApp
 
-    TrayApp(AppState()).run()
+        TrayApp(AppState()).run()
+    except Exception as exc:
+        # 起不来时进程静默退出，托盘图标、卡片、日志一个都不会有——先留痕再退非零码
+        _report_crash(exc)
+        return 1
     return 0
 
 

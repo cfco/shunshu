@@ -1,6 +1,6 @@
 [project]
 name = "shunshu"
-version = "0.9.0"
+version = "0.9.1"
 description = "小说目录页更新监控：托盘常驻 + Windows 弹窗提醒"
 readme = "README.md"
 authors = [

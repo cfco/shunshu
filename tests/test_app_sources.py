@@ -144,6 +144,38 @@ def test_popup_subcommand_still_accepts_what_notify_builds():
     assert json.loads(args.payload)["title"] == "标题"
 
 
+def _broken_state(*_args, **_kwargs):
+    raise OSError("模拟起不来：数据目录是只读的")
+
+
+def test_startup_crash_leaves_a_traceback_and_a_card(tmp_path, monkeypatch):
+    """编译版没有控制台（--windows-console-mode=disable），起不来时 traceback 必须落到
+    data/shunshu.log 上，并尽力弹一张卡说一声，否则现场只剩「双击没反应」。"""
+    monkeypatch.setenv("SHUNSHU_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr("shunshu.app.AppState", _broken_state)
+
+    assert main(["run"]) == 1
+
+    log = (tmp_path / "data" / "shunshu.log").read_text(encoding="utf-8")
+    assert "启动失败" in log and "模拟起不来" in log and "Traceback" in log
+    alerts = (tmp_path / "data" / "alerts.log").read_text(encoding="utf-8")
+    assert "顺手启动失败" in alerts
+
+
+def test_startup_crash_falls_back_to_temp_log_when_data_is_unwritable(tmp_path, monkeypatch):
+    """崩溃本身可能就是 data/ 写不动引起的：这时 traceback 退到系统临时目录，不能一起丢掉。"""
+    data = tmp_path / "data"
+    (data / "shunshu.log").mkdir(parents=True)  # 这个位置上是个目录，追加必然失败
+    monkeypatch.setenv("SHUNSHU_DATA_DIR", str(data))
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr("shunshu.app.AppState", _broken_state)
+
+    assert main(["run"]) == 1
+
+    crash = (tmp_path / "shunshu-crash.log").read_text(encoding="utf-8")
+    assert "启动失败" in crash and "模拟起不来" in crash
+
+
 # ---------- 托盘来源展示与维护 ----------
 
 def test_tray_source_line_shows_proxy_without_credentials(app_state: AppState):

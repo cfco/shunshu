@@ -377,7 +377,11 @@ def collect_alerts(novels: list[Novel], outcomes: list[Outcome], *, keep: int = 
             fresh = [entry for _, entry in sorted(picked.values(), key=lambda pair: pair[0])]
             latest = novel.latest_chapter()
         elif fresh:
-            novel.mark_alerted([e.k for e in fresh], keep=keep)
+            # `mark_alerted` 按「列表尾部＝最近」裁上限，而 `fresh` 是新→旧，正着传进去会让
+            # 刚弹过卡的最新章节最先被挤掉。将来会重复报上来的恰恰是这一批（慢半拍的镜像
+            # 从自己目录的末尾追上来），所以账本要留最新那几章：一次补更上千章、超过了
+            # notified_keys_keep 时，镜像补报同一批不再重新弹卡。
+            novel.mark_alerted([e.k for e in reversed(fresh)], keep=keep)
             latest = novel.latest_chapter()
         else:
             continue
