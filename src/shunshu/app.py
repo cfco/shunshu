@@ -216,6 +216,12 @@ class AppState:
             self._cfg.poll_minutes = value
             save_config(self._cfg)
 
+    def set_pause_enabled(self, enabled: bool) -> None:
+        """托盘「暂停检查」开关只翻 pause_enabled；时段两端时间仍在 config.json 里改。"""
+        with self._lock:
+            self._cfg.pause_enabled = enabled
+            save_config(self._cfg)
+
     # ---------- 已读标记 ----------
 
     def mark_read(self, ident: str, chapter: Chapter) -> bool:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -58,6 +59,29 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", "", (text or "").translate(_ZERO_WIDTH)).lower()
 
 
+# 暂停检查时段的两端：HH:MM（也认全角冒号与 9:30 这种一位小时）
+_HHMM = re.compile(r"(\d{1,2})\s*[:：]\s*(\d{1,2})")
+_MINUTES_PER_DAY = 24 * 60
+_SECONDS_PER_DAY = 24 * 3600
+
+
+def parse_hhmm(text: object) -> int | None:
+    """「11:30」→ 当天第几分钟；写歪了（11:60、abc、空）返回 None，调用方按「不暂停」处理。"""
+    match = _HHMM.fullmatch(str(text or "").strip())
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return hour * 60 + minute
+
+
+def _seconds_of_day(epoch: float) -> int:
+    """本地时间的「今天第几秒」：午休要按用户桌上那个钟，不是 UTC。"""
+    local = time.localtime(epoch)
+    return local.tm_hour * 3600 + local.tm_min * 60 + local.tm_sec
+
+
 def _base_dir() -> Path:
     """程序基准目录：data/ 就建在它旁边。
 
@@ -93,6 +117,29 @@ _FLOAT_FIELDS = frozenset({
 _LIST_FIELDS = frozenset({
     "ad_exact_texts", "ad_patterns", "title_suffixes", "host_whitelist",
 })
+_BOOL_FIELDS = frozenset({"pause_enabled"})
+_STR_FIELDS = frozenset({"pause_start", "pause_end"})
+_TRUE_WORDS = frozenset({"1", "true", "yes", "on", "y"})
+_FALSE_WORDS = frozenset({"0", "false", "no", "off", "n"})
+
+
+def _to_bool(value):
+    """布尔字段的手改归一：只认上面两张词表，认不动返回 None 交调用方回默认值。
+
+    不能直接用 bool(value)——那是把 "false" 这种非空字符串判成真，等于手改
+    pause_enabled 想关掉反而打开了。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_WORDS:
+            return True
+        if text in _FALSE_WORDS:
+            return False
+    return None
 
 
 def _coerce_field(key: str, value):
@@ -114,6 +161,11 @@ def _coerce_field(key: str, value):
             return None
     if key in _LIST_FIELDS:
         return [str(item) for item in value] if isinstance(value, (list, tuple)) else None
+    if key in _BOOL_FIELDS:
+        return _to_bool(value)
+    if key in _STR_FIELDS:
+        # 空串是用户「不要这个时段」的合法写法，原样留着；只有整个键缺省时才用内置默认值
+        return str(value).strip()
     if key == "user_agent":
         text = str(value).strip()
         return text or None
@@ -144,6 +196,11 @@ class Config:
     # 目录正/倒序判断：编号升序占比超过此阈值就认作正序，低于 (1 - 阈值) 认作倒序
     order_trend_threshold: float = 0.6
     failure_backoff_threshold: int = 5
+    # 暂停检查时段（默认对齐午休）：这段时间整轮不抓站点，出时段的第一轮再一起报更新，
+    # 免得卡片正好落在人不在工位的时候。开关在托盘菜单，两端时间改这个文件。
+    pause_enabled: bool = False
+    pause_start: str = "11:30"
+    pause_end: str = "13:30"
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -185,6 +242,42 @@ class Config:
 
     def compiled(self) -> Rules:
         return Rules.build(self)
+
+    def pause_window(self) -> tuple[int, int] | None:
+        """两端时间都写得对时返回 (起始, 结束) 的「当天第几分钟」，与开关无关。
+
+        这一句只回答「时段配置得对不对」，「此刻到底该不该暂停」在 pause_seconds_left 里
+        （那边才看 pause_enabled）；菜单要用它单独判断时间写歪没有，不能被开关带跑。
+        起始==结束 按「没有时段」处理：它既可能是 0 分钟也可能是整一天，误判成后者
+        会让程序永远停抓且没有任何提示，宁可继续按间隔检查。
+        """
+        start, end = parse_hhmm(self.pause_start), parse_hhmm(self.pause_end)
+        if start is None or end is None or start == end:
+            return None
+        return start, end
+
+    def pause_seconds_left(self, now: float | None = None) -> float | None:
+        """此刻真的处在暂停时段里时返回「距时段结束还要几秒」（至少 1 秒），否则 None。
+
+        结束早于起始算跨零点（22:00~06:30 这种夜间时段）。多算 1 秒是给调度器的：
+        掐着端点那一分钟醒来可能落在 13:29:59.8，那一下抓取照样会把卡片送进午休中间。
+        """
+        if not self.pause_enabled:
+            return None
+        window = self.pause_window()
+        if window is None:
+            return None
+        start, end = window
+        span = (end - start) % _MINUTES_PER_DAY * 60
+        epoch = time.time() if now is None else now
+        elapsed = (_seconds_of_day(epoch) - start * 60) % _SECONDS_PER_DAY
+        if elapsed >= span:
+            return None
+        return max(1.0, span - elapsed + 1.0)
+
+    def in_pause_window(self, now: float | None = None) -> bool:
+        """此刻是否正在暂停中（托盘标签与状态提示用）。"""
+        return self.pause_seconds_left(now) is not None
 
 
 class Rules:
