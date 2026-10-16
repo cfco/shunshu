@@ -332,6 +332,8 @@ class Novel:
     primary_id: str = ""
     read_keys: list[str] = field(default_factory=list)
     alerted_keys: list[str] = field(default_factory=list)
+    # 卡片弹出去了、但没人点过也没被鼠标划过的章节：重启把卡片冲掉之后靠它补弹
+    unseen_keys: list[str] = field(default_factory=list)
     chapter_index: list[ChapterEntry] = field(default_factory=list)
     created_at: str | None = None
 
@@ -394,7 +396,7 @@ class Novel:
         payload["sources"] = [Source.from_dict(s) for s in
                               (raw_sources if isinstance(raw_sources, list) else [])
                               if isinstance(s, dict)]
-        for key in ("read_keys", "alerted_keys"):
+        for key in ("read_keys", "alerted_keys", "unseen_keys"):
             payload[key] = _str_list(payload.get(key))
         raw_index = payload.get("chapter_index")
         entries = []

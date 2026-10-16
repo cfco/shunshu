@@ -1,7 +1,9 @@
-"""右下角提醒卡片：由主程序以子进程方式拉起，点章节即跳浏览器。
+"""右上角提醒卡片：由主程序以子进程方式拉起，点章节即跳浏览器。
 
 不用 Windows 原生 toast：非打包程序的 AUMID 注册不上，WinRT 会把通知静默丢掉
 （Show() 不报错，但通知中心的库里根本没写入）。这里用 Tk 画一张无边框卡片。
+卡片不掐秒自动消失：没人点、鼠标也没从上面划过就一直挂着，划过去再离开才算看完
+（人不在工位时消失的提醒等于没提醒）；主进程那边管去重和封顶，见 notify.Notifier。
 已读状态由卡片自己追加写 data/read.jsonl，主程序下一轮吸收进书架。
 """
 
@@ -30,6 +32,8 @@ _ACCENT = "#7fb3ff"
 _UNREAD = "#6fd08c"
 _READ = "#7d8590"
 _FONT = "Microsoft YaHei UI"
+# 鼠标位置的采样间隔：只用来判断有没有「划过去再离开」，200ms 足够，也别勤到耗电
+_POINTER_POLL_MS = 200
 
 
 def make_payload(title: str, lines: list[str] | None = None, chapters: list[dict] | None = None,
@@ -46,8 +50,8 @@ def _rows_per_column(root: tk.Tk) -> int:
 def _place(root: tk.Tk, index: int, width: int = _WIDTH) -> None:
     """先排布再量尺寸，否则 overrideredirect 窗口会塌成一条。
 
-    卡片从右下角向上堆叠：一列排满（按屏幕高度算行数）就向左换一列，
-    index 由 Notifier 按槽位分配，保证短时间内的多批卡片不会完全重叠。
+    卡片从右上角往下堆叠：一列排满（按屏幕高度算行数）就向左换一列，
+    index 由 Notifier 按「还挂在屏幕上的卡片」分配，两张卡不会叠在同一位置。
     """
     root.update_idletasks()
     height = root.winfo_reqheight()
@@ -146,13 +150,50 @@ def build_card(root: tk.Tk, payload: dict) -> None:
               font=(_FONT, 9), padx=12, pady=2).pack(side="right")
 
 
-def show(payload: dict, index: int = 0, seconds: float = 12.0) -> None:
-    """卡片进程主流程：默认展示时长与 notify._CARD_SECONDS 保持一致（12 秒）。"""
+def _pointer_inside(root: tk.Tk) -> bool:
+    """鼠标指针此刻是否压在卡片那块矩形上（卡片无边框也不能拖动，矩形就是它的全部）。
+
+    宽度取实际值与请求值的较大者：窗口还没映射出来时 winfo_width 是 1，而请求宽度
+    比 geometry 设的 400 窄一点（实测 372），只取一个会把卡片右边那条漏掉。
+    """
+    x, y = root.winfo_pointerxy()
+    left, top = root.winfo_rootx(), root.winfo_rooty()
+    width = max(root.winfo_width(), root.winfo_reqwidth())
+    height = max(root.winfo_height(), root.winfo_reqheight())
+    return left <= x < left + width and top <= y < top + height
+
+
+def close_after_read(root: tk.Tk) -> None:
+    """鼠标划过去再离开就收起；从头到尾没人碰过的卡片一直挂着。
+
+    判指针位置而不是绑 <Enter>/<Leave>：卡片里每个 Label 都是独立窗口，鼠标在卡内
+    挪动会连着触发子控件的 Leave，照事件判会把「正盯着看」误判成「已经划过去了」。
+    """
+    left = not _pointer_inside(root)  # 弹出来时指针正压在卡片上，那一下不算「划过」
+    seen = False                      # 从外面划进来过，就算这个人看过了
+
+    def tick() -> None:
+        nonlocal left, seen
+        if _pointer_inside(root):
+            seen = seen or left
+            left = False
+        else:
+            left = True
+            if seen:
+                root.destroy()
+                return
+        root.after(_POINTER_POLL_MS, tick)
+
+    root.after(_POINTER_POLL_MS, tick)
+
+
+def show(payload: dict, index: int = 0) -> None:
+    """卡片进程主流程：一直显示到被点、被划过，或者被主进程收掉（同书换新章/堆满一屏）。"""
     root = tk.Tk(className="shunshu")
     root.title("顺手")
     build_card(root, payload)
     _place(root, index)
-    root.after(max(2000, int(seconds * 1000)), root.destroy)
+    close_after_read(root)
     root.mainloop()
 
 
@@ -160,9 +201,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="shunshu.popup", description="顺手更新提醒卡片")
     parser.add_argument("--payload", required=True, help="make_payload 生成的 JSON 字符串")
     parser.add_argument("--index", type=int, default=0, help="多本同时更新时的纵向堆叠序号")
-    parser.add_argument("--seconds", type=float, default=12.0)
     args = parser.parse_args(argv)
-    show(json.loads(args.payload), args.index, args.seconds)
+    show(json.loads(args.payload), args.index)
     return 0
 
 

@@ -5,7 +5,7 @@ import json
 import fixtures
 import pytest
 import requests
-from conftest import FakeFetcher
+from conftest import FakeFetcher, FakeProc, capture_cards
 
 from shunshu.config import Config, load_config, normalize_text
 from shunshu.http import (
@@ -364,17 +364,17 @@ def test_normalize_text_strips_zero_width():
 
 # ---------- 通知 ----------
 
-def test_popup_command_carries_payload_index_and_seconds():
+def test_popup_command_carries_payload_and_index():
     from shunshu.notify import popup_command
     from shunshu.popup import make_payload
 
     payload = make_payload("书名<>&", chapters=[{"t": "第1章", "u": "https://x.com/1.html", "read": True}])
-    cmd = popup_command(payload, 2, 12.0)
+    cmd = popup_command(payload, 2)
     assert cmd[1:4] == ["-m", "shunshu", "popup"]
     data = json.loads(cmd[cmd.index("--payload") + 1])
     assert data["title"] == "书名<>&" and data["chapters"][0]["read"] is True
     assert cmd[cmd.index("--index") + 1] == "2"
-    assert cmd[cmd.index("--seconds") + 1] == "12"
+    assert "--seconds" not in cmd, "卡片不再按秒自动消失，别再传那个参数"
 
 
 def test_card_lists_five_newest_first_with_read_flags():
@@ -446,7 +446,7 @@ def test_card_does_not_mark_read_when_browser_fails(paths: Paths, monkeypatch):
 def test_notifier_records_alerts_log(paths: Paths, monkeypatch):
     calls = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: calls.append((payload, index)) or "")
+                        lambda payload, index=0: calls.append((payload, index)) or ("", FakeProc()))
     notifier = Notifier(alerts_path=paths.alerts_log, enabled=True)
     assert notifier.show("书", ["第9章 新"]) is True
     assert calls[0][0]["title"] == "书" and calls[0][0]["lines"] == ["第9章 新"]
@@ -457,7 +457,7 @@ def test_notifier_records_alerts_log(paths: Paths, monkeypatch):
 def test_notifier_can_be_silenced(paths: Paths, monkeypatch):
     calls = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: calls.append(payload) or "")
+                        lambda payload, index=0: calls.append(payload) or ("", FakeProc()))
     notifier = Notifier(alerts_path=paths.alerts_log, enabled=False)
     assert notifier.show("书", ["第9章 新"]) is False
     assert calls == []
@@ -469,7 +469,7 @@ def test_notifier_rejects_non_http_chapter_url(paths: Paths, monkeypatch):
 
     calls = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: calls.append(payload) or "")
+                        lambda payload, index=0: calls.append(payload) or ("", FakeProc()))
     source = Source(id="b1", toc_url="https://x.com/1/", site="x.com")
     entry = ChapterEntry(k="000009|第9章", t="第9章", u="javascript:alert(1)", s="b1")
     novel = Novel(id="b1", title="书", sources=[source], primary_id="b1", chapter_index=[entry])
@@ -477,6 +477,145 @@ def test_notifier_rejects_non_http_chapter_url(paths: Paths, monkeypatch):
 
     assert notifier.notify_alert(NovelAlert(novel=novel, entries=[entry])) is True
     assert "javascript" not in paths.alerts_log.read_text(encoding="utf-8")
+
+
+def test_same_novel_new_chapter_replaces_its_earlier_card(paths: Paths, monkeypatch):
+    """同一本书又更了一章：旧卡还挂在屏幕上就得被新章那张顶掉，否则过期那张先被划到。"""
+    from shunshu.models import ChapterEntry, NovelAlert
+
+    spawned = capture_cards(monkeypatch)
+    source = Source(id="b1", toc_url="https://x.com/1/", site="x.com")
+    novel = Novel(id="b1", title="书", sources=[source], primary_id="b1")
+    notifier = Notifier(alerts_path=paths.alerts_log, enabled=True)
+
+    def alert(number: int, title: str) -> NovelAlert:
+        entry = ChapterEntry(k=f"0000{number}|{title}", t=title,
+                             u=f"https://x.com/{number}.html", s="b1", n=number)
+        novel.chapter_index = [entry]
+        return NovelAlert(novel=novel, entries=[entry])
+
+    notifier.notify_alert(alert(61, "第61章"))
+    notifier.notify_alert(alert(62, "第62章"))
+
+    assert [index for _p, index, _c in spawned] == [0, 0], "旧卡收起后 0 号槽位空出来了"
+    assert spawned[0][2].terminated, "同一本书的旧卡要被新卡顶掉"
+    assert spawned[1][2].terminated is False, "新那张还得挂着"
+
+
+def test_stack_full_evicts_the_oldest_unread_card(paths: Paths, monkeypatch):
+    """没人划过的卡堆满一屏就得腾地方：新卡挤掉最旧那张，而不是继续压到屏幕外。"""
+    from shunshu.notify import _MAX_LIVE_CARDS
+
+    spawned = capture_cards(monkeypatch)
+    notifier = Notifier(alerts_path=paths.alerts_log, enabled=True)
+    for i in range(_MAX_LIVE_CARDS + 1):
+        assert notifier.show(f"第{i}张卡", ["内容"]) is True
+
+    assert len(notifier._live) == _MAX_LIVE_CARDS
+    assert spawned[0][2].terminated, "堆满之后最旧那张被收掉"
+    assert spawned[-1][1] == 0, "腾出来的 0 号槽位被新卡接上"
+
+
+def test_slot_frees_when_a_card_was_swiped_away(paths: Paths, monkeypatch):
+    """卡片被划过就自己退了：父进程下次弹卡得先把这笔账摘掉，不然槽位号只涨不回收。"""
+    spawned = capture_cards(monkeypatch)
+    notifier = Notifier(alerts_path=paths.alerts_log, enabled=True)
+    notifier.show("第一张", ["内容"])
+    notifier.show("第二张", ["内容"])
+    assert [index for _p, index, _c in spawned] == [0, 1]
+
+    spawned[0][2].exited = True  # 第一张被划走了
+    notifier.show("第三张", ["内容"])
+    assert spawned[-1][1] == 0, "空出来的 0 号槽位要能被补上"
+
+
+def test_card_that_failed_to_pop_does_not_hold_a_slot(paths: Paths, monkeypatch):
+    """弹不出来的卡不该占着槽位：后面的卡照样从 0 号排起。"""
+    indices = []
+    monkeypatch.setattr("shunshu.notify.spawn_card",
+                        lambda payload, index=0: indices.append(index) or ("起进程失败", None))
+    notifier = Notifier(alerts_path=paths.alerts_log, enabled=True)
+    assert notifier.show("第一张", ["内容"]) is False
+    assert notifier.show("第二张", ["内容"]) is False
+    assert indices == [0, 0]
+    assert notifier._live == {}
+
+
+def test_replaced_and_evicted_cards_are_not_counted_as_seen(paths: Paths, monkeypatch):
+    """被新章顶掉、被封顶淘汰的卡片人根本没看到：不能算「划过」，补弹的账得留着。"""
+    from shunshu.notify import _MAX_LIVE_CARDS
+
+    popped = capture_cards(monkeypatch)
+    notifier = Notifier(alerts_path=paths.alerts_log, enabled=True)
+    for i in range(_MAX_LIVE_CARDS + 1):
+        notifier.show(f"第{i}张卡", ["内容"])
+    assert popped[0][2].terminated, "最旧那张被收掉了"
+    assert notifier.take_acked() == [], "被我们 terminate 的不算看过"
+
+    notifier.show("第0张卡", ["换了一轮内容"])
+    assert notifier.take_acked() == [], "同一句提示被新卡顶掉也不算看过"
+
+
+def test_swiped_away_card_reports_its_key_as_seen(paths: Paths, monkeypatch):
+    """卡片自己退出（退出码 0）就是被划过或被点掉了：键要交回主程序清补弹的账。"""
+    popped = capture_cards(monkeypatch)
+    notifier = Notifier(alerts_path=paths.alerts_log, enabled=True)
+    notifier.show("《书》更新 1 章", ["第61章"])
+    notifier.show("另一句提示", ["回执"])
+    assert notifier.take_acked() == []
+
+    popped[0][2].exited = True
+    assert notifier.take_acked() == ["《书》更新 1 章"]
+    assert notifier.take_acked() == [], "收走一次就该清空，别反复报同一张"
+
+
+def test_close_all_leaves_no_card_on_screen(paths: Paths, monkeypatch):
+    """退出时把还挂着的卡片一起收掉：留下的窗口没人能收，下次启动还得补弹。"""
+    popped = capture_cards(monkeypatch)
+    notifier = Notifier(alerts_path=paths.alerts_log, enabled=True)
+    notifier.show("第一张", ["内容"])
+    notifier.show("第二张", ["内容"])
+    notifier.close_all()
+    assert all(entry[2].terminated for entry in popped)
+    assert notifier._live == {}
+
+
+def test_card_stays_until_the_pointer_passes_over_it():
+    """没人点、鼠标也没划过的卡片不许自己消失；划过去再离开就算看完了。"""
+    from conftest import FakePointerRoot
+
+    from shunshu.popup import close_after_read
+
+    root = FakePointerRoot(box=(100, 100, 400, 190), pointer=(0, 0))
+    close_after_read(root)
+    for _ in range(50):
+        root.tick()
+    assert root.destroyed is False, "人不在工位时弹出来的卡必须还挂在那儿"
+
+    root.move(200, 150)  # 划到卡片上
+    root.tick()
+    root.move(0, 0)      # 再离开
+    root.tick()
+    assert root.destroyed, "划过之后离开就该收起"
+
+
+def test_pointer_resting_on_a_new_card_is_not_a_pass():
+    """卡片正好弹在停着的指针底下：光移开不算「划过」，移开再划回来才算。"""
+    from conftest import FakePointerRoot
+
+    from shunshu.popup import close_after_read
+
+    root = FakePointerRoot(box=(100, 100, 400, 190), pointer=(200, 150))
+    close_after_read(root)
+    root.move(0, 0)
+    root.tick()
+    assert root.destroyed is False
+
+    root.move(200, 150)
+    root.tick()
+    root.move(0, 0)
+    root.tick()
+    assert root.destroyed
 
 
 def test_second_instance_backs_off_with_a_card(tmp_path, monkeypatch):
@@ -490,7 +629,7 @@ def test_second_instance_backs_off_with_a_card(tmp_path, monkeypatch):
 
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
+                        lambda payload, index=0: cards.append(payload) or ("", FakeProc()))
     monkeypatch.setattr(tray, "acquire_singleton", lambda: False)
     app = tray.TrayApp(AppState(Paths(tmp_path / "data")))
     app.run()
@@ -543,7 +682,7 @@ def test_popup_command_shape_follows_the_runtime(monkeypatch, tmp_path):
     monkeypatch.delattr(sys, "frozen", raising=False)
     monkeypatch.setattr(sys, "argv", [str(exe)])
     monkeypatch.setattr(sys, "executable", str(tmp_path / "python.exe"))
-    argv = notify.popup_command({"title": "t"}, 2, 12.0)
+    argv = notify.popup_command({"title": "t"}, 2)
     assert os.path.normcase(argv[0]) == os.path.normcase(str(exe))
     assert argv[1] == "popup" and "-m" not in argv
     assert argv[argv.index("--index") + 1] == "2"
@@ -552,15 +691,15 @@ def test_popup_command_shape_follows_the_runtime(monkeypatch, tmp_path):
     interpreter.write_bytes(b"")
     monkeypatch.setattr(sys, "executable", str(interpreter))
     monkeypatch.setattr(sys, "argv", [str(tmp_path / "__main__.py")])
-    assert notify.popup_command({"title": "t"}, 0, 12.0)[:4] ==         [str(interpreter), "-m", "shunshu", "popup"]
+    assert notify.popup_command({"title": "t"}, 0)[:4] == [str(interpreter), "-m", "shunshu", "popup"]
 
 
 def test_failed_card_spawn_is_recorded_with_a_reason(tmp_path, monkeypatch):
     """卡片弹不出来不能静默：现场只有 alerts.log 一份东西可看。"""
     from shunshu import notify
 
-    def failing(payload, index=0, seconds=12.0):
-        return "起进程失败 FileNotFoundError: [WinError 2]"
+    def failing(payload, index=0):
+        return "起进程失败 FileNotFoundError: [WinError 2]", None
 
     monkeypatch.setattr(notify, "spawn_card", failing)
     path = tmp_path / "alerts.log"
@@ -604,13 +743,13 @@ def test_fetcher_close_lets_queued_fetches_finish():
 
 
 def test_card_slots_are_shared_by_one_notifier(app_state, monkeypatch):
-    """槽位要跨轮、跨「托盘回执」与「更新卡」共用：每轮新建一份 Notifier 时，
-    两张卡各自都从 0 数起，12 秒内连来两批就叠在屏幕同一位置。"""
+    """槽位表要跨轮、跨「托盘回执」与「更新卡」共用：每轮新建一份 Notifier 时，
+    两张卡各自都从 0 数起，连着弹就叠在屏幕同一位置。"""
     from shunshu.tray import TrayApp
 
     indices = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: indices.append(index) or "")
+                        lambda payload, index=0: indices.append(index) or ("", FakeProc()))
     tray = TrayApp(app_state)
     assert tray.notifier is app_state.notifier, "托盘和轮询得共用同一份槽位表"
 
@@ -668,7 +807,7 @@ def test_show_logs_only_the_lines_the_card_displays(paths: Paths, monkeypatch):
 
     payloads = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: payloads.append(payload) or "")
+                        lambda payload, index=0: payloads.append(payload) or ("", FakeProc()))
     lines = [f"第{i}章 测试" for i in range(1, 8)]
     assert Notifier(alerts_path=paths.alerts_log, enabled=True).show(
         "顺手 · 启动检查", lines, "https://book.example.com/1/9.html") is True

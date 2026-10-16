@@ -6,7 +6,7 @@ import json
 
 import fixtures
 import pytest
-from conftest import FakeFetcher
+from conftest import FakeFetcher, FakeProc
 
 from shunshu.app import AppState, DuplicateSource
 from shunshu.cli import build_parser, main
@@ -138,9 +138,9 @@ def test_popup_subcommand_still_accepts_what_notify_builds():
     from shunshu.notify import popup_command
     from shunshu.popup import make_payload
 
-    argv = popup_command(make_payload("标题", lines=["一行"]), 2, 12.0)[3:]
+    argv = popup_command(make_payload("标题", lines=["一行"]), 2)[3:]
     args = build_parser().parse_args(argv)
-    assert args.command == "popup" and args.index == 2 and args.seconds == 12.0
+    assert args.command == "popup" and args.index == 2
     assert json.loads(args.payload)["title"] == "标题"
 
 
@@ -218,7 +218,7 @@ def test_source_maintenance_lives_on_app_state(app_state: AppState):
 def test_tray_primary_and_pause_actions_take_effect(app_state: AppState, monkeypatch):
     from shunshu.tray import TrayApp
 
-    monkeypatch.setattr("shunshu.notify.spawn_card", lambda payload, index=0, seconds=12.0: "")
+    monkeypatch.setattr("shunshu.notify.spawn_card", lambda payload, index=0: ("", FakeProc()))
     url_b = "https://mirror-novel.net/12_3456/"
     novel = app_state.add_novel(fixtures.BASE_URL)
     mirror = app_state.add_source(novel.id, url_b)
@@ -242,7 +242,7 @@ def test_tray_new_source_receipt_names_that_source(app_state: AppState, monkeypa
 
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
+                        lambda payload, index=0: cards.append(payload) or ("", FakeProc()))
     # 本用例只验回执文案；代理探测由 test_probe_flow 专测，这里直接判「探测通过」
     monkeypatch.setattr(app_state, "ensure_source_proxy",
                         lambda sid, fetcher=None: ProbeResult(proxy=""))
@@ -283,7 +283,7 @@ def test_tray_source_submenu_lists_actions(app_state: AppState):
 def test_tray_delete_source_needs_two_clicks(app_state: AppState, monkeypatch):
     from shunshu.tray import TrayApp
 
-    monkeypatch.setattr("shunshu.notify.spawn_card", lambda payload, index=0, seconds=12.0: "")
+    monkeypatch.setattr("shunshu.notify.spawn_card", lambda payload, index=0: ("", FakeProc()))
     url_b = "https://mirror-novel.net/12_3456/"
     novel = app_state.add_novel(fixtures.BASE_URL)
     mirror = app_state.add_source(novel.id, url_b)
@@ -303,7 +303,7 @@ def test_tray_add_source_from_clipboard_then_baselines_quietly(app_state: AppSta
     url_b = "https://mirror-novel.net/12_3456/"
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
+                        lambda payload, index=0: cards.append(payload) or ("", FakeProc()))
     monkeypatch.setattr(tray, "read_text", lambda: f"这个站更快 {url_b}")
     novel = app_state.add_novel(fixtures.BASE_URL)
     app_state.set_fetcher(FakeFetcher({fixtures.BASE_URL: fixtures.normal_html(),

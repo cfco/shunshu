@@ -40,6 +40,10 @@ class DuplicateSource(Exception):
     """同一目录页已在书架里（不管挂在哪个来源下）。"""
 
 
+# 补弹账本最多记几章：一次补更上千章的书（日志里见过 1106 章那种）不能让 novels.json 撑爆
+_UNSEEN_KEEP = 30
+
+
 class AppState:
     def __init__(self, paths: Paths | None = None):
         self.paths = paths or Paths()
@@ -216,12 +220,6 @@ class AppState:
             self._cfg.poll_minutes = value
             save_config(self._cfg)
 
-    def set_pause_enabled(self, enabled: bool) -> None:
-        """托盘「暂停检查」开关只翻 pause_enabled；时段两端时间仍在 config.json 里改。"""
-        with self._lock:
-            self._cfg.pause_enabled = enabled
-            save_config(self._cfg)
-
     # ---------- 已读标记 ----------
 
     def mark_read(self, ident: str, chapter: Chapter) -> bool:
@@ -240,6 +238,9 @@ class AppState:
 
     def _remember_read(self, novel: Novel, key: str) -> None:
         novel.read_keys.append(key)
+        # 点开这一章就是看到这次更新了：从补弹账里划掉，重启不再为它弹一张
+        if key in novel.unseen_keys:
+            novel.unseen_keys = [k for k in novel.unseen_keys if k != key]
         cap = self._cfg.notified_keys_keep
         if cap <= 0:
             # cap=0 表示一个都不留：del [:-0] 等于 del [:0] 一条都删不掉，必须显式清空
@@ -264,6 +265,63 @@ class AppState:
         if changed:
             save_novels(self.paths, self._novels)
         return changed
+
+    def settle_card_acks(self) -> int:
+        """托盘退出前主动收一次：刚划过卡片就点退出，别等下一轮、更别下次启动再弹一遍。"""
+        with self._lock:
+            return self._absorb_card_acks()
+
+    def _absorb_card_acks(self) -> int:
+        """卡片被鼠标划过或被点掉就是「看过了」：把这本书的补弹账清掉。调用方需已持锁。
+
+        谁还挂在屏幕上只有 `Notifier` 知道（它攥着卡片进程句柄），所以每轮去收一次；
+        被新章顶掉、被封顶淘汰的那些不算看过，收回来的是空的。
+        """
+        acked = set(self.notifier.take_acked())
+        if not acked:
+            return 0
+        changed = 0
+        for novel in self._novels:
+            if novel.id in acked and novel.unseen_keys:
+                novel.unseen_keys = []
+                changed += 1
+        if changed:
+            save_novels(self.paths, self._novels)
+        return changed
+
+    def _mark_unseen(self, alerts: list[NovelAlert]) -> None:
+        """把这一轮弹出去的更新记成「还没人看过」：重启把窗口冲掉后靠它补弹。
+
+        记的是**这次报上来的那几章**（不是卡片上显示的前 5 行——那 5 行里混着更早的章，
+        补弹时标题会变成「更新 5 章」而实际只更了 1 章）。卡片内容照 `chapter_index` 重算，
+        和原来那张一模一样。上限 30 章：一次补更上千章的书不能让账本把 novels.json 撑爆。
+        「已添加」那张是建档回执、不是等着人看的提醒，不记账。
+        """
+        with self._lock:
+            changed = 0
+            for alert in alerts:
+                if alert.added:
+                    continue
+                keys = [entry.k for entry in alert.entries][:_UNSEEN_KEEP]
+                if keys and keys != alert.novel.unseen_keys:
+                    alert.novel.unseen_keys = keys
+                    changed += 1
+            if changed:
+                save_novels(self.paths, self._novels)
+
+    def pending_unseen_alerts(self) -> list[NovelAlert]:
+        """上次弹过、但没人点过也没被鼠标划过的更新：按原样再弹一遍。"""
+        with self._lock:
+            alerts: list[NovelAlert] = []
+            for novel in self._novels:
+                if not novel.unseen_keys:
+                    continue
+                pending = set(novel.unseen_keys)
+                entries = [entry for entry in novel.chapter_index if entry.k in pending]
+                if entries:
+                    alerts.append(NovelAlert(novel=novel, entries=entries,
+                                             latest=novel.latest_chapter()))
+            return alerts
 
     # ---------- 代理自动探测 ----------
 
@@ -379,6 +437,7 @@ class AppState:
         with self._round_lock:
             with self._lock:
                 self._absorb_read_marks()
+                self._absorb_card_acks()
                 novel = find_novel(self._novels, ident)
                 if novel is None:
                     return []
@@ -403,6 +462,7 @@ class AppState:
         # 另一次添加堵在 _round_lock 上
         if notify:
             self.notifier.notify_many(alerts)
+            self._mark_unseen(alerts)
         # 代理重探要敲网络（最坏能拖到一分钟），放到整轮锁外做：不然用户在重探进行时
         # 添加小说，check_one 会一直等这把锁，添加看起来像卡住了。重探只改 proxy 和
         # 失败计数、不碰抓取状态，与随后开始的下一轮并发也无害。
@@ -415,6 +475,7 @@ class AppState:
         with self._round_lock:
             with self._lock:
                 self._absorb_read_marks()
+                self._absorb_card_acks()
                 novels = list(self._novels)
                 rules = self._rules
                 fetcher = self._fetcher
@@ -429,6 +490,7 @@ class AppState:
         # 首轮检查和下一轮都堵在 _round_lock 上（一次大批更新能堵好几秒）
         if notify:
             self.notifier.notify_many(alerts)
+            self._mark_unseen(alerts)
         # 定时轮里发现代理彻底失效（到退避阈值）也自动重探一次：放到整轮锁外做，理由同
         # check_one。重探成功会清掉失败计数，调度器随后算退避时自然不再跳过这个来源。
         # 只认真敲过门的来源：被退避跳过的那一轮 outcome 仍带着 proxy_error 状态与到阈值的

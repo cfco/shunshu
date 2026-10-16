@@ -20,7 +20,6 @@ def build_parser() -> argparse.ArgumentParser:
     popup = sub.add_parser("popup", help="内部：主程序弹卡片时调用")
     popup.add_argument("--payload", required=True, help="卡片内容的 JSON（见 shunshu.popup.make_payload）")
     popup.add_argument("--index", type=int, default=0)
-    popup.add_argument("--seconds", type=float, default=12.0)
     return parser
 
 
@@ -62,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "popup":
         from .popup import show
 
-        show(json.loads(args.payload), args.index, args.seconds)
+        show(json.loads(args.payload), args.index)
         return 0
 
     try:

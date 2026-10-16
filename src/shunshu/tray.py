@@ -60,8 +60,7 @@ class TrayApp:
         self.state = state or AppState()
         # 与轮询共用同一个 Notifier：不然托盘回执和更新卡片各自数各自的槽位，永远都从 0 开始
         self.notifier = self.state.notifier
-        self.scheduler = Scheduler(self.state, on_round=self._after_round,
-                                   on_pause=self._enter_pause)
+        self.scheduler = Scheduler(self.state, on_round=self._after_round)
         self.icon: pystray.Icon | None = None
         self._pending_delete: tuple[str, float] | None = None
         self._status_hint = "启动中"
@@ -192,30 +191,6 @@ class TrayApp:
         self.state.set_poll_minutes(value)
         self._rebuild_menu()
 
-    def act_toggle_pause(self, icon=None, item=None) -> None:
-        """午休暂停开关：只翻 pause_enabled，时段两端时间仍要在 config.json 里改。"""
-        cfg = self.state.cfg
-        inside = cfg.in_pause_window()
-        enabled = not cfg.pause_enabled
-        self.state.set_pause_enabled(enabled)
-        if not enabled and inside:
-            # 那一觉是按「距时段结束还剩多久」睡的，不叫醒就得干等到点才恢复检查
-            self.scheduler.resume_now()
-        self._rebuild_menu()
-        if not enabled:
-            self._flash("已关闭暂停检查", f"轮询恢复成每 {cfg.poll_minutes} 分钟一轮，不看时间")
-            return
-        if cfg.pause_window() is None:
-            self._flash("已开启暂停检查，但时段没生效",
-                        f"config.json 里 pause_start / pause_end 现在是 {cfg.pause_start} 和 "
-                        f"{cfg.pause_end}，改成 HH:MM（如 11:30 与 13:30）后点「重新加载配置」")
-            return
-        left = cfg.pause_seconds_left()
-        detail = (f"现在正处在时段内，约 {round(left / 60)} 分钟后恢复检查" if left is not None
-                  else f"{cfg.pause_start}~{cfg.pause_end} 整轮不抓，"
-                       f"期间更新的章节由出时段的第一轮一起报出来")
-        self._flash("已开启暂停检查", detail)
-
     def act_toggle_autostart(self, icon=None, item=None) -> None:
         if autostart.is_enabled():
             autostart.disable()
@@ -234,6 +209,9 @@ class TrayApp:
 
     def act_quit(self, icon=None, item=None) -> None:
         self.scheduler.stop()
+        self.state.settle_card_acks()     # 先收「已经划过」的账，再收窗口
+        # 还挂着的卡片一起收掉：留着就是没人认领的窗口，下次启动会按「没看过」补弹
+        self.notifier.close_all()
         if self.icon is not None:
             self.icon.stop()
 
@@ -304,14 +282,17 @@ class TrayApp:
         """这一轮真正提醒过的本（不含刚建档的那张「已添加」卡片）。"""
         return [alert for alert in self.state.last_alerts if not alert.added]
 
-    def _enter_pause(self, text: str) -> None:
-        """调度器跨进暂停时段时叫回来：悬浮提示与菜单标签当场改成「暂停中」。
+    def _repop_unseen(self) -> None:
+        """上次弹过、没人点过也没被划过的更新补弹一遍：重启把窗口冲掉了不能就这么吞掉。
 
-        不叫这一声的话，托盘上最后一条提示还是出时段前那一轮的「均无新章节」，
-        午休结束时看不出这两小时是故意没动还是坏了。
+        排在启动摘要之后弹：补的那几张才是主角，压在最新一层才不会被摘要卡盖住。
+        这一轮启动检查刚弹过的书要跳过——那张卡已经在了，再弹一张只会把前一张顶掉。
         """
-        self._status_hint = text
-        self._rebuild_menu()
+        just_popped = {alert.novel.id for alert in self.state.last_alerts}
+        pending = [alert for alert in self.state.pending_unseen_alerts()
+                   if alert.novel.id not in just_popped]
+        if pending:
+            self.notifier.notify_many(pending)
 
     def _sync_icon_state(self) -> None:
         if self.icon is not None:
@@ -369,8 +350,6 @@ class TrayApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("重新加载配置", self.act_reload_config),
             pystray.MenuItem("扫描间隔", pystray.Menu(self._interval_items)),
-            pystray.MenuItem(self._pause_label(), self.act_toggle_pause,
-                             checked=lambda item: self.state.cfg.pause_enabled),
             pystray.MenuItem("开机自启", self.act_toggle_autostart,
                              checked=lambda item: autostart.is_enabled()),
             pystray.Menu.SEPARATOR,
@@ -464,20 +443,6 @@ class TrayApp:
     def _interval_checked(value, current, item=None) -> bool:
         return current == value
 
-    def _pause_label(self) -> str:
-        """「暂停检查」那行的标签：只写勾选表达不了的信息，开关状态交给那个勾本身。
-
-        没勾上时不带「已关闭」这类字样；勾上之后才需要多说两句——是正在暂停里，
-        还是时段写歪了（那种情况下开着等于没暂停）。
-        """
-        cfg = self.state.cfg
-        span = f"{cfg.pause_start}~{cfg.pause_end}"
-        if not cfg.pause_enabled:
-            return f"暂停检查（{span}）"
-        if cfg.pause_window() is None:
-            return f"暂停检查（时段 {span} 无效）"
-        return f"暂停检查（{span}，暂停中）" if cfg.in_pause_window() else f"暂停检查（{span}）"
-
     # ---------- 运行 ----------
 
     def run(self) -> None:
@@ -507,4 +472,5 @@ class TrayApp:
         body = [*getattr(self.state, "load_warnings", []), *lines[1:]]
         launch = next((o.latest.url for o in outcomes if o.latest), "")
         self.notifier.show("顺手 · 启动检查", body or ["书架为空"], launch)
+        self._repop_unseen()
         self.scheduler.run_forever()

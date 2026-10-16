@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import fixtures
-from conftest import FakeFetcher
+from conftest import FakeFetcher, FakeProc, capture_cards
 
 from shunshu.align import match_key
 from shunshu.app import AppState
@@ -89,7 +89,7 @@ def test_notify_many_uses_one_card_per_book(app_state: AppState, monkeypatch):
 
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append((payload, index)) or "")
+                        lambda payload, index=0: cards.append((payload, index)) or ("", FakeProc()))
     notifier = Notifier(alerts_path=app_state.paths.alerts_log, enabled=True)
     assert notifier.notify_many(app_state.last_alerts) is True
 
@@ -100,19 +100,140 @@ def test_notify_many_uses_one_card_per_book(app_state: AppState, monkeypatch):
 
 
 def test_notifier_slot_skips_a_slot_still_held_from_earlier_batch(app_state: AppState, monkeypatch):
-    """12 秒内连来两批更新：第二批不能又从 0 号槽位开始把第一批没消失的卡片盖住。"""
-    import time as time_mod
-
+    """卡片不掐秒消失：上一批还挂在屏幕上时，第二批不能又从 0 号槽位把它们盖住。"""
     from shunshu.notify import Notifier
 
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(index) or "")
+                        lambda payload, index=0: cards.append(index) or ("", FakeProc()))
     notifier = Notifier(alerts_path=app_state.paths.alerts_log, enabled=True)
-    # 手动占住 0 号槽（模拟上一批卡片还在屏幕上）
-    notifier._slots = [time_mod.monotonic() + 100]
+    # 手动占住 0 号槽（模拟上一批里那张还没被划走的卡片）
+    notifier._live = {"上一本的卡": (FakeProc(), 0)}
     notifier.show("第二批的卡", ["内容"])
-    assert cards == [1], "0 号还没释放，新卡必须顺延到 1 号槽位"
+    assert cards == [1], "0 号还被占着，新卡必须顺延到 1 号槽位"
+
+
+def _book_with_one_new_chapter(app_state: AppState) -> FakeFetcher:
+    """建一本刚更了一章的书：基线那轮不弹卡，更新那轮照常弹（卡片由 monkeypatch 假进程顶替）。"""
+    fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()})
+    app_state.add_novel(fixtures.BASE_URL)
+    app_state.set_fetcher(fetcher)
+    app_state.run_round(notify=False)
+    fetcher.add(fixtures.BASE_URL, fixtures.normal_html([*fixtures.CHAPTERS, "第61章 没看的那一章"]))
+    return fetcher
+
+
+def test_popped_card_is_marked_unseen_until_it_is_swiped_away(app_state: AppState, monkeypatch):
+    """弹出去的卡片按「还没人看过」记账；鼠标划过（卡片自己退出、码 0）之后下一轮清账。"""
+    popped = capture_cards(monkeypatch)
+    _book_with_one_new_chapter(app_state)
+    app_state.run_round()
+    novel = app_state.novels[0]
+    assert novel.unseen_keys == [entry.k for entry in app_state.last_alerts[0].entries], \
+        "记的是这次报上来的那几章，不是卡片上显示的前 5 行"
+    assert len(novel.unseen_keys) == 1, "更了 1 章就记 1 章，补弹的标题才会还是「更新 1 章」"
+
+    popped[0][2].exited = True          # 鼠标划过去又离开：卡片进程自己退出，退出码 0
+    app_state.run_round()
+    assert app_state.novels[0].unseen_keys == [], "看过一眼就不该再补弹"
+    assert AppState(app_state.paths).novels[0].unseen_keys == [], "清账要落盘"
+
+
+def test_unseen_updates_get_popped_again_after_a_restart(app_state: AppState, monkeypatch):
+    """重启把窗口冲掉了：那些没被点过也没被划过的更新，下次启动照原样补弹。"""
+    popped = capture_cards(monkeypatch)
+    _book_with_one_new_chapter(app_state)
+    app_state.run_round()
+    assert len(popped) == 1
+
+    restarted = AppState(app_state.paths)         # 新进程：书架从盘上读回来
+    pending = restarted.pending_unseen_alerts()
+    assert len(pending) == 1 and pending[0].novel.unseen_keys
+    restarted.notifier.notify_many(pending)
+    assert len(popped) == 2, "补弹要真弹一张"
+    assert popped[1][0]["chapters"] == popped[0][0]["chapters"], "补的那张和原来那张内容一致"
+    assert popped[1][0]["title"] == popped[0][0]["title"] == "《测试这本书》更新 1 章（来自 book.example.com）",         "标题也得一致：更了 1 章就不能说成 5 章"
+
+
+def test_seen_chapters_are_not_popped_again_after_restart(app_state: AppState, monkeypatch):
+    """划过一眼就算看过：整张卡的账一起清，重启不再补弹。"""
+    popped = capture_cards(monkeypatch)
+    _book_with_one_new_chapter(app_state)
+    app_state.run_round()
+    popped[0][2].exited = True
+    app_state.run_round()
+    assert AppState(app_state.paths).pending_unseen_alerts() == []
+
+
+def test_opening_a_chapter_from_the_menu_clears_its_unseen_entry(app_state: AppState, monkeypatch):
+    """没等卡片、直接在托盘点「打开最新章节」：也算看过，不该再补弹那张卡。"""
+    capture_cards(monkeypatch)
+    _book_with_one_new_chapter(app_state)
+    app_state.run_round()
+    novel = app_state.novels[0]
+    assert novel.unseen_keys
+
+    assert app_state.mark_read(novel.id, novel.latest_chapter()) is True
+    assert AppState(app_state.paths).pending_unseen_alerts() == []
+
+
+def test_quit_settles_a_card_swiped_just_before(app_state: AppState, monkeypatch):
+    """刚把卡片划过就点退出：这笔「看过了」要先落盘，否则下次启动会再弹一张没看过的。"""
+    from shunshu.tray import TrayApp
+
+    popped = capture_cards(monkeypatch)
+    _book_with_one_new_chapter(app_state)
+    app_state.run_round()
+    popped[0][2].exited = True          # 用户划过，卡片自己退出了（码 0）
+    TrayApp(app_state).act_quit()       # 中间没跑过任何一轮
+    assert AppState(app_state.paths).novels[0].unseen_keys == []
+
+
+def test_round_without_notify_leaves_nothing_to_repop(app_state: AppState, monkeypatch):
+    """没弹卡的一轮（notify=False）不该记账：不然没弹过的章节会被当成「弹过没看」补弹。"""
+    capture_cards(monkeypatch)
+    _book_with_one_new_chapter(app_state)
+    app_state.run_round(notify=False)
+    assert app_state.novels[0].unseen_keys == []
+    assert app_state.pending_unseen_alerts() == []
+
+
+def test_startup_does_not_repop_a_book_it_just_alerted(app_state: AppState, monkeypatch):
+    """启动轮自己刚弹过的书，补弹那一步不该再弹第二张——那只会把刚弹的那张顶掉。"""
+    import fixtures
+    from shunshu.tray import TrayApp
+
+    popped = capture_cards(monkeypatch)
+    fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()})
+    app_state.add_novel(fixtures.BASE_URL)
+    app_state.save_novels()
+    app_state.set_fetcher(fetcher)
+    app_state.run_round(notify=False)
+    fetcher.add(fixtures.BASE_URL, fixtures.normal_html([*fixtures.CHAPTERS, "第61章 上次弹过没看"]))
+    app_state.run_round()
+    assert app_state.novels[0].unseen_keys, "上一世那张没人看，账要留着"
+
+    restarted = AppState(app_state.paths)                  # 重启：账从盘上读回来
+    restarted.set_fetcher(fetcher)
+    tray = TrayApp(restarted)
+    fetcher.add(fixtures.BASE_URL, fixtures.normal_html(
+        [*fixtures.CHAPTERS, "第61章 上次弹过没看", "第62章 启动轮又更了一章"]))
+    restarted.run_round()                                  # 启动轮当场弹一张
+    popped_now = len(popped)
+    tray._repop_unseen()
+    assert len(popped) == popped_now, "这本书刚弹过，不该再补一张"
+
+
+def test_quit_closes_the_cards_on_screen(app_state: AppState, monkeypatch):
+    """退出托盘时把还挂着的卡片一起收掉：留着就是没人认领的窗口，下次启动会补弹。"""
+    from shunshu.tray import TrayApp
+
+    popped = capture_cards(monkeypatch)
+    _book_with_one_new_chapter(app_state)
+    app_state.run_round()
+    app = TrayApp(app_state)
+    app.act_quit()
+    assert popped[0][2].terminated is True
 
 
 def test_single_book_update_toast_lists_only_that_book(app_state: AppState):
@@ -134,7 +255,7 @@ def test_adding_a_book_pops_card_with_latest_five(app_state: AppState, monkeypat
     """新加的一本要立刻弹最近 5 章：确认认对了书，也能顺手点开开始读。"""
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
+                        lambda payload, index=0: cards.append(payload) or ("", FakeProc()))
     app_state.set_fetcher(FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()}))
     novel = app_state.add_novel(fixtures.BASE_URL)
     outcomes = app_state.check_one(novel.id)
@@ -154,7 +275,7 @@ def test_adding_a_book_pops_card_with_latest_five(app_state: AppState, monkeypat
 def test_failed_first_check_pops_no_card(app_state: AppState, monkeypatch):
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
+                        lambda payload, index=0: cards.append(payload) or ("", FakeProc()))
     app_state.set_fetcher(FakeFetcher({}))  # 全部 URL 报网络错误
     novel = app_state.add_novel(fixtures.BASE_URL)
     assert [o.status for o in app_state.check_one(novel.id)] == [STATUS_NET_ERROR]
@@ -176,7 +297,7 @@ def test_card_shows_five_latest_not_just_new(app_state: AppState, monkeypatch):
     """只更新 1 章时卡片也要凑满最近 5 章，才能看出哪几章漏读。"""
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
+                        lambda payload, index=0: cards.append(payload) or ("", FakeProc()))
     fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()})
     app_state.add_novel(fixtures.BASE_URL)
     app_state.set_fetcher(fetcher)
@@ -197,7 +318,7 @@ def test_card_click_flows_through_read_log_into_next_card(app_state: AppState, m
 
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
+                        lambda payload, index=0: cards.append(payload) or ("", FakeProc()))
     fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()})
     novel = app_state.add_novel(fixtures.BASE_URL)
     app_state.set_fetcher(fetcher)
@@ -227,7 +348,7 @@ def test_read_state_is_shared_across_sources(app_state: AppState, monkeypatch):
     """已读记在小说级：繁体站那边读过「第61章」，简体站这张卡片里同一章也是灰的。"""
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
+                        lambda payload, index=0: cards.append(payload) or ("", FakeProc()))
     url_b = "https://mirror-novel.net/12_3456/"
     simple = [*fixtures.CHAPTERS, "第61章 风雪夜归人"]
     traditional = [f"第{i}章 測試章節{i:04d}" for i in range(1, 61)] + ["第61章 風雪夜歸人"]
@@ -255,7 +376,7 @@ def test_silent_round_still_records_the_alert(app_state: AppState, monkeypatch):
     """`--no-toast` 只是这一轮不弹，章节照样记账，下一轮不该再弹一遍。"""
     cards = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0, seconds=12.0: cards.append(payload) or "")
+                        lambda payload, index=0: cards.append(payload) or ("", FakeProc()))
     fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()})
     app_state.add_novel(fixtures.BASE_URL)
     app_state.set_fetcher(fetcher)
