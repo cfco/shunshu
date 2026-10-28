@@ -137,6 +137,14 @@ jobs:
           "name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Release tag: $name"
 
+      # ---------- 发布页正文 = README「变更记录」里这一条的实际内容 ----------
+      # 不用 GitHub 自动生成的 notes（那是合并请求清单加一串 Full Changelog 链接，
+      # 点开什么也看不见）。README 里一条日志是一整行，脚本按 ①②③ 拆成项目符号。
+      # 两个 job 共用 scripts/release_notes.py，正文只有一份来源
+      - name: Build release notes
+        shell: pwsh
+        run: uv run python scripts/release_notes.py --version "${{ steps.tag.outputs.name }}" --out release-notes.md
+
       # ---------- 自动发布 Release（开源项目：每次 push 都要有可下载的 exe） ----------
       # tag 不存在时 action-gh-release 会就地建 tag，不用本地手动打
       - name: Publish GitHub Release
@@ -145,7 +153,7 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.name }}
           name: Shunshu ${{ steps.tag.outputs.name }}
-          generate_release_notes: true
+          body_path: release-notes.md
           fail_on_unmatched_files: true
           files: |
             shunshu-*.zip
@@ -294,12 +302,17 @@ jobs:
             echo "name=v$version" >> "$GITHUB_OUTPUT"
           fi
 
+      # 与 Windows 那步同一份脚本、同一份正文（纯标准库，用系统 python3 就够）
+      - name: Build release notes
+        run: python3 scripts/release_notes.py --version "${{ steps.tag.outputs.name }}" --out release-notes.md
+
       # Windows 那个 job 已经建过同名 tag 的 Release，这里再跑一次是往同一个 Release
       # 追加文件（softprops 按 tag 找已有 Release 并更新），不会建出第二个 Release
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
+          body_path: release-notes.md
           fail_on_unmatched_files: true
           files: |
             shunshu-*-linux-x86_64.tar.gz

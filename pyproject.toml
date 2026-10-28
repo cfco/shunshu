@@ -39,4 +39,6 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+# "." 是给 tests/test_release_notes.py 用的：它要 import scripts/release_notes.py
+# （CI 发布页正文的取文本逻辑），那个目录不是包，只能靠根目录进 sys.path
+pythonpath = ["src", "."]
