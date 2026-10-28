@@ -56,6 +56,10 @@ class Scheduler:
                 # 成功或失败次数还没到阈值，清掉退避
                 self._next_due.pop(source.id, None)
 
+    def wait_for_stop(self, seconds: float) -> bool:
+        """等这么多秒；期间点了「退出」就提前返回 True，调用方据此跳过启动那一轮。"""
+        return self._stop.wait(timeout=seconds)
+
     def run_once(self, *, force: bool = False) -> list:
         """跑一轮：force=True 时忽略退避直接检查全部来源。"""
         with self._busy:

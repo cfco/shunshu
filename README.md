@@ -1,14 +1,16 @@
 # 顺手（shunshu）
 
-监控小说**目录页**有没有更新的小工具。Windows 托盘常驻，没有窗口界面：添加、删除、改间隔、看状态全在托盘右键菜单里，更新提醒用右上角卡片。
+监控小说**目录页**有没有更新的小工具。Windows 与 Ubuntu 都是托盘常驻，没有窗口界面：添加、删除、改间隔、看状态全在托盘右键菜单里，更新提醒用右上角卡片。
 
 只做一件事：抓目录页 → 认出章节容器 → 比对新旧章节 → 有更新就弹卡片。正文一律不下载，点章节交给默认浏览器打开。
 
 ## 快速开始
 
+### Windows
+
 双击项目根的 **`启动.bat`**：后台起托盘，不留控制台窗口；首次运行会自动 `uv sync` 装依赖。排错用 `启动.bat debug`（带控制台启动，异常直接看得见）。
 
-重复双击不会多出第二个图标——第二个实例会弹一张「顺手已经在运行」的卡片然后自己退出。
+重复双击不会多出第二个图标——第二个实例会弹一张「顺手已经在运行」的卡片然后自己退出（靠 Windows 命名互斥体）。
 
 手动启动（与双击等价，会占着控制台）：
 
@@ -17,7 +19,34 @@ uv sync
 uv run shunshu
 ```
 
-开机自启：托盘菜单勾「开机自启」（写 HKCU 的 `Software\Microsoft\Windows\CurrentVersion\Run`，源码态用 `pythonw.exe` 起、打包态直接用 `shunshu.exe`，都不占控制台）。
+开机自启：托盘菜单勾「开机自启」（写 HKCU 的 `Software\Microsoft\Windows\CurrentVersion\Run`，源码态用 `pythonw.exe` 起、打包态直接用 `shunshu.exe`，都不占控制台）。自启那条命令带 `--boot-delay=60`：图标当场出现，启动那一轮先等 60 秒再跑，给代理客户端起来的时间——开机就检查会把走代理的来源全记成一次代理失败。手动启动（双击 `启动.bat`）不带这个开关，照旧当场检查。
+
+### Ubuntu
+
+```bash
+uv python install 3.14        # apt 的 python3 版本不够（项目要求 ≥3.14）
+uv sync
+uv run shunshu
+```
+
+系统侧还要这几样，缺哪样就少一块功能：
+
+```bash
+sudo apt install python3-tk xclip wl-clipboard xdg-utils fonts-noto-cjk
+```
+
+| 装件 | 少了会怎样 |
+| --- | --- |
+| `python3-tk` | 提醒卡片弹不出来（Tk 是卡片唯一的渲染层）；uv 自带的解释器是否含 tkinter 视版本而定，缺了就换用系统解释器建 venv |
+| `xclip`（X11）/ `wl-clipboard`（Wayland） | 「添加小说（从剪贴板）」读不到东西，只会回一句「没有可识别的链接」 |
+| `xdg-utils` | 点章节、点「打开数据目录」都靠 `xdg-open` |
+| `fonts-noto-cjk` | 卡片上中文变豆腐块，按像素截断的宽度也会错 |
+
+开机自启：勾「开机自启」写 `~/.config/autostart/shunshu.desktop`（XDG 标准，GNOME/KDE/XFCE 通用）。Exec 行同样带 `--boot-delay=60`，启动那一轮等代理起来再跑，与 Windows 一个口径。
+
+**托盘菜单的限制（还没解决）**：pystray 在 Linux 上依次试 AppIndicator → GTK → Xorg 三个后端。前两个要 `gi`（PyGObject），而它只能由系统包 `python3-gi` 提供、pip 装不上，所以用 uv 的解释器时基本只剩 Xorg 后端——那是老式 XEmbed 托盘，**不渲染右键菜单**（菜单只有 win32/gtk/darwin 后端有），GNOME Shell 默认也不提供这种托盘。结果是：图标可能在 XFCE/MATE/KDE 的托盘里出现但点开没菜单，Ubuntu 默认桌面上则可能什么都不出现。要在 Ubuntu 上真正用好，得改用系统解释器建 venv（`python3 -m venv --system-site-packages` + `sudo apt install python3-gi gir1.2-gtk-3.0`），代价是拿不到 Python 3.14。这条限制留在这里，没有偷偷当成已经能用。
+
+Wayland 下卡片的位置与置顶由合成器说了算（Tk 的 `overrideredirect` + 绝对定位是 X11 的路子），实测效果待验证；X11 会话（登录界面选 "Ubuntu on Xorg"）是这条路最稳的形态。
 
 添加小说：在浏览器里复制目录页网址 → 托盘「添加小说（从剪贴板）」。抓完直接弹一张卡片，列出**最新的 5 章**让你确认认对了书（顺手点一章就能开始看，并记为已读）；书名从页面标题里取，这一轮只记基线、不算更新。
 
@@ -28,7 +57,7 @@ uv run shunshu
 - **添加小说（从剪贴板）**：从剪贴板文本里提 http(s) 网址；同一网址重复添加会提示。
 - **重新加载配置**：手改过 `data/novels.json` / `data/config.json` 后点这里生效，不用重启。
 - **扫描间隔**：5 / 10 / 30 / 60 分钟，四选一，默认 30 分钟（固定间隔，不做抖动）。
-- **开机自启**：勾选状态即当前注册表项是否存在。
+- **开机自启**：勾选状态即自启配置是否存在（Windows 的注册表 Run 项 / Ubuntu 的 autostart 桌面文件）。勾上时写下的命令带 `--boot-delay=60`，托盘提示在等待期间会写「开机启动，60 秒后检查」。
 - **打开数据目录** / **退出**（退出会顺手收掉还挂着的卡片；那些没被看过的更新下次启动补弹）。
 
 ## 更新卡片
@@ -62,6 +91,9 @@ uv run shunshu
 | `alerts.log` | 每次弹窗的内容与跳转地址 |
 | `read.jsonl` | 卡片进程写的已读记录（`novel` + 跨源章节身份 `key`），主程序下一轮吸收进 `novels.json` 后清空 |
 | `shunshu.log` | 运行日志，一轮一行 |
+| `shunshu.lock` | 只在 Ubuntu 上出现：单实例闸门用的是这个文件的 flock（Windows 用命名互斥体，不落文件） |
+
+数据目录默认是项目根（打包后是 exe 同级）；不想让它写在只读位置、或想把书架放到别处，设 `SHUNSHU_DATA_DIR` 指到别的地方（Ubuntu 上用系统解释器 `pip install` 时基本都得设，例如 `~/.local/share/shunshu`）。
 
 两个保命小机制：
 
@@ -72,7 +104,7 @@ uv run shunshu
 
 ## 代理怎么配
 
-**添加书源时会自动确认一次**：托盘「添加小说」或「添加来源到本书」后，程序先**直连**目录页，通了就记下这个站直连；只有直连**连不上**（连接被拒、超时、DNS 失败，一个 HTTP 答复都没拿到）才依次试本机代理（先读 Windows LAN 设置里的系统代理，再兜底试 Clash/v2rayN 等常见本机端口 7890/7891/10809/10808 等；同一端口的 http/https 写法只探一次）。站点只要给了 HTTP 答复（哪怕 4xx/5xx/空页），就说明这条网络路径是通的，不会因为一次临时 503 就误判成「需要代理」。试出某个代理能通，就把代理地址写到该来源上，**后续每一轮都走它**，探测时抓回的首页 HTML 直接复用给首轮建档，目录页只敲一次门；直连和代理都不通则书照加、不记忆，弹卡片指引你手写代理。探测只在添加时做一次（超时 6 秒、不重试），日常轮询绝不临时探测——唯一的例外：**当初由探测自动写上去的**代理连续失败到退避阈值（默认 5 次）会自动重探一次，你把代理客户端从 7890 换成 10809 后无需手改配置即可自愈。你在 `novels.json` 手写的 `proxy` 永远不会被自动覆盖，也**不参与自动重探**（一个包都不会替它试）：它失败就照常累计次数、照常进退避，改不改由你决定。
+**添加书源时会自动确认一次**：托盘「添加小说」或「添加来源到本书」后，程序先**直连**目录页，通了就记下这个站直连；只有直连**连不上**（连接被拒、超时、DNS 失败，一个 HTTP 答复都没拿到）才依次试本机代理（先读 Windows LAN 设置里的系统代理——Ubuntu 上没这一项，直接跳到下一步，再兜底试 Clash/v2rayN 等常见本机端口 7890/7891/10809/10808 等；同一端口的 http/https 写法只探一次）。站点只要给了 HTTP 答复（哪怕 4xx/5xx/空页），就说明这条网络路径是通的，不会因为一次临时 503 就误判成「需要代理」。试出某个代理能通，就把代理地址写到该来源上，**后续每一轮都走它**，探测时抓回的首页 HTML 直接复用给首轮建档，目录页只敲一次门；直连和代理都不通则书照加、不记忆，弹卡片指引你手写代理。探测只在添加时做一次（超时 6 秒、不重试），日常轮询绝不临时探测——唯一的例外：**当初由探测自动写上去的**代理连续失败到退避阈值（默认 5 次）会自动重探一次，你把代理客户端从 7890 换成 10809 后无需手改配置即可自愈。你在 `novels.json` 手写的 `proxy` 永远不会被自动覆盖，也**不参与自动重探**（一个包都不会替它试）：它失败就照常累计次数、照常进退避，改不改由你决定。
 
 结论存在两个地方：
 
@@ -126,6 +158,8 @@ uv run shunshu
 
 同一个 `shunshu.exe` 兼任两件事——直接运行是起托盘，`shunshu.exe popup --payload <json>` 是主程序弹卡片时调的子命令。「当前是不是打包态、再次拉起自己该用哪个 exe」统一由 `packaging.py` 回答（PyInstaller 认 `sys.frozen`；Nuitka 判「argv[0] 是真实文件而 sys.executable 指向的解释器不存在」，因为它会把 `sys.executable` 伪造成一个不存在的 `python.exe`），开机自启命令、`data/` 目录定位、卡片子进程拉起都用这同一结论——Nuitka onefile 升级后解包临时目录会变版本号，`data/` 因此锚定在真实 exe 同级而不是 `__file__` 旁边，书架和代理记忆不会随升级「丢失」。编译参数以 workflow 里那两条为准，本地跑同样的命令即可（需要先 `uv sync --group dev`）。
 
+**只出 Windows 包**：workflow 那个 job 是 `runs-on: windows-latest`，产物名带 `windows-amd64`，`--windows-console-mode=disable` 也是 Windows 专用参数。Ubuntu 目前只能用源码态（`uv run shunshu`）；要出 Linux 产物得再加一个 job（Nuitka 在 Linux 上要 gcc/patchelf，`self_executable()` 复用同一个可执行文件弹卡片那条路也要重新验），这次没做。
+
 ## 设计与取舍
 
 - **入口只有两个**：托盘右键菜单，和直接改 `data/*.json`。不提供命令行——`shunshu` 这个命令只做一件事（起托盘），`python -m shunshu popup` 是主程序弹卡片时自己调用的内部子命令。
@@ -136,7 +170,7 @@ uv run shunshu
 - **内置名单永远生效**：广告/后缀内置名单与 `config.json` 里的用户名单合并去重后使用，老用户文件里固化的旧名单也能收到版本自带的新默认项，用户自己加的条目原样保留。
 - **编码**：盗版站大量 gb18030，按 header → meta → utf-8 → gb18030 的顺序定编码，声明 gb2312/gbk 的一律按 gb18030 解。
 - **最新章节按目录自己的排列定**：把抓到的章节按目录出现顺序排成旧→新，再用相邻编号的升降投票判断这本书是正序排还是倒序排（倒序站取开头，正序站取末尾）。**站点自己把编号写乱时不猜编号**——有的站正文排到 1564 章，末尾又另挂一块 184~190 章，那块才是最新，按编号取就永远取错。跨来源比较仍按章节号（同源的乱序只在源内按排列解决）。
-- **TLS 用 Windows 系统证书库**：盗版站常常只发叶子证书、少发中间证书，浏览器会自己补链，certifi 不会，于是浏览器能开的站在工具里报 `CERTIFICATE_VERIFY_FAILED`。抓取器启动时把默认证书库换成系统库（`truststore`），代理软件自签的 CA 装进系统库也就跟着信；换不了就退回 certifi，不会更差。**验证没有关掉**，只是换成本机信得过的那套根。
+- **TLS 用本机系统证书库**：盗版站常常只发叶子证书、少发中间证书，浏览器会自己补链，certifi 不会，于是浏览器能开的站在工具里报 `CERTIFICATE_VERIFY_FAILED`。抓取器启动时把默认证书库换成系统库（`truststore`：Windows 的根存储、Linux 的 openssl 系统库），代理软件自签的 CA 装进系统库也就跟着信；换不了就退回 certifi，不会更差。**验证没有关掉**，只是换成本机信得过的那套根。
 - **章节身份**：来源内去重用 `normalize_chapter_url` 归一化后的 URL（协议统一 https、去 www、去 index.html 与尾斜杠、去 fragment 与跟踪参数、去默认端口，业务参数保留）。改名、换协议都不会重复提醒。
 - **跨来源认同一章**：用「章节号 + 正题」的 `match_key`——正题先转简体、剥掉「第X章/1001.」序号前缀与「（求月票）」这类括号标注，只留汉字数字和小写字母再比对。繁简两个来源的「第120章 風雪夜歸人」和「第120章 风雪夜归人」因此认得出是同一章，已读状态共通：在一边点开过，另一边那张卡片里也是灰的。**显示也统一成简体**——卡片、托盘菜单里都是简体，但 `data/history/` 与 `novels.json` 存的是源站原文，跳过去的网页仍是繁体原样。
 - **状态分两层**：`notified_keys` 按来源记（各站 URL 不同），`read_keys`、`alerted_keys`、`chapter_index` 与书名按小说记；书名以最先抓到的来源为准，之后不再改写。
@@ -154,9 +188,24 @@ uv run shunshu
 uv run pytest tests -q
 ```
 
-246 个用例，全用内存假站点（`tests/fixtures.py` 里的正常页/gbk 页/倒序页/分页页/广告堆页/跳板页/纯编号页），不联网、不弹真卡片也不起真 Tk 窗口（`tests/conftest.py` 里 autouse 把 `spawn_card` 换掉，返回一个 `FakeProc` 让主进程那套「谁还挂在屏幕上」的记账照常跑到）。卡片自身的逻辑也不起窗口：点击用 `FakeRoot`，「划过才收」用 `FakePointerRoot`（把 `after` 队列攥在测试手里，一步一喂鼠标坐标）。代理相关的用例把 `Session.get` 换成假函数，因此也不真连代理。
+265 个用例，全用内存假站点（`tests/fixtures.py` 里的正常页/gbk 页/倒序页/分页页/广告堆页/跳板页/纯编号页），不联网、不弹真卡片也不起真 Tk 窗口（`tests/conftest.py` 里 autouse 把 `spawn_card` 换掉，返回一个 `FakeProc` 让主进程那套「谁还挂在屏幕上」的记账照常跑到）。卡片自身的逻辑也不起窗口：点击用 `FakeRoot`，「划过才收」用 `FakePointerRoot`（把 `after` 队列攥在测试手里，一步一喂鼠标坐标）。代理相关的用例把 `Session.get` 换成假函数，因此也不真连代理。
+
+平台分支在 `tests/test_host_branches.py`：`IS_WINDOWS` 一律用 monkeypatch 改，所以 Windows 与 Ubuntu 两套实现在任一台机器上都跑得动——Linux 的自启文件、剪贴板工具选择、卡片窗口属性、`xdg-open` 兜底、flock 分支（用假 `fcntl`）都在本机验证过。只有一条 `test_posix_singleton_blocks_second_instance` 要真 POSIX 才成立，在 Windows 上是 skip 状态（`1 skipped`）。
+
+在 Ubuntu 上跑同一套：
+
+```bash
+uv run pytest tests -q                       # 桌面会话里（有 DISPLAY）直接跑
+PYSTRAY_BACKEND=dummy uv run pytest tests -q  # 无显示器的机器（CI/SSH）：托盘用假后端，否则 pystray 连不上 X 就报错
+```
+
+测试覆盖不到的是真机上的渲染与系统集成：Tk 在 X11/Wayland 上的实际外观、pystray 到底能不能出托盘与菜单、`xclip` 与桌面剪贴板是否互通。这几条只能在 Ubuntu 桌面上看，见上面「Ubuntu」那节的限制说明。
 
 ## 变更记录
+
+- **0.13.0（2026-10-28）**：开机自启先等 60 秒再跑启动那一轮。① **症状**：代理客户端（`127.0.0.1:7890`）比托盘起得晚，而 `_startup_then_loop()` 一起来就 `run_once(force=True)`，`data/shunshu.log` 里每个走代理的来源当场记一次「代理不可用：…由于目标计算机积极拒绝，无法连接」，白涨一轮 `consecutive_failures`，启动卡也一片红。② **改法是给自启命令加开关，不是让程序睡 60 秒**：`autostart.BOOT_DELAY_ARG`（`--boot-delay=60`）只写进注册表 Run 项与 `.desktop` 的 Exec 行，`cli` 把它交给 `TrayApp(boot_delay=...)`，`_startup_then_loop()` 开头先等——图标和菜单当场可用，只有那一轮延后。手动启动（双击 `启动.bat`、`uv run shunshu`）不带这个开关，照旧当场检查，不会被拖慢。③ **等的是调度器的退出事件**（新增 `Scheduler.wait_for_stop()`）而不是 `time.sleep`：等待期间点「退出」立刻返回 True，启动轮与轮询都不再跑，否则等满 60 秒还要给一个已经退出的托盘补一张启动卡；等待期间托盘提示写「开机启动，60 秒后检查」，好确认这一等真的在等。④ **`needs_repair()` 只比程序、不比参数**（`_entry_path` 的 samefile 那条原样保留），所以升级前就勾过「开机自启」的机器不会自动补上这个开关——在托盘里取消再勾一次即可（本机这条已经写好并读回核对）。⑤ 用例 265 → 273（新增 `tests/test_boot_delay.py` 8 条：注册表值与源码态 Exec 行都带 `--boot-delay=60`、`--boot-delay=60` 与 `--boot-delay 60` 两种写法都认而裸 `shunshu` 没这个属性、`cli.main` 把它传到托盘、启动轮排在等之后、`boot_delay=0` 连等都不试、等待中退出既不跑轮也不弹卡、`wait_for_stop` 被 `stop()` 立刻叫醒）。**真跑复核** `.tmp/verify_boot_delay.py`（数据目录指 `.tmp/` 里的拷贝、抓取换成空轮，不碰网络也不写 `data/`）：延迟 3 秒实测启动轮在 3.00 秒后开始、等待中提示语是「开机启动，3 秒后检查」；等待 1 秒时点退出，线程 1.00 秒内结束、0 次启动轮、0 张卡；不带延迟那条 0.00 秒就检查。另用 `.venv\Scripts\pythonw.exe -m shunshu run --boot-delay=60 --help` 验了注册表里那条命令真被自启解释器接受（退出码 0）。**没有实测的是真开机**：60 秒是按本机「代理晚于托盘起来」这个现象定的，嫌慢或不够都可以改 `autostart.BOOT_DELAY_SECONDS`，改完要在托盘里重勾一次自启。
+
+- **0.12.0（2026-10-22）**：同一套代码同时跑 Windows 与 Ubuntu。① **新增 `host.IS_WINDOWS`**，平台差异一律写成「函数体内读这个常量」而不是导入期固化——写在模块顶层就固化了，一台机器上测不到另一套分支。② **开机自启拆成两套实现**（`autostart.py`）：Windows 那条原样保留（注册表 Run 项、`"C:\...\pythonw.exe" -m shunshu run` 的引号风格、`_entry_path` 的取法都不变），Ubuntu 写 `~/.config/autostart/shunshu.desktop`（XDG 标准，Exec 行按 shell 规则转义）。**这是原来的头号阻断**：`read_entry()` 里那句 `import winreg` 写在 `try` 外面、只捕 `OSError`，而 `TrayApp.run()` 第一句就是 `repair_if_drifted()`，Ubuntu 上 `ModuleNotFoundError` 直接冒到 `cli.main` → 图标、卡片、轮询一个都没有。③ **卡片不再必崩**：`-toolwindow` 是 Windows 独有的 wm 属性，X11 的 Tk 收到就报 unrecognized option、卡片进程当场非零退出，而卡片是本工具唯一的反馈通道——现在 `overrideredirect` + `-topmost` 两边都设，`-toolwindow` 只在 Windows 设。字体也从写死的 `Microsoft YaHei UI` 改成按候选表挑本机真装了的那一个（Ubuntu 首选 Noto Sans CJK SC，全都没装退回 `TkDefaultFont`）：字形缺了会画成豆腐块，而卡片标题与章节名是按像素宽度截断的，字体不对连排版一起错。④ **剪贴板加 POSIX 分支**：按会话变量依次试 `wl-paste`（要 `WAYLAND_DISPLAY`）、`xclip`、`xsel`（要 `DISPLAY`），命令没装就跳下一个、全都没有就返回 `None` 让菜单照旧降级提示；Windows 的 user32 那条一字未动。⑤ **单实例加 flock 分支**：锁在 `data/shunshu.lock` 上，fd 一直攥着（一关锁就没了），锁文件根本开不了时放行而不是拦启动。原来非 Windows 是直接 `return True`，等于 README 那句「重复启动不会多出第二个图标」在 Ubuntu 上根本不成立。⑥ **交给系统的那几下**：`browser.py` 拆成 `_startfile` / `_webbrowser` / `_fallback_command`，Windows 仍是 startfile → webbrowser → rundll32，Ubuntu 是 webbrowser → xdg-open；托盘「打开数据目录」在 Ubuntu 走 `xdg-open`，失败照旧回执一张卡；「开启失败」那句提示不再只提注册表。⑦ 用例 246 → 265（新增 19 条集中在 `tests/test_host_branches.py`：XDG 自启写读改删与漂移、Windows 命令引号风格与带空格路径的取回、剪贴板三条会话组合与「什么都没装」、`-toolwindow` 只在 Windows、字体回退、`xdg-open` 兜底与 startfile 优先、非 http 链接不落到任何命令、假 `fcntl` 的两条分支与真 flock 跨进程那条）。**Windows 侧真跑复核**（`.tmp/verify_windows_compat.py` + 截图）：注册表项读得一致且 `repair_if_drifted` 没重写、剪贴板仍走 user32、卡片照常弹出且已读行是灰的、第三个进程被互斥体拦住、走真入口的第二个实例弹一张「已经在运行」后退出码 0。**Ubuntu 侧只做到代码与用例，没有真机验证**：Tk 在 X11/Wayland 上的实际外观、pystray 能不能出托盘和菜单（Linux 只有 gtk/appindicator 后端渲染右键菜单，而 `gi` 只能由系统包提供、pip 装不上，这条限制写在上面「Ubuntu」那节没被藏起来）、`xclip` 与桌面剪贴板是否互通、Wayland 下 `overrideredirect` + 绝对定位还剩多少。⑧ **这次没做的**：Linux 打包与 CI job（workflow 仍只出 `windows-amd64`）、`requires-python` 仍是 `>=3.14`（正是它挡住了「用 apt 的 python3 + `python3-gi` 换托盘菜单」那条路，要不要放宽得先定）、数据目录默认仍在项目根（只读位置靠 `SHUNSHU_DATA_DIR` 指走）。
 
 - **0.11.0（2026-10-16）**：重启冲掉的卡片会补弹。① **`novels.json` 每本新增 `unseen_keys`**：弹出去、但没人点过也没被鼠标划过的章节记在这儿（记的是**这次报上来的那几章**，最多 30 章——一次补更上千章的书不能把账本撑爆；「已添加」那张是建档回执，不记账）。下次启动在「启动检查」那张之后按 `chapter_index` 重算内容再弹一遍，标题与那 5 行和原来那张一模一样；启动轮当场已经弹过的那本不再重复补（先按卡片显示的前 5 行记过，结果更 1 章被说成「更新 5 章」，改成记实际报上来的章节才对得上）。② **谁被看过了，靠卡片进程的退出码判断**：`spawn_card` 交回的句柄被 `Notifier._collect_acks()` 用 `poll()` 检查——自己退出的（码 0）就是被划过或被点掉，算看过；被 `terminate` 的（同书换新章、堆满淘汰）和崩掉的都不算，下次启动照样补。原来的 `_prune` 并进这一条，`take_acked()` 把看过的那些键交给主程序清账。没做成卡片自己往 `data/` 写一条已看记录：父进程本来就攥着句柄，少一条跨进程写文件的并发路径。③ **清账的三个入口**：每轮开头（`_absorb_card_acks`，与吸收 `read.jsonl` 同一处）、托盘点「打开最新章节」（`_remember_read` 顺手把这一章从 `unseen_keys` 里划掉，没等卡片划到也算看过）、以及点「退出」（先 `settle_card_acks()` 收账，再 `close_all()` 关掉还挂着的窗口——不然刚划过就退出会白弹一遍，留着那些窗口也没人认领）。④ 启动轮当场弹过的书不再补弹第二张（`_repop_unseen` 按 `last_alerts` 跳过，否则刚弹的那张会被自己顶掉）。⑤ 用例 235 → 246（新增 11 条：弹出去就记账、划过清账并落盘、重启补弹且标题与那 5 行完全一致、启动轮刚弹过的不重复补、`notify=False` 那轮不记账、被顶掉与被淘汰都不算看过、划过算看过、菜单里点开算看过、退出收窗口、退出前收尾账、`close_all` 之后账上不留卡片）。真跑验证：A 进程弹一张卡后 terminate（等于被重启冲掉），B 进程从盘上读出「1 本没看过」并补弹出同一张卡；真鼠标划过之后退出码 0、下一轮 `unseen_keys` 清空、再问补弹是 0 本。
 

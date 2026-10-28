@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 import time
 from functools import partial
@@ -16,6 +17,7 @@ from .app import AppState, DuplicateSource
 from .browser import open_in_default_browser
 from .clipboard import extract_url, read_text
 from .config import POLL_MINUTES
+from .host import IS_WINDOWS
 from .instance import acquire_singleton
 from .http import proxy_label
 from .models import (
@@ -56,11 +58,13 @@ def make_icon_image(state: str = "normal") -> Image.Image:
 
 
 class TrayApp:
-    def __init__(self, state: AppState | None = None):
+    def __init__(self, state: AppState | None = None, boot_delay: float = 0):
         self.state = state or AppState()
         # 与轮询共用同一个 Notifier：不然托盘回执和更新卡片各自数各自的槽位，永远都从 0 开始
         self.notifier = self.state.notifier
         self.scheduler = Scheduler(self.state, on_round=self._after_round)
+        # 只有开机自启那条命令会传这个（见 autostart.BOOT_DELAY_ARG）；手动启动是 0，当场检查
+        self.boot_delay = max(0.0, float(boot_delay))
         self.icon: pystray.Icon | None = None
         self._pending_delete: tuple[str, float] | None = None
         self._status_hint = "启动中"
@@ -198,14 +202,19 @@ class TrayApp:
         elif autostart.enable():
             self._flash("已开启开机自启", autostart.current_command())
         else:
-            self._flash("开启失败", "无法写入注册表 Run 项")
+            self._flash("开启失败", "写不进自启配置：Windows 看注册表 Run 项，"
+                                  "Linux 看 ~/.config/autostart/shunshu.desktop")
         self._rebuild_menu()
 
     def act_open_data_dir(self, icon=None, item=None) -> None:
+        target = str(self.state.paths.root)
         try:
-            os.startfile(str(self.state.paths.root))  # type: ignore[attr-defined]
-        except OSError:
-            self._flash("打不开数据目录", str(self.state.paths.root))
+            if IS_WINDOWS:
+                os.startfile(target)  # type: ignore[attr-defined]
+            else:
+                subprocess.run(["xdg-open", target], timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            self._flash("打不开数据目录", target)
 
     def act_quit(self, icon=None, item=None) -> None:
         self.scheduler.stop()
@@ -456,6 +465,8 @@ class TrayApp:
         self.icon.run()
 
     def _startup_then_loop(self) -> None:
+        if self.boot_delay and self._wait_for_boot():
+            return
         try:
             outcomes = self.scheduler.run_once(force=True)
         except Exception as exc:
@@ -474,3 +485,13 @@ class TrayApp:
         self.notifier.show("顺手 · 启动检查", body or ["书架为空"], launch)
         self._repop_unseen()
         self.scheduler.run_forever()
+
+    def _wait_for_boot(self) -> bool:
+        """开机自启那一等：等代理客户端起来再跑启动那一轮。
+
+        等的是调度器的退出事件，不是 sleep：这期间点「退出」立刻返回 True，启动轮与轮询
+        都不再跑——否则等满 60 秒还要给一个已经退出的托盘补一张启动卡。
+        """
+        self._status_hint = f"开机启动，{int(self.boot_delay)} 秒后检查"
+        self._rebuild_menu()
+        return self.scheduler.wait_for_stop(self.boot_delay)

@@ -15,6 +15,8 @@ import sys
 import tkinter as tk
 from tkinter import font as tkfont
 
+from .host import IS_WINDOWS
+
 _WIDTH = 400
 _MARGIN_X = 24
 _MARGIN_Y = 44
@@ -31,9 +33,25 @@ _FG = "#f2f3f5"
 _ACCENT = "#7fb3ff"
 _UNREAD = "#6fd08c"
 _READ = "#7d8590"
+# Windows 上按这个字体量出来的截断宽度；Ubuntu 没这个字体，show() 里按候选换成装了的那一个
 _FONT = "Microsoft YaHei UI"
+_FONT_CANDIDATES = ("Microsoft YaHei UI", "Noto Sans CJK SC", "Noto Sans CJK JP",
+                    "Sarasa UI SC", "WenQuanYi Micro Hei", "WenQuanYi Zen Hei",
+                    "PingFang SC", "DejaVu Sans")
 # 鼠标位置的采样间隔：只用来判断有没有「划过去再离开」，200ms 足够，也别勤到耗电
 _POINTER_POLL_MS = 200
+
+
+def _use_available_font(root: tk.Tk) -> str:
+    """把全局字体换成本机真的装了的那一个：字形缺了会画成豆腐块，量出来的宽度也不对。"""
+    global _FONT
+    families = {name.lower() for name in tkfont.families(root)}
+    for candidate in _FONT_CANDIDATES:
+        if candidate.lower() in families:
+            _FONT = candidate
+            return candidate
+    _FONT = tkfont.nametofont("TkDefaultFont").actual("family")
+    return _FONT
 
 
 def make_payload(title: str, lines: list[str] | None = None, chapters: list[dict] | None = None,
@@ -99,10 +117,20 @@ def _ellipsis_fit(text: str, measure, width: int) -> str:
     return text + tail
 
 
-def build_card(root: tk.Tk, payload: dict) -> None:
+def _apply_window_style(root: tk.Tk) -> None:
+    """无边框 + 置顶。
+
+    -toolwindow 是 Windows 独有的 wm 属性，X11 上传过去 Tcl 直接报 unrecognized
+    option——卡片进程当场崩掉，而这工具唯一的反馈通道就是卡片。
+    """
     root.overrideredirect(True)
     root.attributes("-topmost", True)
-    root.attributes("-toolwindow", True)
+    if IS_WINDOWS:
+        root.attributes("-toolwindow", True)
+
+
+def build_card(root: tk.Tk, payload: dict) -> None:
+    _apply_window_style(root)
     root.configure(bg=_BG)
 
     title_font = tkfont.Font(font=(_FONT, 11, "bold"))
@@ -191,6 +219,7 @@ def show(payload: dict, index: int = 0) -> None:
     """卡片进程主流程：一直显示到被点、被划过，或者被主进程收掉（同书换新章/堆满一屏）。"""
     root = tk.Tk(className="shunshu")
     root.title("顺手")
+    _use_available_font(root)
     build_card(root, payload)
     _place(root, index)
     close_after_read(root)

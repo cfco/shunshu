@@ -1,16 +1,49 @@
-"""读 Windows 剪贴板：托盘「添加小说（从剪贴板）」用，不引入 GUI 依赖。"""
+"""读系统剪贴板：托盘「添加小说（从剪贴板）」用，不引入 GUI 依赖。
+
+Windows 直接调 user32/kernel32；Linux 上没有 ctypes.windll，改为借道会话里的
+命令行工具（Wayland 用 wl-paste，X11 用 xclip / xsel），代价是要装其中一个。
+"""
 
 from __future__ import annotations
 
 import ctypes
+import os
 import re
+import subprocess
+
+from .host import IS_WINDOWS
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>\u3000-\u303f，。、]+", re.I)
 _CF_UNICODETEXT = 13
+_CLIPBOARD_TIMEOUT_SECONDS = 5.0
+# (命令, 参数, 这条要求哪个会话变量存在)：命令没装就跳过，试下一个
+_CLIPBOARD_TOOLS = (
+    ("wl-paste", ("-n",), "WAYLAND_DISPLAY"),
+    ("xclip", ("-selection", "clipboard", "-o"), "DISPLAY"),
+    ("xsel", ("--clipboard", "--output"), "DISPLAY"),
+)
 
 
 def read_text() -> str | None:
     """返回剪贴板里的纯文本，拿不到就返回 None（不抛异常，菜单里要能降级提示）。"""
+    return _read_windows() if IS_WINDOWS else _read_posix()
+
+
+def _read_posix() -> str | None:
+    for name, args, session_var in _CLIPBOARD_TOOLS:
+        if not os.environ.get(session_var):
+            continue
+        try:
+            done = subprocess.run([name, *args], capture_output=True,
+                                  timeout=_CLIPBOARD_TIMEOUT_SECONDS)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if done.returncode == 0 and done.stdout:
+            return done.stdout.decode("utf-8", "replace")
+    return None
+
+
+def _read_windows() -> str | None:
     try:
         user32 = ctypes.windll.user32  # type: ignore[attr-defined]
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]

@@ -1,7 +1,7 @@
 [project]
 name = "shunshu"
-version = "0.11.0"
-description = "小说目录页更新监控：托盘常驻 + Windows 弹窗提醒"
+version = "0.13.0"
+description = "小说目录页更新监控：托盘常驻 + 桌面弹窗提醒（Windows / Ubuntu）"
 readme = "README.md"
 authors = [
     { name = "minyaohua", email = "minyaohua@gmail.com" }

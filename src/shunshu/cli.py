@@ -16,7 +16,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="shunshu", description="小说目录页更新监控（托盘常驻 + 弹窗提醒）",
         epilog="日常操作都在托盘右键菜单里；书架与代理直接改 data/novels.json。")
     sub = parser.add_subparsers(dest="command")
-    sub.add_parser("run", help="启动托盘常驻（默认）")
+    run = sub.add_parser("run", help="启动托盘常驻（默认）")
+    # 只由开机自启那条命令传入（autostart.BOOT_DELAY_ARG）；手动启动不带，仍然当场检查
+    run.add_argument("--boot-delay", type=int, default=0, metavar="SECONDS",
+                     help="开机自启：先等这么多秒再跑启动那一轮（等代理客户端起来）")
     popup = sub.add_parser("popup", help="内部：主程序弹卡片时调用")
     popup.add_argument("--payload", required=True, help="卡片内容的 JSON（见 shunshu.popup.make_payload）")
     popup.add_argument("--index", type=int, default=0)
@@ -68,7 +71,8 @@ def main(argv: list[str] | None = None) -> int:
         from .app import AppState
         from .tray import TrayApp
 
-        TrayApp(AppState()).run()
+        # 裸 `shunshu`（不带 run）走的是同一个入口，那时尚无 boot_delay 这个属性
+        TrayApp(AppState(), boot_delay=getattr(args, "boot_delay", 0)).run()
     except Exception as exc:
         # 起不来时进程静默退出，托盘图标、卡片、日志一个都不会有——先留痕再退非零码
         _report_crash(exc)
