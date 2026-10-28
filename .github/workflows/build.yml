@@ -184,19 +184,22 @@ jobs:
         uses: actions/checkout@v4
 
       # python3-gi + gir1.2-* 是「有没有右键菜单」的那一线；python3-xlib 是 pystray
-      # 的 xorg 兜底后端（只画图标）；python3-tk 是卡片的渲染层；patchelf/gcc 给 Nuitka 用
+      # 的 xorg 兜底后端（只画图标）；python3-tk 是卡片的渲染层；patchelf/gcc 给 Nuitka 用。
+      # appindicator 的 typelib 在 Ubuntu 上有 legacy 与 ayatana 两个包，pystray 会先试
+      # AppIndicator3、ValueError 才退 AyatanaAppIndicator3，所以两个都装——只装一个时
+      # Nuitka 的 gi 插件会因为代码里那个 import 解析不到 typelib 直接 FATAL
       - name: Install system packages
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             python3-venv python3-pip python3-dev python3-tk \
             python3-gi python3-xlib \
-            gir1.2-gtk-3.0 libgtk-3-0t64 \
+            gir1.2-glib-2.0 gir1.2-gtk-3.0 libgtk-3-0t64 \
             patchelf gcc xvfb
-          # AppIndicator 的 typelib 在 Ubuntu 上有 legacy 与 ayatana 两个包名，
-          # pystray 会先试 AppIndicator3、再试 AyatanaAppIndicator3，装到哪个算哪个
-          sudo apt-get install -y --no-install-recommends gir1.2-appindicator3-0.1 \
-            || sudo apt-get install -y --no-install-recommends gir1.2-ayatanaappindicator3-0.1
+          for pkg in gir1.2-appindicator3-0.1 gir1.2-ayatanaappindicator3-0.1; do
+            sudo apt-get install -y --no-install-recommends "$pkg" \
+              || echo "这个发行版没有 $pkg，pystray 会退到另一个后端"
+          done
 
       - name: Install uv
         run: pip install uv
@@ -214,10 +217,51 @@ jobs:
       - name: Run tests (headless X)
         run: xvfb-run -a .venv-linux/bin/python -m pytest tests -q
 
+      # ---------- 编译前先把「这台机器能不能用带菜单的后端」问清楚 ----------
+      # 放在 Nuitka 之前是因为它几秒就出结果，而编译 FATAL 要等几分钟才报，现场还只说
+      # 「Typelib file for namespace X not found」，看不出是缺 apt 包还是打包参数的问题。
+      # DBus 这一项尤其要紧：pystray 的 _util/notify_dbus 在 import 时就无条件
+      # require_version('DBus','1.0')，那个 typelib 缺了整条 gtk/appindicator 路就断，
+      # 只剩只有图标的 _xorg——这是「产物能跑但没菜单」的真正入口，必须先看见。
+      - name: Check tray backends before compiling
+        run: |
+          mkdir -p .tmp
+          xvfb-run -a .venv-linux/bin/python - > .tmp/backend-check.txt 2>&1 <<'PY' || true
+          import gi
+          versions = {"Gtk": "3.0", "GLib": "2.0", "GObject": "2.0", "Gio": "2.0",
+                      "DBus": "1.0", "AppIndicator3": "0.1", "AyatanaAppIndicator3": "0.1"}
+          for namespace, version in versions.items():
+              try:
+                  gi.require_version(namespace, version)
+                  print(f"typelib {namespace} {version}: 有")
+              except ValueError as exc:
+                  print(f"typelib {namespace} {version}: 没有 -> {exc}")
+          for name in ("_appindicator", "_gtk", "_xorg"):
+              try:
+                  __import__("pystray" + "." + name)
+                  print(f"后端 pystray{name}: 能 import")
+              except Exception as exc:
+                  print(f"后端 pystray{name}: 不行 -> {type(exc).__name__}: {exc}")
+          import pystray
+          print("pystray 实际选中的后端:", pystray.Icon.__module__)
+          PY
+          cat .tmp/backend-check.txt
+          {
+            echo "### 编译机上的托盘后端可用性"
+            echo '```'
+            cat .tmp/backend-check.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 只剩 _xorg 时不拦发版（产物是「有图标没菜单」），但必须在日志里醒目一句
+          grep -q "pystray 实际选中的后端: pystray._\(appindicator\|gtk\)" .tmp/backend-check.txt \
+            || echo "::warning::编译机选不到带右键菜单的后端，产物的托盘可能只有图标"
+
       # 与 Windows 那两条同一组关键参数；差别只在：没有 --windows-console-mode，
-      # 以及 gi 要显式带进来（pystray 靠 apt 的 _gi.so + gi.repository 动态加载，
-      # Nuitka 静态分析看不到运行时才确定的 typelib 调用），另外把 Windows/macOS
-      # 的后端排除掉——它们在 Linux 上 import 不了，留着只会让分析报错。
+      # 以及把 Windows/macOS 的后端排除掉——它们在 Linux 上 import 不了，留着只会让
+      # 分析报错。**不要加 --include-package=gi**：gi.repository 的模块是运行时按
+      # typelib 动态造的，整包包含会逼 Nuitka 的 gi 插件去枚举机器上所有 overrides
+      # （Vte/Notify/...），撞上没装 typelib 的那一个就 FATAL 中断编译；只让 pystray
+      # 真正 import 的 Gtk/GLib/GObject/Gio/AppIndicator3 走过去插件自己处理
       - name: Nuitka compile (standalone folder)
         run: |
           .venv-linux/bin/python -m nuitka \
@@ -226,7 +270,6 @@ jobs:
             --enable-plugin=tk-inter \
             --include-package=shunshu \
             --include-package=pystray \
-            --include-package=gi \
             --nofollow-import-to=pystray._win32 \
             --nofollow-import-to=pystray._darwin \
             --include-module=zhconv \
@@ -266,7 +309,8 @@ jobs:
             echo "卡片子进程弹失败（看上一行的原因）"; exit 1
           fi
           echo "托盘后端 \`$backend\`，卡片子进程活着 —— 已写进 Release 说明" >> "$GITHUB_STEP_SUMMARY"
-          cp -r "$data" .tmp/smoke-data   # 留个副本，上传那步好引用
+          cp -r "$data" .tmp/smoke-data            # 留个副本，上传那步好引用
+          cp .tmp/backend-check.txt .tmp/smoke-data/ 2>/dev/null || true
 
       - name: Upload smoke log
         if: always()
