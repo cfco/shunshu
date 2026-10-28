@@ -281,6 +281,51 @@ def test_open_data_dir_reports_a_missing_launcher(app_state, monkeypatch):
     assert "打不开数据目录" in popped[0][0]["title"]
 
 
+# ---------- 托盘后端留痕 ----------
+
+def _icon_from(module_name: str):
+    """造一个「看起来就来自某个后端模块」的 Icon 替身：pystray 的后端名只藏在 __module__ 里。"""
+
+    class FakeIcon:
+        pass
+
+    FakeIcon.__module__ = module_name
+    return FakeIcon
+
+
+def _last_log_line(app_state) -> str:
+    return app_state.paths.runtime_log.read_text(encoding="utf-8").strip().splitlines()[-1]
+
+
+@pytest.mark.parametrize("module,verdict", [
+    ("pystray._appindicator", "有右键菜单"),
+    ("pystray._gtk", "有右键菜单"),
+    ("pystray._win32", "有右键菜单"),
+    ("pystray._xorg", "只有图标，没有右键菜单"),
+    ("pystray._dummy", "只有图标，没有右键菜单"),
+])
+def test_tray_backend_log_says_whether_the_menu_works(app_state, monkeypatch, module, verdict):
+    """Ubuntu 上「图标在但点开没菜单」要靠日志分辨，这一行还得把结论说成人话。"""
+    import pystray
+    from shunshu import tray
+
+    monkeypatch.setattr(pystray, "Icon", _icon_from(module))
+    tray.TrayApp(app_state)._log_tray_backend()
+
+    line = _last_log_line(app_state)
+    assert f"托盘后端: {module.rsplit('.', 1)[-1]}（{verdict}）" in line
+
+
+def test_tray_backend_log_uses_the_real_icon(app_state):
+    """不 monkeypatch 时取的是当前平台真正选中的那个后端，不能是空或别的模块。"""
+    import pystray
+
+    from shunshu import tray
+
+    tray.TrayApp(app_state)._log_tray_backend()
+    assert pystray.Icon.__module__.rsplit(".", 1)[-1] in _last_log_line(app_state)
+
+
 # ---------- 单实例 ----------
 
 def test_posix_singleton_branch_with_a_fake_fcntl(tmp_path, monkeypatch):

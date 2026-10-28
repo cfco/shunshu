@@ -15,11 +15,19 @@ def is_packaged() -> bool:
 
     PyInstaller 设 `sys.frozen`，直接认。
     Nuitka 两件事都不按常理来：`__compiled__` 只注入入口模块（子模块里查不到），
-    还把 `sys.executable` 伪造成产物目录下一个并不存在的 `python.exe`，真实启动
-    路径在 `sys.argv[0]`。所以 Nuitka 态判「argv[0] 是个真实文件、而 sys.executable
-    指向的解释器不存在」。
+    还把 Windows 下的 `sys.executable` 伪造成产物目录下一个并不存在的 `python.exe`，
+    真实启动路径在 `sys.argv[0]`。所以 Windows 态判「argv[0] 是真实文件而
+    sys.executable 指向的解释器不存在」。
+
+    Linux 上 Nuitka 更狡猾：`argv[0]` 和 `sys.executable` 都指向那个真实存在的产物
+    文件，只看解释器存不存在会判成源码态——卡片子进程于是被拼成
+    `./shunshu -m shunshu popup`（产物不认 `-m`，一张卡都弹不出来），`data/` 也改成从
+    `__file__` 往上找 `pyproject.toml`，找不到就落到莫名目录（书架与代理记忆全丢）。
+    所以先认入口模块的 `__compiled__`，那条启发式退回作 Windows 的兜底。
     """
     if getattr(sys, "frozen", False):
+        return True
+    if hasattr(sys.modules.get("__main__"), "__compiled__"):
         return True
     invoked = sys.argv[0] if sys.argv else ""
     return bool(invoked) and os.path.isfile(invoked) and not os.path.isfile(sys.executable or "")

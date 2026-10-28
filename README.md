@@ -23,30 +23,40 @@ uv run shunshu
 
 ### Ubuntu
 
+Ubuntu 上有两种跑法，**差别只在托盘右键菜单有没有**，而右键菜单就是这个工具的全部操作入口：
+
 ```bash
-uv python install 3.14        # apt 的 python3 版本不够（项目要求 ≥3.14）
+# 跑法一（有右键菜单）：用 apt 的 python3 建 venv —— gi 只有系统那一份
+sudo apt install python3-venv python3-tk python3-gi python3-xlib \
+                 gir1.2-gtk-3.0 libgtk-3-0t64 gir1.2-appindicator3-0.1
+python3 -m venv --system-site-packages .venv
+.venv/bin/pip install beautifulsoup4 lxml pillow pystray PySocks requests zhconv truststore
+PYTHONPATH=src .venv/bin/python -m shunshu
+
+# 跑法二（一条命令，但没有右键菜单）：uv 自己的 3.14，pip 装不出 gi
+uv python install 3.14
 uv sync
 uv run shunshu
 ```
 
-系统侧还要这几样，缺哪样就少一块功能：
+跑法二不是跑法一的省事版：pystray 依次试 AppIndicator → GTK → Xorg 三个后端，前两个要 `gi`（PyGObject），而它只能由 apt 的 `python3-gi` 提供、pip 装不出来，且绑死在系统那个解释器上（Ubuntu 24.04 与 Zorin 18 都是 3.12）。所以 `requires-python` 从 `>=3.14` 放宽到 `>=3.12` 就是为了让跑法一装得进来；本机开发仍由 `.python-version` 钉在 3.14，uv 不会自己降。
 
-```bash
-sudo apt install python3-tk xclip wl-clipboard xdg-utils fonts-noto-cjk
-```
+系统侧还要这几样，缺哪样就少一块功能：
 
 | 装件 | 少了会怎样 |
 | --- | --- |
-| `python3-tk` | 提醒卡片弹不出来（Tk 是卡片唯一的渲染层）；uv 自带的解释器是否含 tkinter 视版本而定，缺了就换用系统解释器建 venv |
+| `python3-tk` | 提醒卡片弹不出来（Tk 是卡片唯一的渲染层） |
+| `python3-gi` + `gir1.2-gtk-3.0` + `gir1.2-appindicator3-0.1` | 托盘**没有右键菜单**：图标也许还在，但点开是空的，添加小说、改间隔、删除全都没入口 |
+| `python3-xlib` | 连兜底的老式 XEmbed 图标也没有，`import pystray` 直接失败 |
 | `xclip`（X11）/ `wl-clipboard`（Wayland） | 「添加小说（从剪贴板）」读不到东西，只会回一句「没有可识别的链接」 |
 | `xdg-utils` | 点章节、点「打开数据目录」都靠 `xdg-open` |
 | `fonts-noto-cjk` | 卡片上中文变豆腐块，按像素截断的宽度也会错 |
 
+**到底用的是哪个后端，问日志**：`data/shunshu.log` 每次启动第一行就是「托盘后端: `_appindicator`（有右键菜单）」或「`_xorg`（只有图标，没有右键菜单）」，不用靠猜（`_dummy` 是 CI 里用的假后端）。
+
 开机自启：勾「开机自启」写 `~/.config/autostart/shunshu.desktop`（XDG 标准，GNOME/KDE/XFCE 通用）。Exec 行同样带 `--boot-delay=60`，启动那一轮等代理起来再跑，与 Windows 一个口径。
 
-**托盘菜单的限制（还没解决）**：pystray 在 Linux 上依次试 AppIndicator → GTK → Xorg 三个后端。前两个要 `gi`（PyGObject），而它只能由系统包 `python3-gi` 提供、pip 装不上，所以用 uv 的解释器时基本只剩 Xorg 后端——那是老式 XEmbed 托盘，**不渲染右键菜单**（菜单只有 win32/gtk/darwin 后端有），GNOME Shell 默认也不提供这种托盘。结果是：图标可能在 XFCE/MATE/KDE 的托盘里出现但点开没菜单，Ubuntu 默认桌面上则可能什么都不出现。要在 Ubuntu 上真正用好，得改用系统解释器建 venv（`python3 -m venv --system-site-packages` + `sudo apt install python3-gi gir1.2-gtk-3.0`），代价是拿不到 Python 3.14。这条限制留在这里，没有偷偷当成已经能用。
-
-Wayland 下卡片的位置与置顶由合成器说了算（Tk 的 `overrideredirect` + 绝对定位是 X11 的路子），实测效果待验证；X11 会话（登录界面选 "Ubuntu on Xorg"）是这条路最稳的形态。
+**托盘在这类桌面上还有两层 CI 证明不了的**：GNOME Shell 默认不显示任何托盘图标，要装 AppIndicator 扩展（apt 包 `gnome-shell-extension-appindicator`；Zorin/MATE/KDE 自带）；Wayland 会话里卡片的位置与置顶由合成器说了算（Tk 的 `overrideredirect` + 绝对定位是 X11 的路子），实测效果待验证。X11 会话（登录界面选 "Ubuntu on Xorg"）是这条路最稳的形态。
 
 添加小说：在浏览器里复制目录页网址 → 托盘「添加小说（从剪贴板）」。抓完直接弹一张卡片，列出**最新的 5 章**让你确认认对了书（顺手点一章就能开始看，并记为已读）；书名从页面标题里取，这一轮只记基线、不算更新。
 
@@ -153,12 +163,20 @@ Wayland 下卡片的位置与置顶由合成器说了算（Tk 的 `overrideredir
 | --- | --- | --- |
 | `shunshu-<版本>-windows-amd64.zip` | folder 模式：`shunshu.exe` + 依赖目录，解压即用 | 启动最快，首次运行不解包 |
 | `shunshu-<版本>-windows-amd64-onefile.exe` | 单个 exe | 拷一个文件就走；首次运行解包到 `%LOCALAPPDATA%` 下按版本固定的缓存目录 |
+| `shunshu-<版本>-linux-x86_64.tar.gz` | folder 模式：`shunshu` 二进制 + 依赖目录，解压即用 | Ubuntu 24.04 及更新的（编译机固定在 `ubuntu-24.04`，glibc 下限由它决定） |
 
 单文件模式用了 `--onefile-cache-mode=cached`：解包目录固定，**主进程和弹卡片用的子进程共用同一份**，否则每弹一张卡就要重解一次几十 MB。这也是它必须带 `--company-name/--product-name/--product-version` 的原因（默认路径模板要用这几个值）。代价是 CI 要多编一次，构建时间大约翻倍。
 
-同一个 `shunshu.exe` 兼任两件事——直接运行是起托盘，`shunshu.exe popup --payload <json>` 是主程序弹卡片时调的子命令。「当前是不是打包态、再次拉起自己该用哪个 exe」统一由 `packaging.py` 回答（PyInstaller 认 `sys.frozen`；Nuitka 判「argv[0] 是真实文件而 sys.executable 指向的解释器不存在」，因为它会把 `sys.executable` 伪造成一个不存在的 `python.exe`），开机自启命令、`data/` 目录定位、卡片子进程拉起都用这同一结论——Nuitka onefile 升级后解包临时目录会变版本号，`data/` 因此锚定在真实 exe 同级而不是 `__file__` 旁边，书架和代理记忆不会随升级「丢失」。编译参数以 workflow 里那两条为准，本地跑同样的命令即可（需要先 `uv sync --group dev`）。
+同一个 `shunshu.exe`（Linux 上是 `shunshu`）兼任两件事——直接运行是起托盘，`shunshu.exe popup --payload <json>` 是主程序弹卡片时调的子命令。「当前是不是打包态、再次拉起自己该用哪个 exe」统一由 `packaging.py` 回答（PyInstaller 认 `sys.frozen`；Nuitka 先认入口模块的 `__compiled__`，再退回「argv[0] 是真实文件而 sys.executable 指向的解释器不存在」这条 Windows 启发式——Linux 上 Nuitka 的 `sys.executable` 就指向那个真实存在的产物文件，只查解释器存不存在会把产物当成源码态，弹卡命令被拼成 `./shunshu -m shunshu popup`，一张卡都出不来），开机自启命令、`data/` 目录定位、卡片子进程拉起都用这同一结论——Nuitka onefile 升级后解包临时目录会变版本号，`data/` 因此锚定在真实 exe 同级而不是 `__file__` 旁边，书架和代理记忆不会随升级「丢失」。编译参数以 workflow 里那三条为准，本地跑同样的命令即可（Windows 侧先 `uv sync --group dev`）。
 
-**只出 Windows 包**：workflow 那个 job 是 `runs-on: windows-latest`，产物名带 `windows-amd64`，`--windows-console-mode=disable` 也是 Windows 专用参数。Ubuntu 目前只能用源码态（`uv run shunshu`）；要出 Linux 产物得再加一个 job（Nuitka 在 Linux 上要 gcc/patchelf，`self_executable()` 复用同一个可执行文件弹卡片那条路也要重新验），这次没做。
+**Ubuntu 那个 job（`build-ubuntu`）**与 Windows 的差别，都是被「gi 只能来自 apt」逼出来的：
+
+- **不用 uv 建环境**：`uv export --frozen` 把 `uv.lock` 里的依赖版本导成 requirements 喂给 pip，但解释器换成 `/usr/bin/python3` 建的 `--system-site-packages` venv——只有这样才能看见 apt 的 `gi`。依赖版本仍由 lock 说了算。
+- **编译参数**多两条 `--nofollow-import-to=pystray._win32/_darwin`（那两个后端在 Linux 上 import 不了，留着只会让 Nuitka 分析报错），少了 `--windows-console-mode`；`--include-package=gi` 是把 `_gi.so` 与 `gi.repository` 带进产物。
+- **typelib 不在包里**：`gi.require_version('AppIndicator3', '0.1')` 找的是系统的 `/usr/lib/.../girepository-1.0/*.typelib`，所以**目标机仍要 apt 装** `python3-gi gir1.2-gtk-3.0 gir1.2-appindicator3-0.1`（上面表格里那行）。这是 Linux 桌面应用的常态，不是打包没打全。
+- **没有 onefile 版**：folder 模式那份就是产物；要单文件再说。
+- **产物自测跑到哪一步**：job 会在 `xvfb-run` 里用**编出来的二进制**空书架跑一遍，硬门槛是三条——撑到被 `timeout` 收掉（启动没崩）、`shunshu.log` 写了「托盘后端: …」、`alerts.log` 记了启动那张卡且**没有**「卡片没弹出」。这正好盯住 Nuitka 那两个老坑（静默 ImportError、打包态判定失效），后端结论与日志副本也一并传成 Actions artifact 方便回看。
+- **证明不了的**：runner 上没有真的托盘宿主，所以「图标在桌面上到底显不显示、右键菜单点得开吗、GNOME 要不要装 AppIndicator 扩展、Wayland 下卡片位置还剩多少」CI 说不了话，只能在真桌面上看（见上面 Ubuntu 那节）。日志里的「托盘后端」那行是现场分辨这件事的唯一依据。
 
 ## 设计与取舍
 
@@ -196,12 +214,15 @@ uv run pytest tests -q
 
 ```bash
 uv run pytest tests -q                       # 桌面会话里（有 DISPLAY）直接跑
-PYSTRAY_BACKEND=dummy uv run pytest tests -q  # 无显示器的机器（CI/SSH）：托盘用假后端，否则 pystray 连不上 X 就报错
+PYSTRAY_BACKEND=dummy uv run pytest tests -q  # 无显示器的机器（SSH）：托盘用假后端，否则 pystray 连不上 X 就报错
+xvfb-run -a .venv-linux/bin/python -m pytest tests -q  # CI 里那条：apt 解释器 + 假 X，gi 与 Tk 都在
 ```
 
 测试覆盖不到的是真机上的渲染与系统集成：Tk 在 X11/Wayland 上的实际外观、pystray 到底能不能出托盘与菜单、`xclip` 与桌面剪贴板是否互通。这几条只能在 Ubuntu 桌面上看，见上面「Ubuntu」那节的限制说明。
 
 ## 变更记录
+
+- **0.14.0（2026-10-28）**：CI 出 Ubuntu 产物。① **`requires-python` 从 `>=3.14` 放宽到 `>=3.12`**：托盘右键菜单只有 pystray 的 appindicator/gtk 后端才渲染得出来，而 `gi` 只能由 apt 的 `python3-gi` 提供（pip 装不出来）且绑死系统解释器——Ubuntu 24.04 与 Zorin 18 都是 3.12，卡在这个约束上就只能出一个「有图标没菜单」的包。代码本身没有 3.13+ 的东西（最狠的是 `dataclass(slots=True)`，3.10 就有），3.12.13 上全量用例实跑通过；本机开发仍由 `.python-version` 钉在 3.14，uv 不会自己降。② **`packaging.is_packaged()` 加 Nuitka 的 `__compiled__` 分支**：Linux 上 Nuitka standalone 的 `argv[0]` 和 `sys.executable` 都指向那个真实存在的产物文件，原来那条「argv[0] 是真文件而 executable 不存在」的 Windows 启发式在这里判成源码态，后果是弹卡子进程被拼成 `./shunshu -m shunshu popup`（产物不认 `-m`，一张卡都出不来）并且 `data/` 从 `__file__` 往上找 `pyproject.toml` 找不到、落到莫名目录——现象是「程序看着在跑，但什么都没发生」。现在先认入口模块的 `__compiled__`，那条启发式退作 Windows 兜底。③ **启动时往 `data/shunshu.log` 记一行托盘后端**（`_appindicator（有右键菜单）` / `_xorg（只有图标，没有右键菜单）`），Ubuntu 上那个「图标在但点开是空的」的黑箱现场从此有日志可查；后端名从 `pystray.Icon.__module__` 取，因为 pystray 在导入期就用 `backend()` 选完实现并把这函数 `del` 掉了。④ **workflow 加 `build-ubuntu` job**：`ubuntu-24.04`（钉版本而不是 latest，产物 glibc 下限由编译机决定，将来 runner 悄悄升级会把老桌面甩掉）；apt 装 `python3-gi`/`gir1.2-gtk-3.0`/appindicator typelib（legacy 名装不上就退 ayatana）/`python3-xlib`/`python3-tk`/`patchelf`/`xvfb`；依赖版本仍出自 `uv.lock`（`uv export --frozen` 导成 requirements 喂 pip），但 venv 由 `/usr/bin/python3 -m venv --system-site-packages` 建，只有这样才看得见 apt 的 `gi`；测试在 `xvfb-run` 里跑；Nuitka 参数与 Windows 同一组，另加 `--include-package=gi` 与两条 `--nofollow-import-to=pystray._win32/_darwin`（这俩后端在 Linux 上 import 不了，留着只会让分析报错），去掉 `--windows-console-mode`；产物 `shunshu-<版本>-linux-x86_64.tar.gz` 追加进同一个 Release（`needs: build` + `if: !cancelled()`：Windows 编译挂了也照样出 Linux 包，两 job 不抢着建 Release）。⑤ **产物自测**：在 `xvfb-run` 里用编出来的二进制空书架跑一遍，硬门槛三条——撑到被 `timeout` 收掉（启动没崩）、日志写了托盘后端那行、`alerts.log` 记了启动卡且没有「卡片没弹出」；后端与日志副本传成 artifact 供回看。**CI 证明不了的**照旧写在 README 里没藏：runner 上没有真托盘宿主，「桌面到底显不显示图标、菜单点得开吗、GNOME 要不要装 AppIndicator 扩展、Wayland 下卡片位置还剩多少」只能真机看；typelib 也不在包里（`gi.require_version` 找的是系统 `/usr/lib/.../girepository-1.0`），目标机仍要 apt 那三个包。⑥ Linux 侧**没有** onefile 产物；⑦ 用例 273 → 282（新增 9 条：后端留痕的参数化 5 条 + 真 `Icon` 那条 + 打包态 3 条，含 Linux standalone 形态与「打包态弹卡命令复用产物本身」）。
 
 - **0.13.0（2026-10-28）**：开机自启先等 60 秒再跑启动那一轮。① **症状**：代理客户端（`127.0.0.1:7890`）比托盘起得晚，而 `_startup_then_loop()` 一起来就 `run_once(force=True)`，`data/shunshu.log` 里每个走代理的来源当场记一次「代理不可用：…由于目标计算机积极拒绝，无法连接」，白涨一轮 `consecutive_failures`，启动卡也一片红。② **改法是给自启命令加开关，不是让程序睡 60 秒**：`autostart.BOOT_DELAY_ARG`（`--boot-delay=60`）只写进注册表 Run 项与 `.desktop` 的 Exec 行，`cli` 把它交给 `TrayApp(boot_delay=...)`，`_startup_then_loop()` 开头先等——图标和菜单当场可用，只有那一轮延后。手动启动（双击 `启动.bat`、`uv run shunshu`）不带这个开关，照旧当场检查，不会被拖慢。③ **等的是调度器的退出事件**（新增 `Scheduler.wait_for_stop()`）而不是 `time.sleep`：等待期间点「退出」立刻返回 True，启动轮与轮询都不再跑，否则等满 60 秒还要给一个已经退出的托盘补一张启动卡；等待期间托盘提示写「开机启动，60 秒后检查」，好确认这一等真的在等。④ **`needs_repair()` 只比程序、不比参数**（`_entry_path` 的 samefile 那条原样保留），所以升级前就勾过「开机自启」的机器不会自动补上这个开关——在托盘里取消再勾一次即可（本机这条已经写好并读回核对）。⑤ 用例 265 → 273（新增 `tests/test_boot_delay.py` 8 条：注册表值与源码态 Exec 行都带 `--boot-delay=60`、`--boot-delay=60` 与 `--boot-delay 60` 两种写法都认而裸 `shunshu` 没这个属性、`cli.main` 把它传到托盘、启动轮排在等之后、`boot_delay=0` 连等都不试、等待中退出既不跑轮也不弹卡、`wait_for_stop` 被 `stop()` 立刻叫醒）。**真跑复核** `.tmp/verify_boot_delay.py`（数据目录指 `.tmp/` 里的拷贝、抓取换成空轮，不碰网络也不写 `data/`）：延迟 3 秒实测启动轮在 3.00 秒后开始、等待中提示语是「开机启动，3 秒后检查」；等待 1 秒时点退出，线程 1.00 秒内结束、0 次启动轮、0 张卡；不带延迟那条 0.00 秒就检查。另用 `.venv\Scripts\pythonw.exe -m shunshu run --boot-delay=60 --help` 验了注册表里那条命令真被自启解释器接受（退出码 0）。**没有实测的是真开机**：60 秒是按本机「代理晚于托盘起来」这个现象定的，嫌慢或不够都可以改 `autostart.BOOT_DELAY_SECONDS`，改完要在托盘里重勾一次自启。
 

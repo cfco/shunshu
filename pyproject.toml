@@ -1,12 +1,16 @@
 [project]
 name = "shunshu"
-version = "0.13.0"
+version = "0.14.0"
 description = "小说目录页更新监控：托盘常驻 + 桌面弹窗提醒（Windows / Ubuntu）"
 readme = "README.md"
 authors = [
     { name = "minyaohua", email = "minyaohua@gmail.com" }
 ]
-requires-python = ">=3.14"
+# >=3.12 而不是 3.14：Ubuntu 24.04 / Zorin 18 的 apt python3 就是 3.12，而托盘右键菜单
+# 要的后端只能来自 apt 的 python3-gi（pip 装不出 gi）。代码本身没有 3.13+ 的特性
+# （只用 dataclass(slots=True) 这类 3.10 就有的），3.12 上 273 条用例全过。
+# 本机开发仍由 .python-version 钉在 3.14 上，uv 不会自己降。
+requires-python = ">=3.12"
 dependencies = [
     "beautifulsoup4>=4.15.0",
     "lxml>=6.1.3",

@@ -32,6 +32,7 @@ from .models import (
     status_label,
 )
 from .scheduler import Scheduler
+from .store import append_text, now_stamp
 
 _CONFIRM_WINDOW_SECONDS = 10.0
 
@@ -459,10 +460,32 @@ class TrayApp:
             self._flash("顺手已经在运行", "托盘里已有一个实例，这次不再重复启动")
             return
         autostart.repair_if_drifted()
+        self._log_tray_backend()
         self.icon = pystray.Icon("shunshu", title=self._tooltip(), icon=make_icon_image("normal"),
                                  menu=self.build_menu())
         threading.Thread(target=self._startup_then_loop, name="shunshu-poll", daemon=True).start()
         self.icon.run()
+
+    # 只有这几个后端会渲染原生右键菜单（pystray 自己的口径，见 _util/gtk 与 _win32）
+    _MENU_BACKENDS = ("_win32", "_gtk", "_appindicator", "_darwin")
+
+    def _log_tray_backend(self) -> None:
+        """把 pystray 实际挑中的后端记一行。
+
+        Ubuntu 上「图标在但点开没菜单」全靠这行分辨：`_appindicator` / `_gtk` 才有菜单，
+        `_xorg` 是老式 XEmbed 托盘只画图标，而前两个要 apt 的 python3-gi（pip 装不出来）。
+        CI 冒烟测试也断言这一行。
+
+        后端名从 `Icon.__module__` 取：pystray 在导入期就用 `backend()` 选好实现并把这个
+        函数 `del` 掉了，`pystray.backend()` 根本不存在；而每个后端文件都自己定义 `Icon`，
+        所以它的 `__module__` 就是选中的那一个。
+        """
+        name = pystray.Icon.__module__.rsplit(".", 1)[-1]
+        append_text(
+            self.state.paths.runtime_log,
+            f"{now_stamp()} 托盘后端: {name}"
+            f"（{'有右键菜单' if name in self._MENU_BACKENDS else '只有图标，没有右键菜单'}）",
+        )
 
     def _startup_then_loop(self) -> None:
         if self.boot_delay and self._wait_for_boot():

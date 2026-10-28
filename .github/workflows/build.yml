@@ -7,11 +7,14 @@
 #
 # 也就是说：不需要在本地手动打 tag，改完代码把版本号往上推一次，Release 就跟着更新。
 #
-# 产物（每次 push 都会发到 Releases，两种各一份）：
+# 产物（每次 push 都会发到 Releases）：
 #   shunshu-{版本}-windows-amd64.zip        ← folder 模式：exe + 运行时依赖目录
 #     ├── shunshu.exe                          主程序 + popup 子命令，同一个 exe
 #     └── 运行时依赖（含 zhconv 词库、Tk、pystray/PIL 后端）
 #   shunshu-{版本}-windows-amd64-onefile.exe ← 单文件模式：一个 exe 拷走即用
+#   shunshu-{版本}-linux-x86_64.tar.gz       ← Ubuntu 24.04 上编译的 standalone 目录
+#     ├── shunshu                              主程序 + popup 子命令，同一个二进制
+#     └── 运行时依赖（Tk、gi/AppIndicator 的 .so；typelib 仍要目标机 apt 装，见 README）
 
 name: Build
 
@@ -147,3 +150,156 @@ jobs:
           files: |
             shunshu-*.zip
             dist-onefile/shunshu-*-onefile.exe
+
+  # ------------------------------------------------------------------
+  # Ubuntu 产物：与 Windows 那 job 各自独立，同一个 Release 上多一个 tar.gz。
+  #
+  # 为什么固定在 ubuntu-24.04 而不是 ubuntu-latest：产物的 glibc 下限由编译机的
+  # 版本决定，钉在 24.04 才能同时跑在 24.04 / 24.10 与 Zorin 18（24.04 底座）上；
+  # runner 的默认版本将来一升，产物就对老桌面不能用了，而且不会有报错提示你。
+  #
+  # 为什么不用 uv 的 Python 3.14：托盘右键菜单只有 pystray 的 appindicator/gtk 后端
+  # 才有，而 gi（PyGObject）只能由 apt 的 python3-gi 提供、pip 装不出来，apt 那份
+  # 又是绑死系统 python3.12 的。所以这个 job 全程用 /usr/bin/python3 建
+  # --system-site-packages 的 venv（requires-python 因此得放宽到 >=3.12）。
+  # ------------------------------------------------------------------
+  build-ubuntu:
+    name: Ubuntu Build
+    runs-on: ubuntu-24.04
+    needs: build
+    # Windows job 失败也照样出 Linux 包：否则 Ubuntu 产物的命运绑在另一个平台的编译上
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # python3-gi + gir1.2-* 是「有没有右键菜单」的那一线；python3-xlib 是 pystray
+      # 的 xorg 兜底后端（只画图标）；python3-tk 是卡片的渲染层；patchelf/gcc 给 Nuitka 用
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3-venv python3-pip python3-dev python3-tk \
+            python3-gi python3-xlib \
+            gir1.2-gtk-3.0 libgtk-3-0t64 \
+            patchelf gcc xvfb
+          # AppIndicator 的 typelib 在 Ubuntu 上有 legacy 与 ayatana 两个包名，
+          # pystray 会先试 AppIndicator3、再试 AyatanaAppIndicator3，装到哪个算哪个
+          sudo apt-get install -y --no-install-recommends gir1.2-appindicator3-0.1 \
+            || sudo apt-get install -y --no-install-recommends gir1.2-ayatanaappindicator3-0.1
+
+      - name: Install uv
+        run: pip install uv
+
+      # 依赖版本仍由 uv.lock 说了算（uv export 出来喂给 pip），但解释器必须是 apt 那个
+      - name: Create venv on the system interpreter
+        run: |
+          uv export --frozen --no-dev --no-hashes --no-emit-project -o .tmp/requirements.txt
+          python3 -m venv --system-site-packages .venv-linux
+          .venv-linux/bin/python -m pip install -U pip
+          .venv-linux/bin/python -m pip install -r .tmp/requirements.txt pytest nuitka
+          .venv-linux/bin/python -c "import gi; gi.require_version('Gtk', '3.0'); \
+            from gi.repository import Gtk; print('gi + Gtk 3.0 ok')"
+
+      - name: Run tests (headless X)
+        run: xvfb-run -a .venv-linux/bin/python -m pytest tests -q
+
+      # 与 Windows 那两条同一组关键参数；差别只在：没有 --windows-console-mode，
+      # 以及 gi 要显式带进来（pystray 靠 apt 的 _gi.so + gi.repository 动态加载，
+      # Nuitka 静态分析看不到运行时才确定的 typelib 调用），另外把 Windows/macOS
+      # 的后端排除掉——它们在 Linux 上 import 不了，留着只会让分析报错。
+      - name: Nuitka compile (standalone folder)
+        run: |
+          .venv-linux/bin/python -m nuitka \
+            --standalone \
+            --assume-yes-for-downloads \
+            --enable-plugin=tk-inter \
+            --include-package=shunshu \
+            --include-package=pystray \
+            --include-package=gi \
+            --nofollow-import-to=pystray._win32 \
+            --nofollow-import-to=pystray._darwin \
+            --include-module=zhconv \
+            --include-package-data=zhconv \
+            --include-module=truststore \
+            --no-deployment-flag=self-execution \
+            --output-dir=dist-linux \
+            src/shunshu \
+            --output-filename=shunshu
+
+      # ---------- 产物自测：CI 能证明的到此为止，见 README 的 Ubuntu 一节 ----------
+      # 空书架跑一遍：只验「产物起得来、托盘后端是哪个、卡片子进程真能活过启动窗口」。
+      # 卡片这条尤其关键——Nuitka 在 Linux 上 argv[0] 与 sys.executable 都真实存在，
+      # 打包态判定一旦退回源码态，弹卡命令就成了 `./shunshu -m shunshu popup`，
+      # 现象是一张卡都弹不出来，而程序看起来「还在跑」。
+      - name: Smoke test the built bundle
+        run: |
+          set -uo pipefail
+          data="$RUNNER_TEMP/shunshu-smoke"
+          rm -rf "$data"; mkdir -p "$data"
+          SHUNSHU_DATA_DIR="$data" timeout 30 xvfb-run -a \
+            ./dist-linux/shunshu.dist/shunshu run --boot-delay=1 >"$data/stdout.log" 2>&1
+          code=$?
+          echo "--- shunshu.log ---"; cat "$data/shunshu.log" 2>/dev/null || echo "(没有 shunshu.log)"
+          echo "--- stdout/stderr ---"; cat "$data/stdout.log"
+          # 124 = 被 timeout 收掉，正是「一直活着」的意思；自己退了就得看日志
+          if [ "$code" -ne 124 ]; then
+            echo "产物没撑到 timeout（exit=$code），启动就崩了"; exit 1
+          fi
+          grep -q "托盘后端:" "$data/shunshu.log" || {
+            echo "没写到托盘后端那行：run() 之前就没跑起来"; exit 1; }
+          backend=$(sed -n 's/.*托盘后端: \([^（]*\).*/\1/p' "$data/shunshu.log" | tail -1)
+          echo "托盘后端：$backend"
+          grep -q "顺手 · 启动检查" "$data/alerts.log" || {
+            echo "启动那张卡没记进 alerts.log：notify/show 没走到"; exit 1; }
+          if grep -q "卡片没弹出" "$data/alerts.log"; then
+            echo "卡片子进程弹失败（看上一行的原因）"; exit 1
+          fi
+          echo "托盘后端 \`$backend\`，卡片子进程活着 —— 已写进 Release 说明" >> "$GITHUB_STEP_SUMMARY"
+          cp -r "$data" .tmp/smoke-data   # 留个副本，上传那步好引用
+
+      - name: Upload smoke log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shunshu-ubuntu-smoke-log
+          path: ".tmp/smoke-data"
+          if-no-files-found: warn
+          retention-days: 7
+
+      # 二进制放压缩包根目录（与 Windows 的 zip 同构），解压到哪个目录 data/ 就在哪
+      - name: Package tar.gz
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' pyproject.toml | head -1)
+          tar -czf "shunshu-$version-linux-x86_64.tar.gz" -C dist-linux/shunshu.dist .
+          ls -lh "shunshu-$version-linux-x86_64.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shunshu-linux-x86_64
+          path: "shunshu-*-linux-x86_64.tar.gz"
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' pyproject.toml | head -1)
+            echo "name=v$version" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Windows 那个 job 已经建过同名 tag 的 Release，这里再跑一次是往同一个 Release
+      # 追加文件（softprops 按 tag 找已有 Release 并更新），不会建出第二个 Release
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          fail_on_unmatched_files: true
+          files: |
+            shunshu-*-linux-x86_64.tar.gz
