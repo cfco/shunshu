@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import requests
 
+from shunshu import http
 from shunshu.http import ConnectionFailureError, Fetcher, FetchError
 
 
@@ -113,3 +114,85 @@ def test_pool_is_rebuilt_when_workers_change():
         assert second is not first and fetcher._pool_workers == 4
     finally:
         fetcher.close()
+
+
+# ---------- 单页总时限 ----------
+
+class _Clock:
+    """假时钟：涓流场景用它把累计耗时按「读到第几块」推进，测试不碰真 sleep。"""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _TrickleResp:
+    """每隔 10 秒吐一小块：每一次读都刚好不触发 socket 超时，但这一页永远读不完。"""
+
+    status_code = 200
+    headers = {"Content-Type": "text/html; charset=utf-8"}
+    encoding = "utf-8"
+
+    def __init__(self, clock: _Clock) -> None:
+        self.clock = clock
+
+    def close(self) -> None:
+        pass
+
+    def iter_content(self, chunk_size):
+        while True:
+            self.clock.now += 10.0
+            yield b"<html><body><a href='/1.html'>\xe7\xac\xac1\xe7\xab\xa0</a></body></html>"
+
+
+def test_default_budget_is_all_attempts_plus_all_backoff():
+    """预算要一眼能对上「最坏要多久」：默认 15s×3 次 + 退避 3s+6s = 54s。"""
+    assert Fetcher("ua").url_budget_seconds == 54.0
+    # 探测用短超时、不重试：取 30 秒下限即可，反正一次尝试就到不了
+    assert Fetcher("ua", timeout=6.0, retries=0).url_budget_seconds == 30.0
+
+
+def test_trickle_site_is_cut_off_by_the_url_budget(monkeypatch):
+    """涓流站只有累计预算拦得住：不然一个 URL 能续命到几十秒，把整轮和托盘一起堵死。"""
+    clock = _Clock()
+    monkeypatch.setattr(http, "time", clock)
+    seen: list = []
+
+    def get(url, **kwargs):
+        seen.append(kwargs["timeout"])
+        return _TrickleResp(clock)
+
+    fetcher = Fetcher("ua", timeout=15, retries=2, backoff=3)
+    monkeypatch.setattr(fetcher.session, "get", get)
+    with pytest.raises(FetchError) as excinfo:
+        fetcher.fetch_html("https://slow.example.com/1/")
+    message = str(excinfo.value)
+    assert "总时限" in message and "太慢" in message and "不是连不上" in message
+    assert not isinstance(excinfo.value, ConnectionFailureError), "慢不等于连不上，探测不许据此切代理"
+    assert seen == [15], "读流里就该掐断，不该再开第二次尝试"
+    assert clock.now <= fetcher.url_budget_seconds + 10, "累计耗时被预算钉住，最多多读一块"
+
+
+def test_exhausted_budget_shrinks_the_attempt_timeout_and_stops(monkeypatch):
+    """单次 timeout 只剩多少给多少；预算见底就直接失败，不再开新尝试。"""
+    clock = _Clock()
+    monkeypatch.setattr(http, "time", clock)
+    seen: list = []
+
+    def get(url, **kwargs):
+        seen.append(kwargs["timeout"])
+        clock.now += 40.0  # 这一趟尝试吃掉 40 秒
+        raise requests.exceptions.ConnectionError("[WinError 10060] 连接超时")
+
+    fetcher = Fetcher("ua", timeout=15, retries=2, backoff=3)
+    monkeypatch.setattr(fetcher.session, "get", get)
+    with pytest.raises(FetchError) as excinfo:
+        fetcher.fetch_html("https://slow.example.com/1/")
+    assert "总时限" in str(excinfo.value)
+    assert seen == [15, 11], "第二次只剩 54-40-3=11 秒给单次 timeout，第三次不许再开"
+    assert clock.now == 83.0

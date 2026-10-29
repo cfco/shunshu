@@ -149,6 +149,59 @@ def test_site_renumbering_is_recorded_as_toc_reset_without_popup():
     assert "重编号" in outcome.message or "只剩" in outcome.message
 
 
+def _rolling_page(titles: list[str]) -> str:
+    """滚动式目录页：href 按章节号生成，窗口滑动时同一章的 URL 不变。
+
+    不能用 `fixtures.normal_html`——它的 href 是位置编号，窗口一滑每章都换 URL，
+    测出来的是「整站重编号」而不是滚动目录。
+    """
+    links = "\n".join(
+        f'<dd><A href="{t[1:t.index("章")]}.html">{t}</A></dd>' for t in titles)
+    return ('<!DOCTYPE html><html><head><title>测试这本书_笔趣阁</title></head>'
+            f'<body><div class="listmain"><dl>\n{links}\n</dl></div></body></html>')
+
+
+def test_rolling_toc_keeps_alerting_after_many_rounds():
+    """只列最近 12 章的滚动式目录：连跑 40 轮还在正常提醒，不该被历史记账撑成「疑似改版」。
+
+    分母原来用累计 notified_keys（离开目录的老章还会留 500 条），这种站的分母每轮 +1、
+    分子封顶 11，跑二十几轮 overlap 就跌破 0.35 → 之后每轮判改版 → 永久不提醒。
+    """
+    novel = make_novel()
+    fetcher = FakeFetcher({})
+    window = [f"第{n}章 起步" for n in range(49, 61)]
+    fetcher.add(fixtures.BASE_URL, _rolling_page(window))
+    assert check_source(novel, first(novel), RULES, fetcher, None).status == STATUS_BASELINE
+
+    for number in range(61, 101):
+        window = window[1:] + [f"第{number}章 滚动更新"]
+        fetcher.add(fixtures.BASE_URL, _rolling_page(window))
+        outcome = check_source(novel, first(novel), RULES, fetcher, None)
+        assert outcome.status == STATUS_UPDATED, f"第 {number} 章被误判：{outcome.message}"
+        assert [c.title for c in outcome.new_chapters] == [f"第{number}章 滚动更新"]
+
+
+def test_catchup_after_downtime_is_reported_not_swallowed():
+    """关机几天回来一次追平 35 章：编号紧接已知最新章就是断档追赶，要弹卡。
+
+    旧逻辑按「一次 >30 个新标识」判成重编号，走 _reset 时照样 _commit 记账，
+    这批章一条没报就被写成「已提醒过」，永久静默。
+    """
+    novel = make_novel()
+    fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()})
+    check_source(novel, first(novel), RULES, fetcher, None)
+
+    added = [f"第{n}章 断档追赶" for n in range(61, 96)]        # 35 章，超过 max_report_new_chapters
+    fetcher.add(fixtures.BASE_URL, fixtures.normal_html([*fixtures.CHAPTERS, *added]))
+    outcome = check_source(novel, first(novel), RULES, fetcher, None)
+    assert outcome.status == STATUS_UPDATED, outcome.message
+    assert outcome.new_count == len(added)
+
+    # 报过就该记账：下一轮不能把这 35 章当成没报过再刷一遍
+    again = check_source(novel, first(novel), RULES, fetcher, None)
+    assert again.status == STATUS_NO_CHANGE
+
+
 def test_network_error_keeps_previous_state():
     novel = make_novel()
     check_source(novel, first(novel), RULES,

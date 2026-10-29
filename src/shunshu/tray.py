@@ -198,8 +198,13 @@ class TrayApp:
 
     def act_toggle_autostart(self, icon=None, item=None) -> None:
         if autostart.is_enabled():
-            autostart.disable()
-            self._flash("已关闭开机自启", "")
+            # disable() 的返回值不能丢：写不动注册表/家目录时说「已关闭」是假话，
+            # 下次开机照样自启，而菜单重开一看还是勾着的
+            if autostart.disable():
+                self._flash("已关闭开机自启", "")
+            else:
+                self._flash("关闭失败", "删不掉自启配置：Windows 看注册表 Run 项，"
+                                      "Linux 看 ~/.config/autostart/shunshu.desktop")
         elif autostart.enable():
             self._flash("已开启开机自启", autostart.current_command())
         else:
@@ -492,18 +497,20 @@ class TrayApp:
             return
         try:
             outcomes = self.scheduler.run_once(force=True)
+            failed = ""
         except Exception as exc:
             outcomes = []
-            self._flash("启动检查失败", repr(exc))
+            failed = repr(exc)
+            self._flash("启动检查失败", failed)
         lines = self.state.startup_lines(outcomes)
         self._status_hint = lines[0] if lines else self._status_hint
         self._sync_icon_state()
         self._rebuild_menu()
-        # 启动时配置/书架发生过降级（坏 JSON 已备份）：把原因顶到启动卡最前面。
-        # 逐本行不再按 history_display_cap 切一刀——那个配置管的是菜单里列几条更新记录，
-        # 跟启动卡显示几行是两码事；整段交给 notifier.show() 按卡片硬上限截断
-        # （见 notify._CARD_LINES），多算出来的行也只是白算
+        # 启动轮崩了不能顺着 startup_lines 的空结果写成「书架为空」：那是另一句假话，
+        # 还会把刚弹的失败卡盖掉（同一标题去重，后一张顶掉前一张）
         body = [*getattr(self.state, "load_warnings", []), *lines[1:]]
+        if failed:
+            body = [f"启动检查失败：{failed}"]
         launch = next((o.latest.url for o in outcomes if o.latest), "")
         self.notifier.show("顺手 · 启动检查", body or ["书架为空"], launch)
         self._repop_unseen()

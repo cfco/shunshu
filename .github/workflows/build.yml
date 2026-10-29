@@ -18,6 +18,13 @@
 
 name: Build
 
+# 同一分支/同一 tag 的 run 排队跑，别并发：两次 run 会抢着写同一条 Release，
+# 后完成的那次覆盖前一次的正文与资产（实测过——旧 workflow 那次后跑完，把发布页正文
+# 从变更记录的实际内容盖回了自动生成的 compare 链接）
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
 on:
   push:
     branches: [main]
@@ -303,6 +310,13 @@ jobs:
             echo "没写到托盘后端那行：run() 之前就没跑起来"; exit 1; }
           backend=$(sed -n 's/.*托盘后端: \([^（]*\).*/\1/p' "$data/shunshu.log" | tail -1)
           echo "托盘后端：$backend"
+          # 只有图标的 _xorg 不算过：这个工具的操作入口全在右键菜单，勾掉这条就是把
+          # 「点开是空的」的包静默发出去。缺 typelib 时 pystray 会当场抛 ValueError
+          # （backend() 只 except ImportError），所以真跑到这一步说明 gi 那条路是通的
+          case "$backend" in
+            _appindicator|_gtk) ;;
+            *) echo "托盘后端是 $backend，产物没有右键菜单，不能发"; exit 1 ;;
+          esac
           grep -q "顺手 · 启动检查" "$data/alerts.log" || {
             echo "启动那张卡没记进 alerts.log：notify/show 没走到"; exit 1; }
           if grep -q "卡片没弹出" "$data/alerts.log"; then

@@ -54,6 +54,34 @@ def status_label(status: str) -> str:
     return _LABELS.get(status, status)
 
 
+def _to_int(value, default: int = 0) -> int:
+    """数值字段归一：字符串数字转过去，转不动（null、对象、"abc"）用默认值。"""
+    if isinstance(value, bool):
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_opt_int(value) -> int | None:
+    """可空的数值字段（latest_number）：转不动就留 None，不能塌成 0——0 会被当成
+    「已知最新章是第 0 章」，续更判据从此恒真。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_bool(value) -> bool:
+    """布尔字段归一：手改的 "false"/"0"/"no" 都当关，空值当关，其余当真。"""
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0", "no", "off", "none")
+    return bool(value)
+
+
 def _str_list(value) -> list[str]:
     """手改的名单字段统一成字符串列表。
 
@@ -304,6 +332,15 @@ class Source:
             payload["selector"] = str(payload["selector"])
         for key in ("keep_keys", "drop_keys", "notified_keys"):
             payload[key] = _str_list(payload.get(key))
+        # 数值与布尔字段同样要归一：手改成 "3" 这种字符串，会在 monitor 的失败计数
+        # `consecutive_failures += 1` 上抛 TypeError，而那句写在兜底 except 里——异常
+        # 逃出兜底就掀掉整轮（漏记账、不弹卡，日志只剩一行「轮询异常」，托盘看着正常）。
+        # `"false"` 这类真值字符串也一样：不转成 bool 就永远停不掉一个源
+        for key in ("chapter_count", "consecutive_failures", "pages_followed"):
+            payload[key] = _to_int(payload.get(key))
+        payload["latest_number"] = _to_opt_int(payload.get("latest_number"))
+        for key in ("enabled", "baseline_set"):
+            payload[key] = _to_bool(payload.get(key))
         return cls(**payload)
 
 

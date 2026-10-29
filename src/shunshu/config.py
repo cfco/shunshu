@@ -181,6 +181,18 @@ class Config:
         # 扫描间隔只认托盘菜单那四个固定选项：手改出 7 这种值时归到最接近的选项，
         # 保证菜单有勾选、调度器算出的等待秒数也在预期范围内
         cfg.poll_minutes = min(POLL_MINUTES, key=lambda v: abs(v - cfg.poll_minutes))
+        # 几个能把自己打死的手改值夹回合法区间（类型已经在 _coerce_field 里转好了）：
+        # failure_backoff_threshold=0 会让 scheduler 的 `cf >= 0` 恒真，连抓成功的来源也被退避；
+        # 超时/大小/并发给 0 或负数则全架每轮失败
+        cfg.failure_backoff_threshold = max(1, cfg.failure_backoff_threshold)
+        cfg.request_timeout_seconds = min(max(cfg.request_timeout_seconds, 1.0), 300.0)
+        cfg.retry_backoff_seconds = max(0.0, cfg.retry_backoff_seconds)
+        cfg.same_host_delay_seconds = max(0.0, cfg.same_host_delay_seconds)
+        cfg.max_response_bytes = max(10_000, cfg.max_response_bytes)
+        cfg.concurrency = min(max(cfg.concurrency, 1), 32)
+        cfg.request_retries = min(max(cfg.request_retries, 0), 5)
+        cfg.notified_keys_keep = max(0, cfg.notified_keys_keep)
+        cfg.max_report_new_chapters = max(1, cfg.max_report_new_chapters)
         return cfg
 
     def compiled(self) -> Rules:

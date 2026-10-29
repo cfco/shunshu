@@ -41,5 +41,7 @@ def self_executable() -> str:
     """
     for path in (sys.argv[0] if sys.argv else "", sys.executable):
         if path and os.path.isfile(path):
-            return os.path.abspath(path)
+            # realpath 而不是 abspath：Linux 上经 /usr/bin 软链启动时，abspath 会把
+            # data/ 定到链接所在的只读目录，书架与代理记忆当场「消失」
+            return os.path.realpath(path)
     return sys.executable

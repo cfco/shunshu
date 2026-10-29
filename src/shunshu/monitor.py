@@ -85,9 +85,14 @@ def check_source(novel: Novel, source: Source, rules: Rules, fetcher: Fetcher,
     if not source.baseline_set or not source.latest_url:
         return _baseline(novel, source, loaded, chapters, rules, paths)
 
-    overlap = len(known & keys_now) / len(known) if known else 1.0
-    if len(known) >= 5 and overlap < rules.cfg.toc_reset_overlap_ratio:
-        why = (f"已知 {len(known)} 章里只剩 {len(known & keys_now)} 章还在，"
+    # 分母用「上一轮目录里的章数」，不是累计 notified_keys：滚动式目录只列最近十几章，
+    # 而 notified_keys 会把离开目录的老章再留最多 500 条，拿它当分母 overlap 只会一路下跌，
+    # 跌破阈值后每轮都判「疑似改版」→ 这本书从此再不提醒，且托盘只有一行灰字
+    previous = source.chapter_count or len(known)
+    still_there = len(known & keys_now)
+    overlap = min(1.0, still_there / previous) if previous else 1.0
+    if previous >= 5 and overlap < rules.cfg.toc_reset_overlap_ratio:
+        why = (f"上一轮目录 {previous} 章里只剩 {still_there} 章还在，"
                "目录疑似被重置或整站改版，已记录不提醒")
         return _reset(novel, source, loaded, chapters, new, rules, paths, why)
 
@@ -97,8 +102,12 @@ def check_source(novel: Novel, source: Source, rules: Rules, fetcher: Fetcher,
     # 这一轮多跟到了一页（比如站点只挂「下一页」而我们刚开始跟），冒出来的成章新章是真新章，
     # 不是重编号，不能按「一次太多新章节」判成目录重置
     grew_pages = loaded.toc.pages_followed > source.pages_followed
-    if not grew_pages and (len(new) > rules.cfg.max_report_new_chapters
-                           or len(new) > len(chapters) * rules.cfg.toc_reset_new_ratio):
+    too_many = (len(new) > rules.cfg.max_report_new_chapters
+                or len(new) > len(chapters) * rules.cfg.toc_reset_new_ratio)
+    # 关机几天或被退避跳过几轮之后回来，一次追平 31+ 章是常态：新章编号全部紧接在
+    # 已知的最新章之后就是断档追赶，照报。原来这里直接判重编号并 _commit 记账，
+    # 那批章被写进「已提醒过」，一条没报就永久静默（用户最在意的漏提醒）
+    if too_many and not grew_pages and not _continues_sequence(new, source.latest_number):
         return _reset(novel, source, loaded, chapters, new, rules, paths,
                       f"一次出现 {len(new)} 个新章节标识，疑似章节重编号，已记录不提醒")
 
@@ -166,6 +175,17 @@ def _no_change(novel: Novel, source: Source, loaded: LoadResult, chapters: list[
     source.status = STATUS_NO_CHANGE
     source.status_detail = "无更新"
     return Outcome(novel=novel, source=source, status=STATUS_NO_CHANGE, latest=latest, message="无更新")
+
+
+def _continues_sequence(new: list[Chapter], latest_number: int | None) -> bool:
+    """新章编号是否全部紧接在已知的最新章之后（=断档追赶，不是整站重编号）。
+
+    任何一章编号缺失或比已知最新章还小就返回 False，维持「只记录不提醒」的保守口径——
+    宁可少报一次改版误报，也不能把真断档当重编号吞掉，那是永久漏提醒。
+    """
+    if latest_number is None or not new:
+        return False
+    return all(chapter.number is not None and chapter.number > latest_number for chapter in new)
 
 
 def _reset(novel: Novel, source: Source, loaded: LoadResult, chapters: list[Chapter],

@@ -104,6 +104,12 @@ class Notifier:
             del self._live[key]
             if code == 0:
                 self._acked.add(key)
+            elif not self.enabled:
+                continue          # 正在退出，被我们 terminate 的那些不算异常
+            else:
+                # 活过 0.5 秒宽限期之后才崩的卡片（慢冷启、缺 Tk 依赖、坏 payload）：
+                # 子进程 stderr 是 DEVNULL，不留这一行就完全无从查起，而它本该是唯一的反馈通道
+                self._record(f"卡片进程 {key}", [f"退出码 {code}（这张卡没让人看到）"], "")
 
     def take_acked(self) -> list[str]:
         """主程序每轮来收一次：这些键的卡片已经被用户看过了，可以清补弹的账。"""
@@ -115,6 +121,9 @@ class Notifier:
 
     def close_all(self) -> None:
         """退出时把还挂着的卡片一起收掉：不留没人认领的窗口，下次启动按「没看过」补弹。"""
+        # 先关闸：正在跑的那一轮可能在我收完窗口之后才 notify_many，那时再 spawn 就是一张
+        # 永远没人划过、也没人收的无主卡片（主进程已经退出了，句柄跟着没了）
+        self.enabled = False
         with self._lock:
             live, self._live = self._live, {}
             self._acked.clear()   # 正在退出了，别把这一轮的 ack 留给下一份 Notifier

@@ -169,6 +169,14 @@ class Fetcher:
         self.retries = max(0, int(retries))
         self.backoff = backoff
         self.max_bytes = max_bytes
+        # timeout 只管单次 socket 读：涓流站每隔十几秒吐一个字节就能把一次抓取无限续命，
+        # 叠上重试与退避能把一个 URL 拖成一两分钟，而 _round_lock 跨整轮持有，
+        # 托盘动作全排在锁后面，用户看到的就是「点了没反应」。
+        # 所以给「一个 URL 的一次完整抓取（含全部重试、退避与读流）」定累计预算 = 全部尝试的超时 + 全部退避
+        self.url_budget_seconds = max(
+            30.0,
+            timeout * (self.retries + 1) + self.backoff * self.retries * (self.retries + 1) / 2,
+        )
         self.headers = {
             "User-Agent": user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -229,11 +237,16 @@ class Fetcher:
         last_error = "未知错误"
         # 最后一次失败是不是"连接没建立"：决定最终抛 ConnectionFailureError 还是普通 FetchError
         connection_failed = False
+        deadline = time.monotonic() + self.url_budget_seconds
         for attempt in range(self.retries + 1):
             if attempt:
-                time.sleep(self.backoff * attempt)
+                # 退避睡的是预算里剩的时间，别越过截止时间
+                time.sleep(min(self.backoff * attempt, max(0.0, deadline - time.monotonic())))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise self._budget_error()
             try:
-                resp = self.session.get(url, timeout=self.timeout, stream=True,
+                resp = self.session.get(url, timeout=min(self.timeout, remaining), stream=True,
                                         allow_redirects=True, proxies=endpoints)
                 try:
                     if resp.status_code >= 500:
@@ -245,7 +258,7 @@ class Fetcher:
                         # 4xx 是站点的明确答复（永久搬家/反爬/不存在）：重试结果不会变，
                         # 而且对探测来说"能回 4xx"证明这条网络路径是通的，直接失败
                         raise FetchError(f"HTTP {resp.status_code}")
-                    body = self._read_capped(resp)
+                    body = self._read_capped(resp, deadline)
                 finally:
                     resp.close()
                 ctype = resp.headers.get("Content-Type", "")
@@ -258,7 +271,7 @@ class Fetcher:
                     raise FetchError("响应内容为空")
                 return text
             except FetchError:
-                # 4xx/非 HTML/空页/超限：立即抛出，保持原类型（ConnectionFailureError 不会在这里产生）
+                # 4xx/非 HTML/空页/超限/总时限：立即抛出，保持原类型（ConnectionFailureError 不会在这里产生）
                 raise
             except (requests.exceptions.ProxyError, requests.exceptions.InvalidSchema) as exc:
                 if not endpoints:
@@ -293,10 +306,18 @@ class Fetcher:
             raise ConnectionFailureError(last_error)
         raise FetchError(last_error)
 
-    def _read_capped(self, resp: requests.Response) -> bytes:
+    def _budget_error(self) -> FetchError:
+        """总时限掐断的说法：要和"连不上"一眼分得开，探测不会据此把站推给代理。"""
+        return FetchError(f"站点响应太慢：单页累计 {self.url_budget_seconds:g} 秒总时限用尽被掐断"
+                          f"（慢，不是连不上）")
+
+    def _read_capped(self, resp: requests.Response, deadline: float) -> bytes:
         chunks: list[bytes] = []
         total = 0
         for chunk in resp.iter_content(chunk_size=65536):
+            # 涓流站每一块都来得比 socket 超时快，单靠 timeout 拦不住，只能逐块对着截止时间算总账
+            if time.monotonic() > deadline:
+                raise self._budget_error()
             if not chunk:
                 continue
             chunks.append(chunk)
