@@ -342,11 +342,54 @@ jobs:
           tar -czf "shunshu-$version-linux-x86_64.tar.gz" -C dist-linux/shunshu.dist .
           ls -lh "shunshu-$version-linux-x86_64.tar.gz"
 
+      # ---------- deb ----------
+      # 只把 Nuitka 的 standalone 目录搬进 /opt/shunshu，依赖仍靠 Depends 从 apt 拿：
+      # typelib（Gtk/AppIndicator3/GLib…）是系统数据，打进包里既不规范也修不了版本漂移。
+      # /usr/bin/shunshu 是指向 /opt 的软链 —— self_executable() 走 realpath，所以真正的
+      # 安装目录是 /opt/shunshu，它 root 所有不可写，data/ 自动退到 ~/.local/share/shunshu
+      # （见 config._pick_data_dir，日志里留一行说明退到哪了）
+      - name: Package deb
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' pyproject.toml | head -1)
+          deb="shunshu-$version-linux-amd64.deb"
+          rm -rf .tmp/deb
+          mkdir -p .tmp/deb/DEBIAN .tmp/deb/opt/shunshu .tmp/deb/usr/bin \
+                   .tmp/deb/usr/share/applications
+          cp -r dist-linux/shunshu.dist/. .tmp/deb/opt/shunshu/
+          ln -s /opt/shunshu/shunshu .tmp/deb/usr/bin/shunshu
+          cat > .tmp/deb/DEBIAN/control <<CTRL
+          Package: shunshu
+          Version: $version
+          Architecture: amd64
+          Section: utils
+          Priority: optional
+          Maintainer: cfco <minyaohua@gmail.com>
+          Depends: python3-tk, gir1.2-gtk-3.0, gir1.2-glib-2.0, libgtk-3-0t64, python3-xlib, gir1.2-appindicator3-0.1 | gir1.2-ayatanaappindicator3-0.1
+          Description: 小说目录页更新监控（托盘常驻 + 弹窗提醒）
+           抓小说目录页、认出章节容器、有新章就在右上角弹卡片。没有窗口界面，
+           添加、删除、改间隔全在托盘右键菜单里。数据目录 ~/.local/share/shunshu。
+          CTRL
+          cat > .tmp/deb/usr/share/applications/shunshu.desktop <<DESK
+          [Desktop Entry]
+          Type=Application
+          Name=顺手
+          Exec=/usr/bin/shunshu
+          Terminal=false
+          Categories=Utility;
+          StartupNotify=false
+          DESK
+          dpkg-deb --root-owner-group --build .tmp/deb "$deb"
+          dpkg-deb --info "$deb" | sed -n '1,20p'
+          ls -lh "$deb"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: shunshu-linux-x86_64
-          path: "shunshu-*-linux-x86_64.tar.gz"
+          path: |
+            shunshu-*-linux-x86_64.tar.gz
+            shunshu-*-linux-amd64.deb
           if-no-files-found: error
           retention-days: 7
 
@@ -374,3 +417,4 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             shunshu-*-linux-x86_64.tar.gz
+            shunshu-*-linux-amd64.deb

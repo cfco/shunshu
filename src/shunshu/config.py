@@ -73,9 +73,44 @@ def _base_dir() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+_data_dir_cache: Path | None = None
+
+
 def data_dir() -> Path:
+    """书架与日志的位置：`SHUNSHU_DATA_DIR` 优先，否则程序旁边的 `data/`。
+
+    装到 `/opt/shunshu`（deb）这类 root 所有的位置时，程序旁边根本写不动，直接退到
+    XDG 数据目录（`~/.local/share/shunshu`），否则第一次写盘就崩在启动里、现场只看到
+    一张「启动失败」卡。只在选路径时试一次，结果缓存（每轮都摸盘没意义）。
+    """
+    global _data_dir_cache
     override = os.environ.get("SHUNSHU_DATA_DIR")
-    return Path(override) if override else _base_dir() / "data"
+    if override:
+        return Path(override)
+    if _data_dir_cache is None:
+        _data_dir_cache = _pick_data_dir()
+    return _data_dir_cache
+
+
+def _pick_data_dir() -> Path:
+    candidate = _base_dir() / "data"
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe = candidate / ".write-probe"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        return candidate
+    except OSError:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+        fallback = Path(base) / APP_NAME
+        fallback.mkdir(parents=True, exist_ok=True)
+        note = (f"安装目录 {candidate} 不可写，数据目录改用 {fallback}\n")
+        try:
+            with (fallback / "shunshu.log").open("a", encoding="utf-8") as fh:
+                fh.write(note)
+        except OSError:
+            pass  # 连回退目录都写不动时交给上层照报启动失败，这里不静默改路径
+        return fallback
 
 
 # 需要 int / float 类型的配置字段：手改 config.json 时可能写成 "30"、30.5 甚至 "abc"，
