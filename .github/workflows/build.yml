@@ -297,9 +297,11 @@ jobs:
           set -uo pipefail
           data="$RUNNER_TEMP/shunshu-smoke"
           rm -rf "$data"; mkdir -p "$data"
+          # runner 用 bash -e 执行 step：timeout 返回 124（= 撑到被收掉，正是我们要的）
+          # 会被 -e 当成失败当场中止，后面的判断根本跑不到。必须显式吃下退出码
+          code=0
           SHUNSHU_DATA_DIR="$data" timeout 30 xvfb-run -a \
-            ./dist-linux/shunshu.dist/shunshu run --boot-delay=1 >"$data/stdout.log" 2>&1
-          code=$?
+            ./dist-linux/shunshu.dist/shunshu run --boot-delay=1 >"$data/stdout.log" 2>&1 || code=$?
           echo "--- shunshu.log ---"; cat "$data/shunshu.log" 2>/dev/null || echo "(没有 shunshu.log)"
           echo "--- stdout/stderr ---"; cat "$data/stdout.log"
           # 124 = 被 timeout 收掉，正是「一直活着」的意思；自己退了就得看日志

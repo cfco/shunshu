@@ -47,6 +47,11 @@ def render(version: str, date: str, body: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows runner 的控制台不是 UTF-8，正文里全是中文：不 reconfigure 的话 print 直接
+    # UnicodeEncodeError，步骤 exit 1（正文文件其实已经写好了，坏的是那句汇报）
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--version", required=True, help="版本号，带不带 v 都行")
     parser.add_argument("--readme", default="README.md")
