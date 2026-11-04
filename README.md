@@ -23,30 +23,31 @@ uv run shunshu
 
 ### Ubuntu
 
-Ubuntu 上有两种跑法，**差别只在托盘右键菜单有没有**，而右键菜单就是这个工具的全部操作入口：
+一条命令装好（apt 依赖 → 系统 python3 的 venv → 装 wheel → 自己跑一遍看托盘后端），装完在终端敲 `shunshu`：
 
 ```bash
-# 跑法一（有右键菜单）：用 apt 的 python3 建 venv —— gi 只有系统那一份
-sudo apt install python3-venv python3-tk python3-gi python3-xlib \
-                 gir1.2-gtk-3.0 libgtk-3-0t64 gir1.2-appindicator3-0.1
-python3 -m venv --system-site-packages .venv
-.venv/bin/pip install beautifulsoup4 lxml pillow pystray PySocks requests zhconv truststore
-PYTHONPATH=src .venv/bin/python -m shunshu
-
-# 跑法二（一条命令，但没有右键菜单）：uv 自己的 3.14，pip 装不出 gi
-uv python install 3.14
-uv sync
-uv run shunshu
+bash <(curl -fsSL https://github.com/cfco/shunshu/releases/latest/download/install-linux.sh)
 ```
 
-跑法二不是跑法一的省事版：pystray 依次试 AppIndicator → GTK → Xorg 三个后端，前两个要 `gi`（PyGObject），而它只能由 apt 的 `python3-gi` 提供、pip 装不出来，且绑死在系统那个解释器上（Ubuntu 24.04 与 Zorin 18 都是 3.12）。所以 `requires-python` 从 `>=3.14` 放宽到 `>=3.12` 就是为了让跑法一装得进来；本机开发仍由 `.python-version` 钉在 3.14，uv 不会自己降。
+在 Ubuntu 26.10 的干净容器里每次发版都会把这条命令原样跑一遍，跑不过就不出包（见下面 CI 那节）。
 
-系统侧还要这几样，缺哪样就少一块功能：
+**Linux 不发「解压即用」的二进制，这是 v0.16.0 那次翻车的结论。** 右键菜单只有 pystray 的 appindicator/gtk 后端渲染得出来，而这两个后端要 apt 的 `gi`（PyGObject）+ GTK3 + appindicator 的 typelib；`gi` 装不进 pip，也搬不出系统。以前用 Nuitka 把编译机（Ubuntu 24.04）那份 `gi` 连同系统整目录的 typelib 快照打进产物，运行时再把 `GI_TYPELIB_PATH` 指向快照——换到 Ubuntu 26.10（gi 3.57、gtk 3.24.52、g-i 1.86）就是本机那个 `libgdk-3` 对不上快照，启动崩成一句没有文字的 `AssertionError`（`gi/overrides/Gdk.py` 里 `assert g_type != TYPE_NONE`），而 CI 在编译机上全绿：快照把「目标机缺东西 / 版本对不上」这件事整个糊住了。现在 Linux 只发纯 Python 的 wheel（没有 C 扩展，一个包通吃 3.12/3.13/3.14），`gi` 一律用目标机自己那套。
+
+源码态开发要右键菜单，也得用系统解释器建 venv（`gi` 只有那一份）：
+
+```bash
+python3 -m venv --system-site-packages .venv && .venv/bin/pip install -e .
+.venv/bin/python -m shunshu
+```
+
+用 uv 管依赖也行，但 uv 自己那个解释器看不见 apt 的 `gi`，托盘会退成只有图标的 `_xorg`——pystray 依次试 AppIndicator → GTK → Xorg 三个后端，前两个都要 `gi`。`requires-python` 是 `>=3.12`（Ubuntu 24.04/Zorin 18 的 apt python3 是 3.12，26.10 是 3.14），代码本身没有 3.13+ 的特性；本机开发由 `.python-version` 钉在 3.14，uv 不会自己降。
+
+系统侧还要这几样（`install-linux.sh` 会一并 apt 装好；缺哪样就少一块功能）：
 
 | 装件 | 少了会怎样 |
 | --- | --- |
 | `python3-tk` | 提醒卡片弹不出来（Tk 是卡片唯一的渲染层） |
-| `python3-gi` + `gir1.2-gtk-3.0` + `gir1.2-appindicator3-0.1` | 托盘**没有右键菜单**：图标也许还在，但点开是空的，添加小说、改间隔、删除全都没入口 |
+| `python3-gi` + `gir1.2-gtk-3.0` + `gir1.2-ayatanaappindicator3-0.1` | 托盘**没有右键菜单**：图标也许还在，但点开是空的，添加小说、改间隔、删除全都没入口 |
 | `python3-xlib` | 连兜底的老式 XEmbed 图标也没有，`import pystray` 直接失败 |
 | `xclip`（X11）/ `wl-clipboard`（Wayland） | 「添加小说（从剪贴板）」读不到东西，只会回一句「没有可识别的链接」 |
 | `xdg-utils` | 点章节、点「打开数据目录」都靠 `xdg-open` |
@@ -103,7 +104,7 @@ uv run shunshu
 | `shunshu.log` | 运行日志，一轮一行 |
 | `shunshu.lock` | 只在 Ubuntu 上出现：单实例闸门用的是这个文件的 flock（Windows 用命名互斥体，不落文件） |
 
-数据目录默认是项目根（打包后是 exe 同级）；不想让它写在只读位置、或想把书架放到别处，设 `SHUNSHU_DATA_DIR` 指到别的地方（Ubuntu 上用系统解释器 `pip install` 时基本都得设，例如 `~/.local/share/shunshu`）。
+数据目录默认是项目根（Windows 打包后是 exe 同级）；装在 site-packages 里的那种（Ubuntu 的 `install-linux.sh`）没有项目根可找，直接落 `~/.local/share/shunshu/data`——venv 重装一次就没了，书架跟着用户走才不会随升级丢失。程序装在写不动的地方时同样退到那里，并在 `shunshu.log` 留一行说明退到哪了。想把书架放到别处就设 `SHUNSHU_DATA_DIR`。
 
 两个保命小机制：
 
@@ -155,7 +156,7 @@ uv run shunshu
 
 ## 打包成 exe
 
-不需要手动打包也不需要手动打 tag：CI（`.github/workflows/build.yml`）在每次 push 到 `main` 时都会跑测试、用 Nuitka 编出 standalone 目录，并按 `pyproject.toml` 里的版本号自动发布到 **Releases**（tag 不存在时由 CI 建）。所以发版动作就是「改版本号 + push」，**顺带要在变更记录里补一条那版的说明**——发布页正文就是 `scripts/release_notes.py` 从下面「变更记录」里那一条取来的（关掉 GitHub 自动生成的 notes，那种只列合并请求和一串链接）。手动打 `v*` tag 也能触发，用于补发某个版本。
+不需要手动打包也不需要手动打 tag：CI（`.github/workflows/build.yml`）在每次 push 到 `main` 时都会跑测试、Windows 用 Nuitka 编出 standalone 目录与单文件 exe、Linux 出 wheel 并在 `ubuntu:26.10` 容器里把安装脚本跑一遍，按 `pyproject.toml` 里的版本号自动发布到 **Releases**（tag 不存在时由 CI 建）。所以发版动作就是「改版本号 + push」，**顺带要在变更记录里补一条那版的说明**——发布页正文就是 `scripts/release_notes.py` 从下面「变更记录」里那一条取来的（关掉 GitHub 自动生成的 notes，那种只列合并请求和一串链接）。手动打 `v*` tag 也能触发，用于补发某个版本。
 
 每次发两个包，按需取用：
 
@@ -163,21 +164,20 @@ uv run shunshu
 | --- | --- | --- |
 | `shunshu-<版本>-windows-amd64.zip` | folder 模式：`shunshu.exe` + 依赖目录，解压即用 | 启动最快，首次运行不解包 |
 | `shunshu-<版本>-windows-amd64-onefile.exe` | 单个 exe | 拷一个文件就走；首次运行解包到 `%LOCALAPPDATA%` 下按版本固定的缓存目录 |
-| `shunshu-<版本>-linux-x86_64.tar.gz` | folder 模式：`shunshu` 二进制 + 依赖目录，解压即用 | Ubuntu 24.04 及更新的（编译机固定在 `ubuntu-24.04`，glibc 下限由它决定） |
+| `shunshu-<版本>-py3-none-any.whl` | 纯 Python wheel（没有 C 扩展） | Ubuntu/Debian：`gi`、GTK3、Tk 全用 apt 那套，所以同一个包通吃 3.12/3.13/3.14 |
+| `install-linux.sh` | 一条命令装好：apt 依赖 → 系统 python3 的 venv → 装 wheel → 自检托盘后端 | 配合上面的 wheel；每次发版在 `ubuntu:26.10` 容器里把这条命令原样跑一遍 |
 
 单文件模式用了 `--onefile-cache-mode=cached`：解包目录固定，**主进程和弹卡片用的子进程共用同一份**，否则每弹一张卡就要重解一次几十 MB。这也是它必须带 `--company-name/--product-name/--product-version` 的原因（默认路径模板要用这几个值）。代价是 CI 要多编一次，构建时间大约翻倍。
 
-同一个 `shunshu.exe`（Linux 上是 `shunshu`）兼任两件事——直接运行是起托盘，`shunshu.exe popup --payload <json>` 是主程序弹卡片时调的子命令。「当前是不是打包态、再次拉起自己该用哪个 exe」统一由 `packaging.py` 回答（PyInstaller 认 `sys.frozen`；Nuitka 先认入口模块的 `__compiled__`，再退回「argv[0] 是真实文件而 sys.executable 指向的解释器不存在」这条 Windows 启发式——Linux 上 Nuitka 的 `sys.executable` 就指向那个真实存在的产物文件，只查解释器存不存在会把产物当成源码态，弹卡命令被拼成 `./shunshu -m shunshu popup`，一张卡都出不来），开机自启命令、`data/` 目录定位、卡片子进程拉起都用这同一结论——Nuitka onefile 升级后解包临时目录会变版本号，`data/` 因此锚定在真实 exe 同级而不是 `__file__` 旁边，书架和代理记忆不会随升级「丢失」。编译参数以 workflow 里那三条为准，本地跑同样的命令即可（Windows 侧先 `uv sync --group dev`）。
+同一个 `shunshu.exe`（Linux 上是 `shunshu`）兼任两件事——直接运行是起托盘，`shunshu.exe popup --payload <json>` 是主程序弹卡片时调的子命令。「当前是不是打包态、再次拉起自己该用哪个 exe」统一由 `packaging.py` 回答（PyInstaller 认 `sys.frozen`；Nuitka 先认入口模块的 `__compiled__`，再退回「argv[0] 是真实文件而 sys.executable 指向的解释器不存在」这条 Windows 启发式——Linux 上 Nuitka 的 `sys.executable` 就指向那个真实存在的产物文件，只查解释器存不存在会把产物当成源码态，弹卡命令被拼成 `./shunshu -m shunshu popup`，一张卡都出不来），开机自启命令、`data/` 目录定位、卡片子进程拉起都用这同一结论——Nuitka onefile 升级后解包临时目录会变版本号，`data/` 因此锚定在真实 exe 同级而不是 `__file__` 旁边，书架和代理记忆不会随升级「丢失」。编译参数以 workflow 里那两条为准（Linux 侧不再编二进制），本地跑同样的命令即可（Windows 侧先 `uv sync --group dev`）。
 
-**Ubuntu 那个 job（`build-ubuntu`）**与 Windows 的差别，都是被「gi 只能来自 apt」逼出来的：
+**Ubuntu 那个 job（`install-ubuntu`）**跑在 `ubuntu:26.10` 的容器里（host 是 `ubuntu-latest`，用户态是 26.10），把用户那条命令原样跑一遍：
 
-- **不用 uv 建环境**：`uv export --frozen` 把 `uv.lock` 里的依赖版本导成 requirements 喂给 pip，但解释器换成 `/usr/bin/python3` 建的 `--system-site-packages` venv——只有这样才能看见 apt 的 `gi`。依赖版本仍由 lock 说了算。
-- **编译参数**多两条 `--nofollow-import-to=pystray._win32/_darwin`（那两个后端在 Linux 上 import 不了，留着只会让 Nuitka 分析报错），少了 `--windows-console-mode`，并且**不能加 `--include-package=gi`**：`gi.repository.*` 是运行时按 typelib 动态造的虚拟模块，整包包含会逼 Nuitka 的 gi 插件去枚举机器上所有 overrides（`Vte`、`Notify`……），撞上没装 typelib 的那一个就 `FATAL: gi: Plugin issue ... Typelib file for namespace 'Vte' not found` 中断编译。让插件只处理 pystray 真 import 的那几个（Gtk/GLib/GObject/Gio/AppIndicator3）才行。
-- **编译前先问一次后端**：`Check tray backends before compiling` 那步在 `xvfb-run` 里逐个 `gi.require_version(...)` 并试着 import 三个后端，结果写进 job 摘要。放这么前是因为它几秒出结果，而编译 FATAL 要等几分钟、报错也看不出是缺 apt 包还是参数问题。`DBus-1.0` 这一项尤其要紧——`pystray/_util/notify_dbus.py` 在 import 时就无条件 `require_version('DBus','1.0')`，它缺了整条 gtk/appindicator 路就断、只剩只有图标的 `_xorg`（注：真缺 DBus typelib 时不会走到这条退化，见上）。
-- **typelib 不在包里**：`gi.require_version('AppIndicator3', '0.1')` 找的是系统的 `/usr/lib/.../girepository-1.0/*.typelib`，所以**目标机仍要 apt 装** `python3-gi gir1.2-gtk-3.0 gir1.2-appindicator3-0.1`（上面表格里那行）。这是 Linux 桌面应用的常态，不是打包没打全。
-- **没有 onefile 版**：folder 模式那份就是产物；要单文件再说。
-- **产物自测跑到哪一步**：job 会在 `xvfb-run` 里用**编出来的二进制**空书架跑一遍，硬门槛是三条——撑到被 `timeout` 收掉（启动没崩）、`shunshu.log` 写了「托盘后端: …」、`alerts.log` 记了启动那张卡且**没有**「卡片没弹出」。这正好盯住 Nuitka 那两个老坑（静默 ImportError、打包态判定失效），后端结论与日志副本也一并传成 Actions artifact 方便回看。
-- **证明不了的**：runner 上没有真的托盘宿主，所以「图标在桌面上到底显不显示、右键菜单点得开吗、GNOME 要不要装 AppIndicator 扩展、Wayland 下卡片位置还剩多少」CI 说不了话，只能在真桌面上看（见上面 Ubuntu 那节）。日志里的「托盘后端」那行是现场分辨这件事的唯一依据。
+- **只编 wheel，不编二进制**：`uv build --wheel` 出一个 `py3-none-any`（纯 Python、没有 C 扩展，gi 由 apt 提供所以不进包）。系统 python 被 PEP 668 标成 externally-managed，因此 uv 装在临时 venv 里，不用 `--break-system-packages` 去动系统环境。
+- **装的步骤与用户完全一致**：`SHUNSHU_WHEEL=<刚编出来的 wheel> bash scripts/install-linux.sh`。脚本 apt 装 `python3-venv python3-tk python3-gi python3-xlib gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-freedesktop xclip wl-clipboard xdg-utils fonts-noto-cjk`——Ubuntu 26.10 把 `python3-tk`/`python3-xlib`/legacy appindicator 挪进了 universe，装不上时脚本自己 `add-apt-repository universe` 再试一次；然后 `/usr/bin/python3 -m venv --system-site-packages` 建 venv 再 pip 装 wheel，只有 `--system-site-packages` 才看得见 apt 那份 `gi`。`gir1.2-freedesktop` 特意写进名单：`DBus-1.0.typelib` 由它带，而 `pystray/_util/gtk.py` 在 import 时就无条件 `from . import notify_dbus`（那里 `require_version('DBus','1.0')`），缺了整条 appindicator/gtk 路当场断。
+- **脚本自带自检**：容器里没有图形会话，所以用 `dbus-run-session` + `xvfb-run` 把托盘真起 15 秒，再读 `~/.local/share/shunshu/data/shunshu.log` 里那行「托盘后端」——不是 `_appindicator`/`_gtk` 就当场失败，「有图标没菜单」的包拦在发版之前。appindicator 是往会话总线注册的，纯 xvfb 没有那条总线，`dbus-run-session` 这层不能省。
+- **同一套用例也在 26.10 + 系统解释器上跑一遍**：Linux 那几条平台分支（XDG 自启文件、剪贴板工具、flock 单实例、卡片窗口属性）只有在这里才是真跑，Windows 那个 job 只覆盖得到一半。
+- **证明不了的**：容器里没有真的托盘宿主（GNOME Shell 的 AppIndicator 扩展、Yaru 那块面板），所以「图标在桌面上到底显不显示、右键菜单点得开吗、GNOME 要不要装扩展、Wayland 下卡片位置还剩多少」CI 说不了话，只能在真桌面上看（见上面 Ubuntu 那节）。日志里的「托盘后端」那行是现场分辨这件事的唯一依据。
 
 ## 设计与取舍
 
@@ -223,6 +223,7 @@ xvfb-run -a .venv-linux/bin/python -m pytest tests -q  # CI 里那条：apt 解�
 
 ## 变更记录
 
+- **0.17.0（2026-11-04）**：Ubuntu 不再发冻结二进制，改成 wheel + 一条命令安装脚本。① **先把 26.10 那句裸 AssertionError 查到底**：v0.16.0 的 deb 在 Ubuntu 26.10 上启动就崩，日志只有 `AssertionError`，调用点是 `gi/overrides/Gdk.py:91` 的 `Color = override(Color)`、断言是 `gi/overrides/__init__.py:189` 的 `assert g_type != TYPE_NONE`——Gdk-3.0 的 typelib 读到了，但本机那个 `libgdk-3` 给不出 `GdkColor` 的 GType。根因是 Nuitka 的 gi 插件把编译机（24.04）系统整目录的 typelib 复制进产物，运行时又把 `GI_TYPELIB_PATH` 指到那份快照：目标机缺包或版本对不上时都不会照实报「typelib 找不到」，只剩一句没有文字的断言，而 CI 在编译机上全绿。README 里原来那句「typelib 不在包里」是错的，已改掉。② **Linux 侧的 Nuitka 编译与 deb 整个撤掉**：CI 只出 `shunshu-<版本>-py3-none-any.whl`（纯 Python、没有 C 扩展，一个包通吃 3.12/3.13/3.14）与 `scripts/install-linux.sh`，`install-ubuntu` job 跑在 `ubuntu:26.10` 容器里，把用户那条命令原样执行——apt 装依赖（26.10 把 `python3-tk`/`python3-xlib` 挪进了 universe，脚本装不上时自己开 universe 再试）→ `/usr/bin/python3 -m venv --system-site-packages` 建 venv → pip 装 wheel。脚本末尾自带自检：用 `dbus-run-session` + `xvfb-run` 真起 15 秒托盘，读 `shunshu.log` 里那行「托盘后端」，不是 `_appindicator`/`_gtk` 就当场失败，「有图标没菜单」的包拦在发版之前；同一套用例也在 26.10 + 系统解释器上跑一遍。`gi` 从此只用目标机那套，产物不再关心发行版的版本差。③ **装在 site-packages 里的数据目录落 `~/.local/share/shunshu/data`**：`config._base_dir()` 往上找不到 `pyproject.toml` 时原来退到 `__file__` 往上第三层（就是 site-packages），venv 重装一次书架就没了；现在退到 XDG 数据目录，记忆跟着用户走。装在只读位置时的那条回退逻辑不动。④ **`import pystray` 失败翻译成人话**：Linux 上把原始异常连同「要 apt 装的那五个包名 + 安装脚本」一起写进卡片和日志，现场不再只有一个 `AssertionError`。⑤ 用例 294 → 299（安装态基准目录 2 条、仓库检出不受影响 1 条、托盘失败文案 3 条里的两条新增）。⑥ **这次没做的**：Windows 那两个 Nuitka 产物的崩溃日志仍写 `v0.0.0`（产物里没有包元数据，`importlib.metadata` 读不到版本；Linux 换 wheel 之后这一版反而带元数据了）；Ubuntu 26.10 真机上「图标显不显示、菜单点得开吗」还得在桌面上看一次——CI 容器里没有真的托盘宿主。
 - **0.16.0（2026-10-28）**：出 deb 包 + 数据目录不再咬死安装目录。① CI 的 `build-ubuntu` 加 `Package deb` 步骤：把 Nuitka 的 standalone 目录搬进 `/opt/shunshu`、`/usr/bin/shunshu` 做软链、写 `.desktop`，`dpkg-deb --root-owner-group` 出 `shunshu-<版本>-linux-amd64.deb` 并追加进同一条 Release。typelib 一律走 `Depends`（`python3-tk`、`gir1.2-gtk-3.0`、`gir1.2-glib-2.0`、`libgtk-3-0t64`、`python3-xlib`、appindicator 的 legacy 与 ayatana 两个包名互为候选），不把系统数据塞进包里——塞了既不规范也修不了版本漂移。② 装到 `/opt` 后程序旁边写不动，`data_dir()` 改成「先试安装目录能不能真写（建目录 + 落一个探针文件），不行就退 `XDG_DATA_HOME`/`~/.local/share/shunshu`」，并在退过去的日志里留一行说明；`SHUNSHU_DATA_DIR` 仍旧优先，源码态与 exe 态位置不变（这条是 deb 的硬前提：没有回退，装完第一次写盘就崩在启动里，现场只有一张「启动失败」卡）。③ 用例 290 → 294（新增 tests/test_data_dir.py 四条：覆盖优先、能写就留在程序旁、只读安装目录退 XDG 并留原因、选址只算一次）。
 
 - **0.15.0（2026-10-28）**：一轮审计（四路分头读码 + 逐条回读源码核实）后的修复，按严重度成批。① **P0 滚动式目录从此永久不提醒**：`toc_reset` 的 overlap 分母用的是累计 `notified_keys`（离开目录的老章还会留 500 条），只列最近十几章的站分母每轮 +1、分子封顶，二十几轮后必然跌破阈值 → 每轮判「疑似改版」；改用上一轮目录条数 `chapter_count` 当分母，并加 40 轮回归用例。② **P0 断档追赶被静默吞掉**：一次 >30 新章判重编号走 `_reset`，而 `_reset` 照样 `_commit` 把这批章写成「已提醒过」——一条没报就永久漏；现在新章编号全部紧接已知最新章时按真更新照报（`_continues_sequence`）。③ **P1 novels.json 手改数值/布尔字段能掀掉整轮**：`Source.from_dict` 原先只归一字符串与列表，`"consecutive_failures": "3"` 会在兜底 except 里的 `+= 1` 再抛、逃出兜底 → 整轮不记账不弹卡，日志只剩一行「轮询异常」；`"enabled": "false"` 恒真停不掉源。补数值/布尔归一（`latest_number` 转不动留 None，不塌成 0）。④ **P1 退出后仍有卡片**：`Notifier.close_all()` 先关闸再收窗口，正在跑的那轮之后 spawn 不再生效（原来会留下永远没人认领的无主窗口）。⑤ **P1/P2 其余**：`Config.from_dict` 把手改的危险值夹回合法区间（`failure_backoff_threshold=0` 会让 `cf >= 0` 恒真、连抓成功的来源也被退避）；`self_executable()` 改 realpath（软链启动时 data/ 落到只读目录，书架像「消失」）；`autostart.disable()` 的返回值不再被丢（写不动时不再谎报「已关闭」）；启动轮崩溃不再顺着空结果写成「书架为空」；活过 0.5 秒宽限期才崩的卡片往 alerts.log 记退出码（子进程 stderr 是 DEVNULL，不留这行就无从查起）。⑥ **CI**：加 `concurrency` 分组（同一 ref 的两次 run 会抢着写同一条 Release，实测被旧那次后跑完把正文盖回 compare 链接）；冒烟自测现在要求后端是 `_appindicator`/`_gtk`，只有图标的 `_xorg` 直接判不过——这个工具的操作入口全在右键菜单。⑦ **纠正一处我自己写错的事实**：缺 `DBus-1.0.typelib` 时 pystray 的 `backend()` 只 `except ImportError`、而 `require_version` 抛的是 `ValueError`，所以是 `import pystray` 当场崩、程序起不来，**不是**我先前写的「退化成只有图标的 `_xorg`」。⑧ 抓取总时限（单 URL 含重试与读流的累计预算，涓流响应原先能无限续命）与用例数见 workflow 与 tests。⑨ 未做/仍待定：`DBus-1.0.typelib` 在 noble 上由哪个包提供，等 CI 那步实测输出定；真桌面（GNOME 托盘扩展、Wayland）仍未验证。
