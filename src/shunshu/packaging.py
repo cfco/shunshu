@@ -9,6 +9,11 @@ from __future__ import annotations
 import os
 import sys
 
+from .host import IS_WINDOWS
+
+# Debian/Ubuntu 里 apt 那份 gi（PyGObject）的位置；产物不冻结 gi，运行时从这里取
+SYSTEM_GI_DIR = "/usr/lib/python3/dist-packages"
+
 
 def is_packaged() -> bool:
     """当前是否运行在打包出来的可执行文件里。
@@ -45,3 +50,20 @@ def self_executable() -> str:
             # data/ 定到链接所在的只读目录，书架与代理记忆当场「消失」
             return os.path.realpath(path)
     return sys.executable
+
+
+def expose_system_gi() -> bool:
+    """Linux 打包态下让 `import gi` 落到 apt 那一份：把 dist-packages 挂到 sys.path 末尾。
+
+    gi 不能再编进产物：Ubuntu 26.10 的 PyGObject 3.57 + 新版 glib 把 `unix_*` 拆到了
+    `GLibUnix-2.0`，Nuitka 冻结的那套 `gi/overrides` 与运行时载入的 typelib 对不上号，
+    托盘一 import 就炸（现场是 `unix_signal_add_full was set deprecated but wasn't added
+    to __all__`，2026-11-04 的 CI 冒烟）。apt 那份 gi 是绑系统解释器 ABI 的 C 扩展，所以
+    这条路只在「编译机与目标机同一个 python 小版本」时成立——CI 正是在 ubuntu:26.10 容器里
+    编、又在同一个容器里跑产物自检。跨发行版请用同一个 Release 里的 wheel + install-linux.sh。
+    """
+    if IS_WINDOWS or not is_packaged():
+        return False
+    if SYSTEM_GI_DIR not in sys.path:
+        sys.path.append(SYSTEM_GI_DIR)
+    return True

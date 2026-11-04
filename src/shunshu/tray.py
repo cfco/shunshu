@@ -9,6 +9,9 @@ import time
 from functools import partial
 
 from .host import IS_WINDOWS  # 必须在 import pystray 之前：托盘起不来时的提示按平台分流
+from .packaging import expose_system_gi
+
+expose_system_gi()  # Linux 打包态：gi 不在产物里，从 apt 那份拿（见 packaging.expose_system_gi）
 
 
 def _tray_import_error(exc: BaseException) -> str:
@@ -26,7 +29,9 @@ def _tray_import_error(exc: BaseException) -> str:
         "Linux 的右键菜单只能用 apt 那套 gi + GTK3，缺任一环都起不来。装齐：\n"
         "sudo apt install -y python3-gi gir1.2-gtk-3.0 "
         "gir1.2-ayatanaappindicator3-0.1 python3-xlib python3-tk\n"
-        "或直接重跑安装脚本 scripts/install-linux.sh（它会装依赖、建 venv、再自检一次）"
+        "装齐了还崩，多半是系统 python 与这个包的编译环境不是同一个版本——"
+        "改用同一个 Release 里的 wheel + install-linux.sh，"
+        "或直接跑 scripts/install-linux.sh（它会装依赖、建 venv、再自检一次）"
     )
 
 

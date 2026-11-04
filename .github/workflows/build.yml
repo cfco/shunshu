@@ -362,16 +362,25 @@ jobs:
           SHUNSHU_WHEEL="$GITHUB_WORKSPACE/dist-wheel/shunshu-${{ steps.version.outputs.value }}-py3-none-any.whl" \
             bash scripts/install-linux.sh
 
-      # 与 Windows 那两条同一组关键参数；差别只在：没有 --windows-console-mode，以及把
-      # Windows/macOS 的后端排除掉。**不要加 --include-package=gi**：gi.repository 的模块是
-      # 运行时按 typelib 动态造的，整包包含会逼 gi 插件去枚举机器上所有 overrides（Vte/Notify/…），
-      # 撞上没装 typelib 的那一个就 FATAL 中断编译
+      # 与 Windows 那两条同一组关键参数；差别只在：没有 --windows-console-mode、把 Windows/macOS
+      # 的后端排除掉，以及 **gi 干脆不编进产物**（--disable-plugins=gi 关掉 gi 插件的 typelib 快照
+      # 复制，--nofollow-import-to 让 pystray 的那句 import gi 不产生冻结模块）。v0.17.0 两轮现场：
+      # 在 24.04 上编 → 26.10 装上去崩在 `assert g_type != TYPE_NONE`（快照对不上本机 libgdk）；
+      # 改在 26.10 容器里编 → 同一个容器里仍崩在 `unix_signal_add_full was set deprecated but
+      # wasn't added to __all__`（3.57 的 gi/overrides 与新版 glib 把 unix_* 拆到 GLibUnix-2.0
+      # 这件事对不上）。同一套 apt 的 gi 在 wheel 那条路上是全绿的，所以运行时用系统那一份：
+      # packaging.expose_system_gi() 只在 Linux 打包态把 /usr/lib/python3/dist-packages 挂到
+      # sys.path 末尾。代价是这个包绑目标机的 python 小版本（产物是 3.14 的 ABI），跨版本请用
+      # 同一个 Release 里的 wheel + install-linux.sh
       - name: Nuitka compile (standalone folder)
         run: |
           .venv-linux/bin/python -m nuitka \
             --standalone \
             --assume-yes-for-downloads \
             --enable-plugin=tk-inter \
+            --disable-plugins=gi \
+            --nofollow-import-to=gi \
+            --nofollow-import-to=gi.* \
             --include-package=shunshu \
             --include-package=pystray \
             --nofollow-import-to=pystray._win32 \
@@ -454,12 +463,13 @@ jobs:
           Section: utils
           Priority: optional
           Maintainer: cfco <minyaohua@gmail.com>
-          Depends: python3-tk, gir1.2-gtk-3.0, gir1.2-glib-2.0, gir1.2-freedesktop, libgtk-3-0t64, python3-xlib, gir1.2-appindicator3-0.1 | gir1.2-ayatanaappindicator3-0.1
+          Depends: python3-gi, python3-tk, gir1.2-gtk-3.0, gir1.2-glib-2.0, gir1.2-freedesktop, libgtk-3-0t64, python3-xlib, gir1.2-appindicator3-0.1 | gir1.2-ayatanaappindicator3-0.1
           Description: 小说目录页更新监控（托盘常驻 + 弹窗提醒）
            抓小说目录页、认出章节容器、有新章就在右上角弹卡片。没有窗口界面，
            添加、删除、改间隔全在托盘右键菜单里。数据目录 ~/.local/share/shunshu。
-           这个包在 ubuntu:26.10 容器里编译，gi/GTK3 与 typelib 快照按该版本对齐；
-           别的发行版请用同一个 Release 里的 wheel + install-linux.sh。
+           gi（PyGObject）不打进包里，由 Depends 里的 python3-gi 提供（apt 那份才与本机
+           glib/GTK3 同源）；包本身是 ubuntu:26.10 的 python3.14 ABI，跨发行版或换了
+           python 小版本请用同一个 Release 里的 wheel + install-linux.sh。
           CTRL
           cat > .tmp/deb/usr/share/applications/shunshu.desktop <<DESK
           [Desktop Entry]

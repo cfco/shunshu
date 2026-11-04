@@ -144,3 +144,38 @@ def test_packaged_version_is_empty_in_source_mode(monkeypatch):
 
     monkeypatch.setattr(packaging, "is_packaged", lambda: False)
     assert shunshu._packaged_version() == ""
+
+
+# ---------- Linux 打包态的 gi 从系统取 ----------
+
+def test_linux_packaged_mode_appends_the_apt_gi_dir(monkeypatch):
+    """产物里没有 gi：把 apt 的 dist-packages 挂到 sys.path 末尾，gi 与 _gi.so 才是同一套。
+
+    26.10 上冻结进产物的 gi 起不来（PyGObject 3.57 + glib 把 unix_* 拆到 GLibUnix-2.0，
+    现场是 `unix_signal_add_full was set deprecated but wasn't added to __all__`）。
+    """
+    from shunshu import packaging
+
+    monkeypatch.setattr(sys, "path", [p for p in sys.path if p != packaging.SYSTEM_GI_DIR])
+    monkeypatch.setattr(packaging, "IS_WINDOWS", False)
+    monkeypatch.setattr(packaging, "is_packaged", lambda: True)
+
+    assert packaging.expose_system_gi() is True
+    # 挂末尾而不是开头：产物里冻结的那些依赖（PIL、requests…）仍要优先于系统 dist-packages
+    assert sys.path[-1] == packaging.SYSTEM_GI_DIR
+
+
+def test_source_mode_and_windows_do_not_touch_sys_path(monkeypatch):
+    """源码态 gi 本来就 import 得到，Windows 没有这个目录，都不该动 sys.path。"""
+    from shunshu import packaging
+
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setattr(packaging, "IS_WINDOWS", False)
+    monkeypatch.setattr(packaging, "is_packaged", lambda: False)
+    assert packaging.expose_system_gi() is False
+    assert packaging.SYSTEM_GI_DIR not in sys.path
+
+    monkeypatch.setattr(packaging, "is_packaged", lambda: True)
+    monkeypatch.setattr(packaging, "IS_WINDOWS", True)
+    assert packaging.expose_system_gi() is False
+    assert packaging.SYSTEM_GI_DIR not in sys.path
