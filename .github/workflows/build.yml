@@ -5,15 +5,23 @@
 #   2. push tag v*       → 同上，Release 挂在这个 tag 上
 #   3. 手动 dispatch      → 和 main 分支一样
 #
-# 也就是说：不需要在本地手动打 tag，改完代码把版本号往上推一次，Release 就跟着更新。
+# 也就是说：不需要在本地手动打 tag，改完代码把版本号往上推一次，Release 就跟着更新；就算忘了抬
+# 版本号，这一版也已经发过了，CI 照样往后走一个空闲号发成新包。
 #
-# 产物（每次 push 都会发到 Releases）：
+# 发版号由最前面的 plan job 定，规则是**每次 push 都发一个没发过的号，绝不覆盖已经发出去的包**：
+# pyproject 那个号还没打过 tag 就直接用它（正常发版仍是「改版本号 + push」），tag 已经存在就 patch
+# 往后找第一个空闲的号。于是忘抬版本号又推一次 = 多发一份新包，而不是把上一次 Release 的内容悄悄
+# 换掉——旧包的下载链接永远指向它当初那份东西。
+#
+# 产物（每次 push 都发到 Releases；Linux 的 tar.gz/deb 在 ubuntu:26.10 容器里编，见 build-ubuntu）：
 #   shunshu-{版本}-windows-amd64.zip        ← folder 模式：exe + 运行时依赖目录
 #     ├── shunshu.exe                          主程序 + popup 子命令，同一个 exe
 #     └── 运行时依赖（含 zhconv 词库、Tk、pystray/PIL 后端）
 #   shunshu-{版本}-windows-amd64-onefile.exe ← 单文件模式：一个 exe 拷走即用
-#   shunshu-{版本}-py3-none-any.whl          ← Linux 用的纯 Python wheel（没有 C 扩展，跨发行版通吃）
-#   scripts/install-linux.sh                   一条命令装好：apt 依赖 → 系统 python3 的 venv → 自检托盘后端
+#   shunshu-{版本}-linux-x86_64.tar.gz       ← Ubuntu 26.04/26.10 解压即用（容器里编的那份）
+#   shunshu-{版本}-linux-amd64.deb           同一套东西搬进 /opt/shunshu + 软链 + .desktop
+#   shunshu-{版本}-py3-none-any.whl          ← 别的发行版用的纯 Python wheel（gi 走目标机 apt）
+#   install-linux.sh                           一条命令装好：apt 依赖 → 系统 python3 的 venv → 自检托盘后端
 
 name: Build
 
@@ -31,9 +39,37 @@ on:
   workflow_dispatch:
 
 jobs:
+  # ------------------------------------------------------------------
+  # 先发版号，再编译：每次 push 都要发一个**没发过**的号，已经发过的绝不覆盖。
+  #
+  # pyproject 那个号还没打过 tag 就直接用它（正常发版就是「改版本号 + push」）；tag 已经
+  # 存在（这版发过了，或者忘抬号又推了一次）就 patch 往后找第一个空闲的。两个 build job 都
+  # 照这里的输出改写自己检出里的 pyproject/uv.lock，wheel 文件名、deb 的 Version、产物里的
+  # VERSION 才会是同一个号。
+  # ------------------------------------------------------------------
+  plan:
+    name: Plan release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pick a version that has not been released yet
+        id: plan
+        run: |
+          mkdir -p .tmp
+          # ls-remote 不用 GitHub API（匿名调用限流很紧），tag 列表一次就够
+          git ls-remote --tags origin > .tmp/tags.txt
+          version=$(python3 scripts/plan_release.py --tags .tmp/tags.txt)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "本次发版：v$version（pyproject 里写的是 v$(sed -n 's/^version = \"\([^\"]*\)\".*/\1/p' pyproject.toml | head -1)）"
+
   build:
     name: Windows Build
     runs-on: windows-latest
+    needs: plan
     # 建 Release 需要写权限：默认的 GITHUB_TOKEN 只有读权限，
     # 不写这行会在 Create GitHub Release 一步报 403 Resource not accessible by integration
     permissions:
@@ -50,6 +86,13 @@ jobs:
           python-version: "3.14"
           # 不要写 cache: "uv"：setup-python 的内置缓存只认 pip/pipenv/cargo，
           # 填 uv 会在这一步直接失败（Error: Caching for 'uv' is not supported）
+
+      # 把 plan 选出来的号写进 pyproject 与 uv.lock：Nuitka 打进去的 VERSION、onefile 的
+      # product-version、zip 的文件名都从 pyproject 取，三处必须是同一个号。放在 setup-python
+      # 之后是用它的 python 命令（Windows runner 上 python3 这个名字不保证有），且必须早于
+      # uv sync——锁与 pyproject 的版本不一致 uv 会直接报错
+      - name: Apply the planned version
+        run: python scripts/plan_release.py --set-version "${{ needs.plan.outputs.version }}" --apply
 
       - name: Install uv
         run: pip install uv
@@ -161,7 +204,7 @@ jobs:
       # 两个 job 共用 scripts/release_notes.py，正文只有一份来源
       - name: Build release notes
         shell: pwsh
-        run: uv run python scripts/release_notes.py --version "${{ steps.tag.outputs.name }}" --out release-notes.md
+        run: uv run python scripts/release_notes.py --version "${{ steps.tag.outputs.name }}" --commit-message "$(git log -1 --pretty=%s)" --out release-notes.md
 
       # ---------- 自动发布 Release（开源项目：每次 push 都要有可下载的 exe） ----------
       # tag 不存在时 action-gh-release 会就地建 tag，不用本地手动打
@@ -198,7 +241,9 @@ jobs:
   build-ubuntu:
     name: Ubuntu 26.10 Build
     runs-on: ubuntu-latest
-    needs: build
+    # needs build：Release 由 Windows 那次建，这次往同一个 Release 追加资产，两个 job 不能
+    # 抢着建同名 tag；needs plan 是为了拿到与 Windows 完全相同的发版号（两边必须落在同一个 Release）
+    needs: [build, plan]
     # Windows job 失败也照样出 Linux 包：两个平台的编译不该互相绑死
     if: ${{ !cancelled() }}
     container:
@@ -237,6 +282,11 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4
+
+      # 与 Windows 那个 job 同一个发版号：wheel 文件名、deb 的 Version、产物里的 VERSION
+      # 都从改写后的 pyproject 取，两边才会挂到同一个 Release 上
+      - name: Apply the planned version
+        run: python3 scripts/plan_release.py --set-version "${{ needs.plan.outputs.version }}" --apply
 
       - name: Resolve version
         id: version
@@ -447,7 +497,7 @@ jobs:
 
       # 与 Windows 那步同一份脚本、同一份正文（纯标准库，系统 python3 就够）
       - name: Build release notes
-        run: python3 scripts/release_notes.py --version "${{ steps.tag.outputs.name }}" --out release-notes.md
+        run: python3 scripts/release_notes.py --version "${{ steps.tag.outputs.name }}" --commit-message "$(git log -1 --pretty=%s)" --out release-notes.md
 
       # Windows job 已经建过同名 tag 的 Release，这里是往同一个 Release 追加文件，不会建出第二个
       - name: Publish GitHub Release

@@ -56,6 +56,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", required=True, help="版本号，带不带 v 都行")
     parser.add_argument("--readme", default="README.md")
     parser.add_argument("--out", required=True, help="写出正文文件（GitHub 的 body_path）")
+    parser.add_argument("--commit-message", default="",
+                        help="变更记录里没这一条时垫正文的提交说明（CI 自动往后走的 patch 号没有条目）")
     args = parser.parse_args(argv)
 
     version = args.version.lstrip("v")
@@ -68,9 +70,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     # 找不到不拦发版：产物已经编好了，别因为漏写一条日志就把整次发布判失败
-    fallback = (f"## v{version}\n\n"
-                f"README 的「变更记录」里没有 v{version} 这一条，补一下；"
-                f"完整改动请看仓库根 README.md 与提交历史。\n")
+    subject = args.commit_message.strip().splitlines()[:1]
+    head = f"{subject[0].strip()}\n\n" if subject else ""
+    fallback = (f"## v{version}\n\n{head}"
+                f"README 的「变更记录」里没有 v{version} 这一条（这一版可能是 CI 自动往后走的 "
+                f"patch 号——同一个版本号已经发过，就不能再覆盖旧的包）；完整改动看提交历史与仓库根 README.md。\n")
     Path(args.out).write_text(fallback, encoding="utf-8")
     print(f"警告：README 变更记录里没有 v{version}，正文写成占位提示", file=sys.stderr)
     return 0

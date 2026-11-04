@@ -52,3 +52,15 @@ def test_missing_entry_writes_a_placeholder_and_does_not_fail(tmp_path, capsys):
     text = out.read_text(encoding="utf-8")
     assert "v9.9.9" in text and "变更记录" in text
     assert "警告" in capsys.readouterr().err
+
+
+def test_missing_entry_falls_back_to_the_commit_subject(tmp_path, capsys):
+    """CI 自动往后走的那些 patch 号本来就没有条目：正文垫本次提交的第一行，别只剩一句提醒。"""
+    out = tmp_path / "notes.md"
+    assert main(["--version", "9.9.9", "--readme", str(README), "--out", str(out),
+                 "--commit-message", "fix: 托盘后端换成 ayatana 也要记一行\n\n正文别的行不会进来"]) == 0
+
+    text = out.read_text(encoding="utf-8")
+    assert "fix: 托盘后端换成 ayatana 也要记一行" in text
+    assert "正文别的行不会进来" not in text
+    assert "警告" in capsys.readouterr().err
