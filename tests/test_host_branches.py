@@ -326,6 +326,49 @@ def test_tray_backend_log_uses_the_real_icon(app_state):
     assert pystray.Icon.__module__.rsplit(".", 1)[-1] in _last_log_line(app_state)
 
 
+# ---------- 托盘库 import 失败的文案 ----------
+
+def test_tray_import_error_on_linux_lists_the_apt_packages(monkeypatch):
+    """Ubuntu 上这条路缺的是 apt 包，裸 AssertionError 看不出缺什么，文案必须把包名列全。"""
+    from shunshu import tray
+
+    monkeypatch.setattr(tray, "IS_WINDOWS", False)
+    text = tray._tray_import_error(AssertionError())
+
+    assert "AssertionError" in text
+    for pkg in ("python3-gi", "gir1.2-gtk-3.0", "gir1.2-ayatanaappindicator3-0.1",
+                "python3-xlib", "python3-tk"):
+        assert pkg in text
+    assert "install-linux.sh" in text
+
+
+def test_tray_import_error_on_windows_stays_short(monkeypatch):
+    """Windows 上没有 apt 那套，塞包名只会把卡片挤爆。"""
+    from shunshu import tray
+
+    monkeypatch.setattr(tray, "IS_WINDOWS", True)
+    assert tray._tray_import_error(ImportError("no PIL")) == "托盘库导入失败：ImportError: no PIL"
+
+
+def test_tray_import_failure_raises_the_hint(monkeypatch):
+    """import pystray 挂了冒出来的是那句人话，不是原样的裸断言。"""
+    import builtins
+    import importlib
+
+    import shunshu.tray as tray_module
+
+    real_import = builtins.__import__
+
+    def boom(name, *args, **kwargs):
+        if name == "pystray":
+            raise AssertionError
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", boom)
+    with pytest.raises(RuntimeError, match="托盘库导入失败"):
+        importlib.reload(tray_module)
+
+
 # ---------- 单实例 ----------
 
 def test_posix_singleton_branch_with_a_fake_fcntl(tmp_path, monkeypatch):

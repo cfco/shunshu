@@ -8,7 +8,33 @@ import threading
 import time
 from functools import partial
 
-import pystray
+from .host import IS_WINDOWS  # 必须在 import pystray 之前：托盘起不来时的提示按平台分流
+
+
+def _tray_import_error(exc: BaseException) -> str:
+    """把「import pystray 失败」翻译成人能照着做的一句话。
+
+    Linux 上这条路上全是 apt 装的 C 库与 typelib，缺哪一环冒出来的都是裸断言或
+    ValueError（现场只看得见 `AssertionError`，看不出少了什么包），所以文案要把
+    包名列全。
+    """
+    detail = f"{type(exc).__name__}: {exc}"
+    if IS_WINDOWS:
+        return f"托盘库导入失败：{detail}"
+    return (
+        "托盘库导入失败：" + detail + "\n"
+        "Linux 的右键菜单只能用 apt 那套 gi + GTK3，缺任一环都起不来。装齐：\n"
+        "sudo apt install -y python3-gi gir1.2-gtk-3.0 "
+        "gir1.2-ayatanaappindicator3-0.1 python3-xlib python3-tk\n"
+        "或直接重跑安装脚本 scripts/install-linux.sh（它会装依赖、建 venv、再自检一次）"
+    )
+
+
+try:
+    import pystray
+except Exception as exc:
+    raise RuntimeError(_tray_import_error(exc)) from exc
+
 from PIL import Image, ImageDraw
 
 from . import autostart
@@ -17,7 +43,6 @@ from .app import AppState, DuplicateSource
 from .browser import open_in_default_browser
 from .clipboard import extract_url, read_text
 from .config import POLL_MINUTES
-from .host import IS_WINDOWS
 from .instance import acquire_singleton
 from .http import proxy_label
 from .models import (

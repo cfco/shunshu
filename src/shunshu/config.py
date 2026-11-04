@@ -58,19 +58,28 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", "", (text or "").translate(_ZERO_WIDTH)).lower()
 
 
+def _xdg_data_dir() -> Path:
+    """XDG 数据目录里本应用那一个（`~/.local/share/shunshu`，尊重 `XDG_DATA_HOME`）。"""
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return Path(base) / APP_NAME
+
+
 def _base_dir() -> Path:
     """程序基准目录：data/ 就建在它旁边。
 
     打包态取真实 exe（sys.argv[0]）所在目录。Nuitka onefile 运行时 __file__ 位于
     按版本变化的解包临时目录里，用它定位会导致每次升级后书架与 site_proxies 记忆
     全部"丢失"。源码态向上找 pyproject.toml 所在的项目根。
+
+    两条都不中就是 pip/venv 安装态：`__file__` 在 site-packages 里，那里重建虚拟环境
+    就没了，所以落 XDG 数据目录（书架跟着用户走，不跟着环境走）。
     """
     if is_packaged():
         return Path(self_executable()).parent
     for parent in Path(__file__).resolve().parents:
         if (parent / "pyproject.toml").exists():
             return parent
-    return Path(__file__).resolve().parents[2]
+    return _xdg_data_dir()
 
 
 _data_dir_cache: Path | None = None
@@ -79,7 +88,7 @@ _data_dir_cache: Path | None = None
 def data_dir() -> Path:
     """书架与日志的位置：`SHUNSHU_DATA_DIR` 优先，否则程序旁边的 `data/`。
 
-    装到 `/opt/shunshu`（deb）这类 root 所有的位置时，程序旁边根本写不动，直接退到
+    程序装在只读位置时（exe 在 `Program Files` 这类地方）程序旁边根本写不动，直接退到
     XDG 数据目录（`~/.local/share/shunshu`），否则第一次写盘就崩在启动里、现场只看到
     一张「启动失败」卡。只在选路径时试一次，结果缓存（每轮都摸盘没意义）。
     """
