@@ -61,6 +61,16 @@ jobs:
         run: uv run pytest tests/ -v
 
       # ---------- Nuitka 编译 ----------
+      # 版本号先落成数据文件打进产物：Nuitka 的 standalone 目录里没有 dist-info，
+      # importlib.metadata 读不到版本，崩溃日志只能写 v0.0.0（v0.16.0 那次现场就这样，
+      # 看日志认不出是哪一版）。__init__ 在元数据缺失时会退回来读产物里的 VERSION。
+      - name: Write VERSION for the packaged build
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path pyproject.toml -Pattern '^version = "(.+?)"').Matches.Groups[1].Value
+          New-Item -ItemType Directory -Force -Path .tmp | Out-Null
+          Set-Content -Path .tmp\VERSION -Value $version -NoNewline -Encoding ascii
+
       # --assume-yes-for-downloads：Nuitka 要用 Dependency Walker 分析扩展模块依赖，
       # 会问「可以下载吗」，非交互模式下默认答 no 直接 FATAL
       # 入口传包目录 src/shunshu 而不是 __main__.py：产物目录才是 shunshu.dist
@@ -76,6 +86,7 @@ jobs:
             --include-module=zhconv `
             --include-package-data=zhconv `
             --include-module=truststore `
+            --include-data-file=.tmp\VERSION=VERSION `
             --output-dir=dist `
             --no-deployment-flag=self-execution `
             src/shunshu `
@@ -104,6 +115,7 @@ jobs:
             --include-module=zhconv `
             --include-package-data=zhconv `
             --include-module=truststore `
+            --include-data-file=.tmp\VERSION=VERSION `
             --no-deployment-flag=self-execution `
             --output-dir=dist-onefile `
             src/shunshu `
@@ -166,24 +178,25 @@ jobs:
             dist-onefile/shunshu-*-onefile.exe
 
   # ------------------------------------------------------------------
-  # Ubuntu：不出冻结二进制，改成「apt 依赖 + 系统 python3 的 venv + 纯 Python wheel」，
-  # 并且**在 ubuntu:26.10 的容器里把用户那条命令原样跑一遍**。
+  # Ubuntu 产物：照旧出 Nuitka standalone 的 tar.gz 与 deb，但**编译环境换成 ubuntu:26.10
+  # 的容器**（host 仍是 ubuntu-latest，用户态、python3.14、apt 的 gi 都是 26.10 的）。
   #
-  # 为什么撤掉 Nuitka 那条路：右键菜单只有 pystray 的 appindicator/gtk 后端渲染得出来，
-  # 而这两个后端要 apt 的 gi（PyGObject）+ GTK3 + appindicator 的 typelib，pip 装不出 gi。
-  # 以前 Nuitka 会把编译机（24.04）那份 gi 连同系统的整目录 typelib 快照一起打进产物，
-  # 运行时还把 GI_TYPELIB_PATH 指到快照目录（gi 插件的逻辑：环境变量没设就设成它），于是
-  # 目标机自己那套 GTK3/gi 跟快照各说各话。Ubuntu 26.10（gi 3.57、gtk 3.24.52、g-i 1.86）
-  # 上的现场就是一句没有文字的 AssertionError——`gi/overrides/Gdk.py` 里那句
-  # `assert g_type != TYPE_NONE`：typelib 从快照读到了，但本机那个 libgdk 给不出 GdkColor
-  # 的 GType。CI 却在编译机上全绿：快照同时把「目标机缺东西」这件事糊住了。产物能不能对上
-  # 目标机的 gi 全靠运气，所以整条撤掉，Linux 只留 wheel + 安装脚本。
+  # 为什么要换编译环境：右键菜单只有 pystray 的 appindicator/gtk 后端渲染得出来，这两个
+  # 后端要 apt 的 gi（PyGObject）+ GTK3 + appindicator 的 typelib，pip 装不出 gi。以前在
+  # ubuntu-24.04 的 runner 上编，Nuitka 的 gi 插件会把编译机那份 gi 连系统整目录的 typelib
+  # 快照一起打进产物，运行时又把 GI_TYPELIB_PATH 指向快照——换到 Ubuntu 26.10（gi 3.57、
+  # gtk 3.24.52、g-i 1.86）就是本机 libgdk 对不上快照，启动崩成一句没有文字的 AssertionError
+  # （gi/overrides/Gdk.py 里 `assert g_type != TYPE_NONE`），而 CI 在编译机上全绿：快照把
+  # 「目标机缺东西 / 版本对不上」整个糊住了。编译机与目标机是同一个发行版，快照才有意义。
   #
-  # 现在 CI 测的就是目标发行版本身：容器里跑 scripts/install-linux.sh（apt → venv → pip 装
-  # 刚编出来的 wheel → 真起一次托盘），硬门槛照旧是「后端是带菜单的那两个」。
+  # 代价说清楚：这个包的 glibc 下限、python ABI 与 gi 快照都按 26.10 对齐，别的发行版（或
+  # 以后 Ubuntu 换成 gobject-introspection 2.0）不保证跑得起来——所以同一个 Release 上还留
+  # 一份 py3-none-any 的 wheel 与 scripts/install-linux.sh，那条路 gi 全用目标机自己那套。
+  #
+  # 发版动作不变：push 到 main 就自动出包并更新 Release，不需要手动打 tag。
   # ------------------------------------------------------------------
-  install-ubuntu:
-    name: Ubuntu 26.10 install
+  build-ubuntu:
+    name: Ubuntu 26.10 Build
     runs-on: ubuntu-latest
     needs: build
     # Windows job 失败也照样出 Linux 包：两个平台的编译不该互相绑死
@@ -196,55 +209,232 @@ jobs:
     env:
       DEBIAN_FRONTEND: noninteractive
     steps:
-      # 容器 job 的 actions/checkout 要用镜像里的 git/curl/tar，ubuntu 基础镜像不保证有。
-      # xvfb 与 dbus 是给安装脚本最后那步自检用的（容器里没有图形会话，appindicator 又要
-      # 会话总线，dbus-run-session + xvfb-run 才能把托盘真起起来）
+      # 容器 job 里 actions/checkout 要用镜像内的 git/curl/tar，sudo 也不需要（就是 root）。
+      # python3-gi + gir1.2-* 是「有没有右键菜单」的那一线；python3-xlib 是 pystray 的 xorg
+      # 兜底后端；python3-tk 是卡片的渲染层；patchelf/gcc 给 Nuitka 用；xvfb + dbus 给自检用
+      # （appindicator 往会话总线注册，纯 xvfb 没有那条总线）。
+      # 26.10 把 python3-tk / python3-xlib / legacy appindicator 的 gir 挪进了 universe，
+      # 干净镜像里 universe 未必开着，先开；两个 appindicator typelib 包都试装——pystray 先试
+      # AppIndicator3、ValueError 才退 AyatanaAppIndicator3，只装一个时另一个在 Nuitka 分析
+      # 阶段解析不到 typelib 会直接 FATAL。DBus-1.0.typelib 由 gir1.2-freedesktop 带，
+      # pystray/_util/notify_dbus.py 在 import 时无条件 require_version('DBus','1.0')。
       - name: Bootstrap the container
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git curl ca-certificates tar \
-            python3 python3-venv python3-pip xvfb dbus
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates tar xz-utils \
+            software-properties-common \
+            python3 python3-venv python3-pip python3-dev python3-tk \
+            python3-gi python3-xlib patchelf gcc \
+            gir1.2-glib-2.0 gir1.2-freedesktop gir1.2-gtk-3.0 libgtk-3-0t64 \
+            xvfb dbus
+          add-apt-repository -y universe || true
+          apt-get update || true
+          for pkg in gir1.2-appindicator3-0.1 gir1.2-ayatanaappindicator3-0.1; do
+            apt-get install -y --no-install-recommends "$pkg" \
+              || echo "这个发行版没有 $pkg，pystray 会退到另一个后端"
+          done
 
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Resolve version
         id: version
-        run: echo "value=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' pyproject.toml | head -1)" >> "$GITHUB_OUTPUT"
+        run: |
+          v=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' pyproject.toml | head -1)
+          echo "value=$v" >> "$GITHUB_OUTPUT"
+          # Nuitka 的产物里没有 dist-info，importlib.metadata 读不到版本，崩溃日志会写成
+          # v0.0.0（v0.16.0 那次现场就是这样）。把版本号当数据文件打进产物，__init__ 退回来读它
+          mkdir -p .tmp
+          printf '%s' "$v" > .tmp/VERSION
 
-      # 纯 Python、没有 C 扩展，所以一个 py3-none-any 通吃 3.12/3.13/3.14。gi 故意不进 wheel，
-      # 由 apt 提供——这正是同一个包能跨发行版的原因，也是与 Nuitka 那条路的根本区别。
-      # 系统 python 被 PEP 668 标成 externally-managed，所以 uv 装在临时 venv 里，不用
-      # --break-system-packages 去动系统环境。
-      - name: Build wheel
+      # 依赖版本仍由 uv.lock 说了算（uv export 出来喂 pip），但解释器必须是 apt 那个 python3，
+      # 否则看不见 gi。系统 python 被 PEP 668 标成 externally-managed，所以 uv 装在临时 venv 里
+      - name: Create venv on the system interpreter
         run: |
           python3 -m venv .venv-build
           .venv-build/bin/python -m pip install --quiet uv
+          .venv-build/bin/uv export --frozen --no-dev --no-hashes --no-emit-project -o .tmp/requirements.txt
+          python3 -m venv --system-site-packages .venv-linux
+          .venv-linux/bin/python -m pip install --quiet -U pip
+          .venv-linux/bin/python -m pip install --quiet -r .tmp/requirements.txt pytest nuitka
+          .venv-linux/bin/python -c "import gi; gi.require_version('Gtk', '3.0'); \
+            from gi.repository import Gtk; print('gi + Gtk 3.0 ok')"
+
+      - name: Run tests (headless X)
+        run: xvfb-run -a .venv-linux/bin/python -m pytest tests -q
+
+      # ---------- 编译前先把「这台机器能不能用带菜单的后端」问清楚 ----------
+      # 放在 Nuitka 之前是因为它几秒就出结果，而编译 FATAL 要等几分钟才报，现场还只说
+      # 「Typelib file for namespace X not found」，看不出是缺 apt 包还是打包参数的问题。
+      - name: Check tray backends before compiling
+        run: |
+          mkdir -p .tmp
+          xvfb-run -a .venv-linux/bin/python - > .tmp/backend-check.txt 2>&1 <<'PY' || true
+          import gi
+          versions = {"Gtk": "3.0", "GLib": "2.0", "GObject": "2.0", "Gio": "2.0",
+                      "DBus": "1.0", "AppIndicator3": "0.1", "AyatanaAppIndicator3": "0.1"}
+          for namespace, version in versions.items():
+              try:
+                  gi.require_version(namespace, version)
+                  print(f"typelib {namespace} {version}: 有")
+              except ValueError as exc:
+                  print(f"typelib {namespace} {version}: 没有 -> {exc}")
+          for name in ("_appindicator", "_gtk", "_xorg"):
+              try:
+                  __import__("pystray" + "." + name)
+                  print(f"后端 pystray{name}: 能 import")
+              except Exception as exc:
+                  print(f"后端 pystray{name}: 不行 -> {type(exc).__name__}: {exc}")
+          import pystray
+          print("pystray 实际选中的后端:", pystray.Icon.__module__)
+          PY
+          cat .tmp/backend-check.txt
+          {
+            echo "### 编译容器里的托盘后端可用性"
+            echo '```'
+            cat .tmp/backend-check.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -q "pystray 实际选中的后端: pystray._\(appindicator\|gtk\)" .tmp/backend-check.txt \
+            || echo "::warning::编译容器选不到带右键菜单的后端，产物的托盘可能只有图标"
+
+      # ---------- wheel 与安装脚本：给不是 26.10 的机器留的路 ----------
+      # 纯 Python、没有 C 扩展，一个 py3-none-any 通吃 3.12/3.13/3.14；gi 不进包，由 apt 提供
+      - name: Build wheel
+        run: |
           .venv-build/bin/uv build --wheel --out-dir dist-wheel
           ls -l dist-wheel
 
-      # 用户在 26.10 上敲的就是同一条命令，这里只是把「从 Releases 下载 wheel」换成刚编出来的本地文件
-      - name: Run the installer
+      # 用户在 Ubuntu 上敲的就是这一条（这里只把「从 Releases 下载」换成刚编出来的本地 wheel）
+      - name: Run the wheel installer (other releases)
         run: |
           SHUNSHU_WHEEL="$GITHUB_WORKSPACE/dist-wheel/shunshu-${{ steps.version.outputs.value }}-py3-none-any.whl" \
             bash scripts/install-linux.sh
 
-      - name: Show what got installed
+      # 与 Windows 那两条同一组关键参数；差别只在：没有 --windows-console-mode，以及把
+      # Windows/macOS 的后端排除掉。**不要加 --include-package=gi**：gi.repository 的模块是
+      # 运行时按 typelib 动态造的，整包包含会逼 gi 插件去枚举机器上所有 overrides（Vte/Notify/…），
+      # 撞上没装 typelib 的那一个就 FATAL 中断编译
+      - name: Nuitka compile (standalone folder)
         run: |
-          venv="$HOME/.local/share/shunshu/venv"
-          "$venv/bin/python" -c "import shunshu, sys; print('shunshu', shunshu.__version__, '/ python', sys.version.split()[0])"
-          "$venv/bin/python" -c "import gi; gi.require_version('Gtk', '3.0'); \
-            from gi.repository import Gtk, Gdk; print('apt 那份 gi 的 Gdk:', Gdk._version)"
-          ls -l "$HOME/.local/share/shunshu/data" || true
-          echo "--- 自检那 15 秒的输出 ---"; cat /tmp/shunshu-selfcheck.log || true
-          tail -n 20 "$HOME/.local/share/shunshu/data/shunshu.log" || true
+          .venv-linux/bin/python -m nuitka \
+            --standalone \
+            --assume-yes-for-downloads \
+            --enable-plugin=tk-inter \
+            --include-package=shunshu \
+            --include-package=pystray \
+            --nofollow-import-to=pystray._win32 \
+            --nofollow-import-to=pystray._darwin \
+            --include-module=zhconv \
+            --include-package-data=zhconv \
+            --include-module=truststore \
+            --include-data-file=.tmp/VERSION=VERSION \
+            --no-deployment-flag=self-execution \
+            --output-dir=dist-linux \
+            src/shunshu \
+            --output-filename=shunshu
 
-      # 同一套用例在目标发行版 + 系统解释器上再跑一遍：Linux 那几条平台分支只有这里才真跑到
-      - name: Run tests on the installed venv
+      # ---------- 产物自测：CI 能证明的到此为止，见 README 的 Ubuntu 一节 ----------
+      # 空书架跑一遍：验「产物起得来、托盘后端是哪个、卡片子进程真能活过启动窗口」。
+      # 关键一条：跑的就是这个容器里真实的那套 GTK3/gi，产物里打包态读版本号也走 VERSION 文件。
+      - name: Smoke test the built bundle
         run: |
-          venv="$HOME/.local/share/shunshu/venv"
-          "$venv/bin/python" -m pip install --quiet pytest
-          xvfb-run -a "$venv/bin/python" -m pytest tests -q
+          set -uo pipefail
+          data="$RUNNER_TEMP/shunshu-smoke"
+          rm -rf "$data"; mkdir -p "$data"
+          # runner 用 bash -e 执行 step：timeout 返回 124（= 撑到被收掉，正是我们要的）
+          # 会被 -e 当成失败当场中止，后面的判断根本跑不到。必须显式吃下退出码
+          code=0
+          SHUNSHU_DATA_DIR="$data" timeout 30 xvfb-run -a \
+            ./dist-linux/shunshu.dist/shunshu run --boot-delay=1 >"$data/stdout.log" 2>&1 || code=$?
+          echo "--- shunshu.log ---"; cat "$data/shunshu.log" 2>/dev/null || echo "(没有 shunshu.log)"
+          echo "--- stdout/stderr ---"; cat "$data/stdout.log"
+          if [ "$code" -ne 124 ]; then
+            echo "产物没撑到 timeout（exit=$code），启动就崩了"; exit 1
+          fi
+          grep -q "托盘后端:" "$data/shunshu.log" || {
+            echo "没写到托盘后端那行：run() 之前就没跑起来"; exit 1; }
+          backend=$(sed -n 's/.*托盘后端: \([^（]*\).*/\1/p' "$data/shunshu.log" | tail -1)
+          echo "托盘后端：$backend"
+          case "$backend" in
+            _appindicator|_gtk) ;;
+            *) echo "托盘后端是 $backend，产物没有右键菜单，不能发"; exit 1 ;;
+          esac
+          grep -q "顺手 · 启动检查" "$data/alerts.log" || {
+            echo "启动那张卡没记进 alerts.log：notify/show 没走到"; exit 1; }
+          if grep -q "卡片没弹出" "$data/alerts.log"; then
+            echo "卡片子进程弹失败（看上一行的原因）"; exit 1
+          fi
+          echo "托盘后端 \`$backend\`，卡片子进程活着 —— 已写进 Release 说明" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf .tmp/smoke-data; cp -r "$data" .tmp/smoke-data
+          cp .tmp/backend-check.txt .tmp/smoke-data/ 2>/dev/null || true
+
+      - name: Upload smoke log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shunshu-ubuntu-smoke-log
+          path: ".tmp/smoke-data"
+          if-no-files-found: warn
+          retention-days: 7
+
+      # 二进制放压缩包根目录（与 Windows 的 zip 同构）；deb 把那串 .so 搬到 /opt 而不是 apt 装，
+      # typelib 仍然不搬（编译机就是目标发行版，快照对齐，但 apt 那三个包仍要装，见 Depends）
+      - name: Package tar.gz
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          tar -czf "shunshu-$version-linux-x86_64.tar.gz" -C dist-linux/shunshu.dist .
+          ls -lh "shunshu-$version-linux-x86_64.tar.gz"
+
+      - name: Package deb
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.value }}"
+          deb="shunshu-$version-linux-amd64.deb"
+          rm -rf .tmp/deb
+          mkdir -p .tmp/deb/DEBIAN .tmp/deb/opt/shunshu .tmp/deb/usr/bin \
+                   .tmp/deb/usr/share/applications
+          cp -r dist-linux/shunshu.dist/. .tmp/deb/opt/shunshu/
+          ln -s /opt/shunshu/shunshu .tmp/deb/usr/bin/shunshu
+          cat > .tmp/deb/DEBIAN/control <<CTRL
+          Package: shunshu
+          Version: $version
+          Architecture: amd64
+          Section: utils
+          Priority: optional
+          Maintainer: cfco <minyaohua@gmail.com>
+          Depends: python3-tk, gir1.2-gtk-3.0, gir1.2-glib-2.0, gir1.2-freedesktop, libgtk-3-0t64, python3-xlib, gir1.2-appindicator3-0.1 | gir1.2-ayatanaappindicator3-0.1
+          Description: 小说目录页更新监控（托盘常驻 + 弹窗提醒）
+           抓小说目录页、认出章节容器、有新章就在右上角弹卡片。没有窗口界面，
+           添加、删除、改间隔全在托盘右键菜单里。数据目录 ~/.local/share/shunshu。
+           这个包在 ubuntu:26.10 容器里编译，gi/GTK3 与 typelib 快照按该版本对齐；
+           别的发行版请用同一个 Release 里的 wheel + install-linux.sh。
+          CTRL
+          cat > .tmp/deb/usr/share/applications/shunshu.desktop <<DESK
+          [Desktop Entry]
+          Type=Application
+          Name=顺手
+          Exec=/usr/bin/shunshu
+          Terminal=false
+          Categories=Utility;
+          StartupNotify=false
+          DESK
+          dpkg-deb --root-owner-group --build .tmp/deb "$deb"
+          dpkg-deb --info "$deb" | sed -n '1,20p'
+          ls -lh "$deb"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shunshu-linux-x86_64
+          path: |
+            shunshu-*-linux-x86_64.tar.gz
+            shunshu-*-linux-amd64.deb
+            dist-wheel/shunshu-*.whl
+            scripts/install-linux.sh
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Resolve release tag
         id: tag
@@ -267,15 +457,7 @@ jobs:
           body_path: release-notes.md
           fail_on_unmatched_files: true
           files: |
+            shunshu-*-linux-x86_64.tar.gz
+            shunshu-*-linux-amd64.deb
             dist-wheel/shunshu-*.whl
             scripts/install-linux.sh
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: shunshu-ubuntu-wheel
-          path: |
-            dist-wheel/shunshu-*.whl
-            scripts/install-linux.sh
-          if-no-files-found: error
-          retention-days: 7

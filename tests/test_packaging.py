@@ -116,3 +116,31 @@ def test_self_executable_prefers_argv_zero_when_both_exist(monkeypatch, tmp_path
     # 两个文件都在 → 按定义不算 Nuitka 打包态，但 self_executable 仍先信 argv[0]
     assert packaging.is_packaged() is False
     assert os.path.normcase(packaging.self_executable()) == os.path.normcase(str(exe))
+
+
+# ---------- 产物里的版本号 ----------
+
+def test_packaged_version_reads_the_file_beside_the_exe(monkeypatch, tmp_path):
+    """Nuitka 产物没有 dist-info，importlib 读不到版本：崩溃日志的版本靠产物里那个 VERSION。
+
+    v0.16.0 那次 Ubuntu 26.10 的崩溃日志写的是 v0.0.0，看日志根本认不出是哪一版。
+    """
+    import shunshu
+    from shunshu import packaging
+
+    exe = tmp_path / "shunshu"
+    exe.write_bytes(b"")
+    (tmp_path / "VERSION").write_text("0.17.0", encoding="utf-8")
+    monkeypatch.setattr(packaging, "is_packaged", lambda: True)
+    monkeypatch.setattr(packaging, "self_executable", lambda: str(exe))
+
+    assert shunshu._packaged_version() == "0.17.0"
+
+
+def test_packaged_version_is_empty_in_source_mode(monkeypatch):
+    """源码态不猜目录：返回空串，由调用方退回 "0.0.0"。"""
+    import shunshu
+    from shunshu import packaging
+
+    monkeypatch.setattr(packaging, "is_packaged", lambda: False)
+    assert shunshu._packaged_version() == ""
