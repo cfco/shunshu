@@ -6,10 +6,11 @@ readme = "README.md"
 authors = [
     { name = "minyaohua", email = "minyaohua@gmail.com" }
 ]
-# >=3.12 而不是 3.14：Ubuntu 24.04 / Zorin 18 的 apt python3 就是 3.12，而托盘右键菜单
-# 要的后端只能来自 apt 的 python3-gi（pip 装不出 gi）。代码本身没有 3.13+ 的特性
-# （只用 dataclass(slots=True) 这类 3.10 就有的），3.12 上全量用例实跑通过。
-# 本机开发仍由 .python-version 钉在 3.14 上，uv 不会自己降。
+# >=3.12 而不是 3.14：Linux 的托盘右键菜单要的后端只能来自 apt 的 python3-gi（pip 装不出），
+# 而它绑死系统解释器——Ubuntu 24.04 / Zorin 18 是 3.12，Ubuntu 26.10 是 3.14。二进制包在
+# ubuntu:26.10 的容器里编（与目标机同版本），wheel + install-linux.sh 那条路则跟着目标机的
+# python3 走，所以下限仍是 3.12。代码本身没有 3.13+ 的特性（最狠的是 dataclass(slots=True)，
+# 3.10 就有）。本机开发由 .python-version 钉在 3.14，uv 不会自己降。
 requires-python = ">=3.12"
 dependencies = [
     "beautifulsoup4>=4.15.0",
