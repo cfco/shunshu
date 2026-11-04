@@ -166,16 +166,23 @@ def test_linux_packaged_mode_appends_the_apt_gi_dir(monkeypatch):
 
 
 def test_source_mode_and_windows_do_not_touch_sys_path(monkeypatch):
-    """源码态 gi 本来就 import 得到，Windows 没有这个目录，都不该动 sys.path。"""
+    """源码态 gi 本来就 import 得到，Windows 没有这个目录，都不该动 sys.path。
+
+    断言的是「sys.path 没被改」而不是「这个目录不在 sys.path 里」：CI 的 .venv-linux 用
+    --system-site-packages 建（不然看不见 apt 的 gi），Ubuntu 解释器本来就把 dist-packages
+    放进 sys.path，后一种写法在源码态也会误报。
+    """
     from shunshu import packaging
 
     monkeypatch.setattr(sys, "path", list(sys.path))
+    before = list(sys.path)
+
     monkeypatch.setattr(packaging, "IS_WINDOWS", False)
     monkeypatch.setattr(packaging, "is_packaged", lambda: False)
     assert packaging.expose_system_gi() is False
-    assert packaging.SYSTEM_GI_DIR not in sys.path
+    assert sys.path == before
 
     monkeypatch.setattr(packaging, "is_packaged", lambda: True)
     monkeypatch.setattr(packaging, "IS_WINDOWS", True)
     assert packaging.expose_system_gi() is False
-    assert packaging.SYSTEM_GI_DIR not in sys.path
+    assert sys.path == before
