@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import threading
 import time
 from functools import partial
 
 from .host import IS_WINDOWS  # 必须在 import pystray 之前：托盘起不来时的提示按平台分流
-from .packaging import expose_system_gi
+from .packaging import SYSTEM_GI_DIR, expose_system_gi, is_packaged
 
 expose_system_gi()  # Linux 打包态：gi 不在产物里，从 apt 那份拿（见 packaging.expose_system_gi）
 
@@ -88,6 +89,38 @@ def make_icon_image(state: str = "normal") -> Image.Image:
     return img
 
 
+def tray_title(backend_module: str, tooltip: str) -> str:
+    """`_xorg` 把 title 当 WM_NAME，而 Xlib 的 `change_text_property` 按 latin-1 编——
+    中文标题会当场 UnicodeEncodeError 把启动炸掉（2026-11-04 容器冒烟现场就是这个）。
+    这个后端本来也不渲染 tooltip，给它 ASCII。"""
+    if backend_module.endswith("_xorg") and not tooltip.isascii():
+        return "shunshu"
+    return tooltip
+
+
+def gi_probe() -> str:
+    """逐条试出「apt 那套 gi 到底卡在哪一环」，只用来写日志，任何异常都不往外抛。
+
+    pystray 选后端时只把 ImportError 咽掉，掉到 `_xorg` 之后现场只剩一行
+    「托盘后端: _xorg」，分不清是 `import gi` 就没成（产物里不带 gi，靠
+    expose_system_gi 从 dist-packages 取），还是 typelib 缺了哪一个。
+    """
+    bits = [f"打包态={is_packaged()}", f"sys.path 末尾={sys.path[-1] if sys.path else '(空)'}",
+            f"{SYSTEM_GI_DIR} 在 sys.path={SYSTEM_GI_DIR in sys.path}"]
+    try:
+        import gi
+    except BaseException as exc:
+        return "；".join(bits + [f"import gi: {type(exc).__name__}: {exc}"])
+    for namespace, version in (("Gtk", "3.0"), ("AppIndicator3", "0.1"),
+                               ("AyatanaAppIndicator3", "0.1"), ("DBus", "1.0")):
+        try:
+            gi.require_version(namespace, version)
+            bits.append(f"{namespace} ok")
+        except BaseException as exc:
+            bits.append(f"{namespace}: {type(exc).__name__}: {exc}")
+    return "；".join(bits)
+
+
 class TrayApp:
     def __init__(self, state: AppState | None = None, boot_delay: float = 0):
         self.state = state or AppState()
@@ -97,6 +130,7 @@ class TrayApp:
         # 只有开机自启那条命令会传这个（见 autostart.BOOT_DELAY_ARG）；手动启动是 0，当场检查
         self.boot_delay = max(0.0, float(boot_delay))
         self.icon: pystray.Icon | None = None
+        self.backend_module = ""
         self._pending_delete: tuple[str, float] | None = None
         self._status_hint = "启动中"
 
@@ -363,7 +397,7 @@ class TrayApp:
     def _rebuild_menu(self) -> None:
         if self.icon is not None:
             self.icon.menu = self.build_menu()
-            self.icon.title = self._tooltip()
+            self.icon.title = tray_title(self.backend_module, self._tooltip())
 
     def _start_bg(self, fn, *args, **kwargs) -> None:
         """所有后台动作统一从这里起线程：线程里抛异常（写盘失败、站点解析崩了等）
@@ -496,8 +530,8 @@ class TrayApp:
             return
         autostart.repair_if_drifted()
         self._log_tray_backend()
-        self.icon = pystray.Icon("shunshu", title=self._tooltip(), icon=make_icon_image("normal"),
-                                 menu=self.build_menu())
+        self.icon = pystray.Icon("shunshu", title=tray_title(self.backend_module, self._tooltip()),
+                                 icon=make_icon_image("normal"), menu=self.build_menu())
         threading.Thread(target=self._startup_then_loop, name="shunshu-poll", daemon=True).start()
         self.icon.run()
 
@@ -515,12 +549,20 @@ class TrayApp:
         函数 `del` 掉了，`pystray.backend()` 根本不存在；而每个后端文件都自己定义 `Icon`，
         所以它的 `__module__` 就是选中的那一个。
         """
-        name = pystray.Icon.__module__.rsplit(".", 1)[-1]
+        module = pystray.Icon.__module__
+        self.backend_module = module
+        name = module.rsplit(".", 1)[-1]
         append_text(
             self.state.paths.runtime_log,
             f"{now_stamp()} 托盘后端: {name}"
             f"（{'有右键菜单' if name in self._MENU_BACKENDS else '只有图标，没有右键菜单'}）",
         )
+        if name not in self._MENU_BACKENDS and not IS_WINDOWS:
+            # 掉到没有菜单的后端，只报后端名等于没报：把 gi 那一环到底哪里断的写清楚
+            append_text(
+                self.state.paths.runtime_log,
+                f"{now_stamp()} 带菜单的后端起不来: {gi_probe()}",
+            )
 
     def _startup_then_loop(self) -> None:
         if self.boot_delay and self._wait_for_boot():

@@ -293,8 +293,13 @@ def _icon_from(module_name: str):
     return FakeIcon
 
 
-def _last_log_line(app_state) -> str:
-    return app_state.paths.runtime_log.read_text(encoding="utf-8").strip().splitlines()[-1]
+def _log_lines(app_state) -> list[str]:
+    return app_state.paths.runtime_log.read_text(encoding="utf-8").strip().splitlines()
+
+
+def _backend_log_line(app_state) -> str:
+    """后端那一行——掉到没菜单的后端时，它后面还会跟一行原因，不能只看最后一行。"""
+    return [line for line in _log_lines(app_state) if "托盘后端:" in line][-1]
 
 
 @pytest.mark.parametrize("module,verdict", [
@@ -312,7 +317,7 @@ def test_tray_backend_log_says_whether_the_menu_works(app_state, monkeypatch, mo
     monkeypatch.setattr(pystray, "Icon", _icon_from(module))
     tray.TrayApp(app_state)._log_tray_backend()
 
-    line = _last_log_line(app_state)
+    line = _backend_log_line(app_state)
     assert f"托盘后端: {module.rsplit('.', 1)[-1]}（{verdict}）" in line
 
 
@@ -323,7 +328,68 @@ def test_tray_backend_log_uses_the_real_icon(app_state):
     from shunshu import tray
 
     tray.TrayApp(app_state)._log_tray_backend()
-    assert pystray.Icon.__module__.rsplit(".", 1)[-1] in _last_log_line(app_state)
+    assert pystray.Icon.__module__.rsplit(".", 1)[-1] in _backend_log_line(app_state)
+
+
+def test_xorg_backend_also_logs_why_the_menu_backend_failed(app_state, monkeypatch):
+    """pystray 把 ImportError 咽掉了，光一行「_xorg」查不出缺什么：Linux 上必须补一行探针。"""
+    import pystray
+    from shunshu import tray
+
+    monkeypatch.setattr(tray, "IS_WINDOWS", False)
+    monkeypatch.setattr(pystray, "Icon", _icon_from("pystray._xorg"))
+    tray.TrayApp(app_state)._log_tray_backend()
+
+    assert any("带菜单的后端起不来:" in line for line in _log_lines(app_state))
+    reason = [line for line in _log_lines(app_state) if "带菜单的后端起不来:" in line][-1]
+    assert "打包态=" in reason and "import gi" in reason
+
+
+def test_menu_backend_gets_no_probe_line(app_state, monkeypatch):
+    """选到带菜单的后端就别多写一行：CI 的冒烟断言按「最后一行是后端行」在读。"""
+    import pystray
+    from shunshu import tray
+
+    monkeypatch.setattr(tray, "IS_WINDOWS", False)
+    monkeypatch.setattr(pystray, "Icon", _icon_from("pystray._appindicator"))
+    tray.TrayApp(app_state)._log_tray_backend()
+
+    assert len(_log_lines(app_state)) == 1
+
+
+def test_windows_never_runs_the_gi_probe(app_state, monkeypatch):
+    """探针是给 apt 的 gi 用的，Windows 上不该跑。"""
+    import pystray
+    from shunshu import tray
+
+    monkeypatch.setattr(tray, "IS_WINDOWS", True)
+    monkeypatch.setattr(pystray, "Icon", _icon_from("pystray._xorg"))
+    tray.TrayApp(app_state)._log_tray_backend()
+
+    assert len(_log_lines(app_state)) == 1
+
+
+@pytest.mark.parametrize("module,expected", [
+    ("pystray._xorg", "shunshu"),
+    ("pystray._appindicator", "顺手 · 监控 3 本"),
+    ("pystray._gtk", "顺手 · 监控 3 本"),
+    ("pystray._win32", "顺手 · 监控 3 本"),
+])
+def test_tray_title_switches_to_ascii_only_for_xorg(module, expected):
+    """`_xorg` 把 title 当 WM_NAME，Xlib 按 latin-1 编：中文标题会 UnicodeEncodeError 炸掉启动。"""
+    from shunshu.tray import tray_title
+
+    assert tray_title(module, "顺手 · 监控 3 本") == expected
+
+
+def test_gi_probe_reports_without_raising(monkeypatch):
+    """探针只写日志，任何情况都得返回一行字符串。"""
+    from shunshu import tray
+
+    monkeypatch.setattr(tray, "is_packaged", lambda: True)
+    text = tray.gi_probe()
+
+    assert isinstance(text, str) and "打包态=True" in text
 
 
 # ---------- 托盘库 import 失败的文案 ----------
