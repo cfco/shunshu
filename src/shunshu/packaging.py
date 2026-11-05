@@ -61,6 +61,11 @@ def expose_system_gi() -> bool:
     to __all__`，2026-11-04 的 CI 冒烟）。apt 那份 gi 是绑系统解释器 ABI 的 C 扩展，所以
     这条路只在「编译机与目标机同一个 python 小版本」时成立——CI 正是在 ubuntu:26.10 容器里
     编、又在同一个容器里跑产物自检。跨发行版请用同一个 Release 里的 wheel + install-linux.sh。
+
+    只对**挂了路径**这件事有把握还不够：Nuitka 对 `--nofollow-import-to` 的模块默认连运行时
+    import 一起拒（v0.19.3 冒烟里是 `ImportError: Module 'gi' was actively excluded from
+    Nuitka compilation`），所以编译必须带 `--no-deployment-flag=excluded-module-usage`，
+    否则这里挂不挂路径都 import 不到 gi，pystray 一路掉到 `_xorg`。
     """
     if IS_WINDOWS or not is_packaged():
         return False

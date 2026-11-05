@@ -340,8 +340,14 @@ jobs:
                   print("require_version", namespace, "失败:", type(exc).__name__, exc)
           PY
           .venv-linux/bin/python -m nuitka --standalone --assume-yes-for-downloads \
-            --disable-plugins=gi --nofollow-import-to=gi --nofollow-import-to='gi.*' \
-            --output-dir=.tmp/giprobe/out .tmp/giprobe/probe.py
+            --disable-plugins=gi --no-deployment-flag=excluded-module-usage \
+            --nofollow-import-to=gi --nofollow-import-to='gi.*' \
+            --output-filename=probe --output-dir=.tmp/giprobe/out .tmp/giprobe/probe.py
+          # Linux 上不加 --output-filename 时产物叫 probe.bin；v0.19.3 那轮这一步「成功」了但
+          # 探针压根没跑（`.tmp/giprobe/out/probe.dist/probe: not found` 被 || true 糊掉了）。
+          # 找不到可执行就当场说死，别让一条假绿骗人。
+          test -x .tmp/giprobe/out/probe.dist/probe || {
+            echo "探针产物不在预期路径，列一下真名："; ls -l .tmp/giprobe/out/probe.dist; exit 1; }
           .tmp/giprobe/out/probe.dist/probe > .tmp/giprobe/result.txt 2>&1 || true
           cat .tmp/giprobe/result.txt
           {
@@ -412,6 +418,12 @@ jobs:
       # packaging.expose_system_gi() 只在 Linux 打包态把 /usr/lib/python3/dist-packages 挂到
       # sys.path 末尾。代价是这个包绑目标机的 python 小版本（产物是 3.14 的 ABI），跨版本请用
       # 同一个 Release 里的 wheel + install-linux.sh
+      #
+      # `--no-deployment-flag=excluded-module-usage` 是这条路的开关，少它整套都不成立：Nuitka 对
+      # `--nofollow-import-to` 的模块默认在**运行时也拒绝 import**，v0.19.3 的冒烟里产物那行写得很清楚
+      # `import gi: ImportError: Module 'gi' was actively excluded from Nuitka compilation.
+      # Disable with '--no-deployment-flag=excluded-module-usage'` —— 光 append dist-packages 到
+      # sys.path 是没用的，得先把这道闸门放开，pystray 才轮得到 _appindicator。
       - name: Nuitka compile (standalone folder)
         run: |
           .venv-linux/bin/python -m nuitka \
@@ -419,6 +431,7 @@ jobs:
             --assume-yes-for-downloads \
             --enable-plugin=tk-inter \
             --disable-plugins=gi \
+            --no-deployment-flag=excluded-module-usage \
             --nofollow-import-to=gi \
             --nofollow-import-to=gi.* \
             --include-package=shunshu \
