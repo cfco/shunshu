@@ -311,6 +311,46 @@ jobs:
           .venv-linux/bin/python -c "import gi; gi.require_version('Gtk', '3.0'); \
             from gi.repository import Gtk; print('gi + Gtk 3.0 ok')"
 
+      # ---------- 产物里那句 sys.path.append 到底管不管用，单独问 ----------
+      # v0.19.1 的冒烟掉到了 `_xorg`（说明 `import gi` 在产物里就没成），但整包跑一趟要 6 分钟，
+      # 而且只能看出「成了/没成」。这里拿**同一组 gi 参数**编一个几行的探针，一分钟内出结论：
+      # 挂上 dist-packages 之后 `import gi` 是什么结果、四个 typelib 各自 require 得到吗。
+      #
+      # 放在测试之前：v0.19.2 那轮测试步骤一红，这条探针就排在后面压根没跑。它不判失败，
+      # 只回答问题，所以不该被任何一步的红挡在后面。
+      - name: Probe system gi inside a Nuitka bundle
+        run: |
+          mkdir -p .tmp/giprobe
+          cat > .tmp/giprobe/probe.py <<'PY'
+          import sys
+          sys.path.append("/usr/lib/python3/dist-packages")
+          print("sys.path 末尾:", sys.path[-1])
+          try:
+              import gi
+          except BaseException as exc:
+              print("产物里 import gi 失败:", type(exc).__name__, exc)
+              raise SystemExit(0)
+          print("产物里 import gi ok:", gi.__file__)
+          for namespace, version in (("Gtk", "3.0"), ("AppIndicator3", "0.1"),
+                                     ("AyatanaAppIndicator3", "0.1"), ("DBus", "1.0")):
+              try:
+                  gi.require_version(namespace, version)
+                  print("require_version", namespace, "ok")
+              except BaseException as exc:
+                  print("require_version", namespace, "失败:", type(exc).__name__, exc)
+          PY
+          .venv-linux/bin/python -m nuitka --standalone --assume-yes-for-downloads \
+            --disable-plugins=gi --nofollow-import-to=gi --nofollow-import-to='gi.*' \
+            --output-dir=.tmp/giprobe/out .tmp/giprobe/probe.py
+          .tmp/giprobe/out/probe.dist/probe > .tmp/giprobe/result.txt 2>&1 || true
+          cat .tmp/giprobe/result.txt
+          {
+            echo "### 产物里取系统 gi 的探针"
+            echo '```'
+            cat .tmp/giprobe/result.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run tests (headless X)
         run: xvfb-run -a .venv-linux/bin/python -m pytest tests -q
 
@@ -361,43 +401,6 @@ jobs:
         run: |
           SHUNSHU_WHEEL="$GITHUB_WORKSPACE/dist-wheel/shunshu-${{ steps.version.outputs.value }}-py3-none-any.whl" \
             bash scripts/install-linux.sh
-
-      # ---------- 产物里那句 sys.path.append 到底管不管用，单独问 ----------
-      # v0.19.1 的冒烟掉到了 `_xorg`（说明 `import gi` 在产物里就没成），但整包跑一趟要 6 分钟，
-      # 而且只能看出「成了/没成」。这里拿**同一组 gi 参数**编一个几行的探针，一分钟内出结论：
-      # 挂上 dist-packages 之后 `import gi` 是什么结果、四个 typelib 各自 require 得到吗。
-      - name: Probe system gi inside a Nuitka bundle
-        run: |
-          mkdir -p .tmp/giprobe
-          cat > .tmp/giprobe/probe.py <<'PY'
-          import sys
-          sys.path.append("/usr/lib/python3/dist-packages")
-          print("sys.path 末尾:", sys.path[-1])
-          try:
-              import gi
-          except BaseException as exc:
-              print("产物里 import gi 失败:", type(exc).__name__, exc)
-              raise SystemExit(0)
-          print("产物里 import gi ok:", gi.__file__)
-          for namespace, version in (("Gtk", "3.0"), ("AppIndicator3", "0.1"),
-                                     ("AyatanaAppIndicator3", "0.1"), ("DBus", "1.0")):
-              try:
-                  gi.require_version(namespace, version)
-                  print("require_version", namespace, "ok")
-              except BaseException as exc:
-                  print("require_version", namespace, "失败:", type(exc).__name__, exc)
-          PY
-          .venv-linux/bin/python -m nuitka --standalone --assume-yes-for-downloads \
-            --disable-plugins=gi --nofollow-import-to=gi --nofollow-import-to='gi.*' \
-            --output-dir=.tmp/giprobe/out .tmp/giprobe/probe.py
-          .tmp/giprobe/out/probe.dist/probe > .tmp/giprobe/result.txt 2>&1 || true
-          cat .tmp/giprobe/result.txt
-          {
-            echo "### 产物里取系统 gi 的探针"
-            echo '```'
-            cat .tmp/giprobe/result.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
 
       # 与 Windows 那两条同一组关键参数；差别只在：没有 --windows-console-mode、把 Windows/macOS
       # 的后端排除掉，以及 **gi 干脆不编进产物**（--disable-plugins=gi 关掉 gi 插件的 typelib 快照
