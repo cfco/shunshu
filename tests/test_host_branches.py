@@ -342,7 +342,8 @@ def test_xorg_backend_also_logs_why_the_menu_backend_failed(app_state, monkeypat
 
     assert any("带菜单的后端起不来:" in line for line in _log_lines(app_state))
     reason = [line for line in _log_lines(app_state) if "带菜单的后端起不来:" in line][-1]
-    assert "打包态=" in reason and "import gi" in reason
+    # 只断言两条分支都会写出来的那两段：机器上 gi 装得全时压根不会出现 "import gi" 那句
+    assert "打包态=" in reason and "sys.path 末尾=" in reason
 
 
 def test_menu_backend_gets_no_probe_line(app_state, monkeypatch):
