@@ -341,6 +341,7 @@ jobs:
           PY
           .venv-linux/bin/python -m nuitka --standalone --assume-yes-for-downloads \
             --disable-plugins=gi --no-deployment-flag=excluded-module-usage \
+            --include-package=asyncio \
             --nofollow-import-to=gi --nofollow-import-to='gi.*' \
             --output-filename=probe --output-dir=.tmp/giprobe/out .tmp/giprobe/probe.py
           # Linux 上不加 --output-filename 时产物叫 probe.bin；v0.19.3 那轮这一步「成功」了但
@@ -350,10 +351,27 @@ jobs:
             echo "探针产物不在预期路径，列一下真名："; ls -l .tmp/giprobe/out/probe.dist; exit 1; }
           .tmp/giprobe/out/probe.dist/probe > .tmp/giprobe/result.txt 2>&1 || true
           cat .tmp/giprobe/result.txt
+          # 一次把「gi + pystray 那条链到底要多少模块」列全：产物不冻结 gi，Nuitka 看不见它的
+          # 依赖，缺一个就得再等一轮冒烟才知道（v0.19.4 缺的就是 asyncio）。有了这张表，下一轮
+          # 要补什么一次补完。
+          xvfb-run -a .venv-linux/bin/python - > .tmp/giprobe/venv-deps.txt 2>&1 <<'PY' || true
+          import sys
+          import gi
+          gi.require_version('Gtk', '3.0')
+          from gi.repository import Gtk  # noqa: F401
+          import pystray  # 导入期就会把带菜单的后端整条链拉起来
+          tops = sorted({m.split('.')[0] for m in sys.modules if m})
+          std = [m for m in tops if m in getattr(sys, 'stdlib_module_names', ())]
+          other = [m for m in tops if m not in getattr(sys, 'stdlib_module_names', ())]
+          print('标准库:', ' '.join(std))
+          print('非标准库:', ' '.join(other))
+          PY
+          cat .tmp/giprobe/venv-deps.txt
           {
             echo "### 产物里取系统 gi 的探针"
             echo '```'
             cat .tmp/giprobe/result.txt
+            cat .tmp/giprobe/venv-deps.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -424,6 +442,11 @@ jobs:
       # `import gi: ImportError: Module 'gi' was actively excluded from Nuitka compilation.
       # Disable with '--no-deployment-flag=excluded-module-usage'` —— 光 append dist-packages 到
       # sys.path 是没用的，得先把这道闸门放开，pystray 才轮得到 _appindicator。
+      #
+      # 闸门放开后又撞上 `import gi: ModuleNotFoundError: No module named 'asyncio'`（v0.19.4）：
+      # gi 不在冻结图里，它依赖链上的**标准库**Nuitka 也一并看不见，所以要显式 --include-package
+      # 把 gi 用得着的 asyncio 带进产物。整张「gi + pystray 需要哪些模块」的表由上面那条探针步骤
+      # 在容器里现场列出来，缺什么一次补完，不再一轮试一个。
       - name: Nuitka compile (standalone folder)
         run: |
           .venv-linux/bin/python -m nuitka \
@@ -432,6 +455,7 @@ jobs:
             --enable-plugin=tk-inter \
             --disable-plugins=gi \
             --no-deployment-flag=excluded-module-usage \
+            --include-package=asyncio \
             --nofollow-import-to=gi \
             --nofollow-import-to=gi.* \
             --include-package=shunshu \

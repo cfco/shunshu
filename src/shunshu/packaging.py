@@ -66,6 +66,10 @@ def expose_system_gi() -> bool:
     import 一起拒（v0.19.3 冒烟里是 `ImportError: Module 'gi' was actively excluded from
     Nuitka compilation`），所以编译必须带 `--no-deployment-flag=excluded-module-usage`，
     否则这里挂不挂路径都 import 不到 gi，pystray 一路掉到 `_xorg`。
+
+    还有第二层看不见：gi 不在冻结图里，它依赖链上的**标准库**Nuitka 也跟着看不见，得在编译
+    参数里显式带上（v0.19.4 现场是 `ModuleNotFoundError: No module named 'asyncio'`——PyGObject
+    3.57 的 gi 要 asyncio）。缺哪个就照 `import gi` 报的那个名字补 `--include-package`。
     """
     if IS_WINDOWS or not is_packaged():
         return False
