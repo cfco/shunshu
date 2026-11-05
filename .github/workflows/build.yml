@@ -374,6 +374,12 @@ jobs:
             cat .tmp/giprobe/venv-deps.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          # 探针也要能失败：`|| true` 只负责让输出先贴出来，结论在这里判。产物里 import gi
+          # 或 Gtk typelib 不行时，后面整包编译 + 冒烟必然红——现在就叫停，别白等八分钟。
+          grep -q "产物里 import gi ok" .tmp/giprobe/result.txt || {
+            echo "探针产物里 import gi 没成（见上面 result.txt），整包不可能选到带菜单的后端"; exit 1; }
+          grep -q "require_version Gtk ok" .tmp/giprobe/result.txt || {
+            echo "探针产物里 Gtk typelib 用不了：_appindicator 和 _gtk 都靠它"; exit 1; }
 
       - name: Run tests (headless X)
         run: xvfb-run -a .venv-linux/bin/python -m pytest tests -q
@@ -502,7 +508,7 @@ jobs:
           if grep -q "卡片没弹出" "$data/alerts.log"; then
             echo "卡片子进程弹失败（看上一行的原因）"; exit 1
           fi
-          echo "托盘后端 \`$backend\`，卡片子进程活着 —— 已写进 Release 说明" >> "$GITHUB_STEP_SUMMARY"
+          echo "托盘后端 \`$backend\`，卡片子进程活着 —— 记在本步骤摘要里" >> "$GITHUB_STEP_SUMMARY"
           rm -rf .tmp/smoke-data; cp -r "$data" .tmp/smoke-data
           cp .tmp/backend-check.txt .tmp/smoke-data/ 2>/dev/null || true
 
@@ -515,8 +521,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # 二进制放压缩包根目录（与 Windows 的 zip 同构）；deb 把那串 .so 搬到 /opt 而不是 apt 装，
-      # typelib 仍然不搬（编译机就是目标发行版，快照对齐，但 apt 那三个包仍要装，见 Depends）
+      # 二进制放压缩包根目录（与 Windows 的 zip 同构）；deb 把那串 .so 搬到 /opt 而不是 apt 装。
+      # 系统侧依赖一律走 Depends：gi 从 v0.19.0 起就不进产物，Nuitka 目录里也没有 typelib 快照可搬。
       - name: Package tar.gz
         run: |
           version="${{ steps.version.outputs.value }}"
