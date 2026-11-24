@@ -75,6 +75,40 @@ def test_timeout_is_classified_as_connection_failure(monkeypatch):
         fetcher.fetch_html("https://a.com/")
 
 
+def test_body_read_timeout_is_not_a_connection_failure(monkeypatch):
+    """响应头已经拿到，正文超时说明网络路径通，不能据此给站点切代理。"""
+    class BodyTimeoutResp(_FakeResp):
+        def iter_content(self, chunk_size):
+            raise requests.exceptions.ReadTimeout("body timed out")
+
+    fetcher = Fetcher("ua", retries=0, backoff=0)
+    monkeypatch.setattr(fetcher.session, "get", lambda *a, **k: BodyTimeoutResp())
+    with pytest.raises(FetchError) as excinfo:
+        fetcher.fetch_html("https://a.com/")
+    assert not isinstance(excinfo.value, ConnectionFailureError)
+
+
+def test_connection_failure_after_body_timeout_uses_the_last_attempt_state(monkeypatch):
+    class BodyTimeoutResp(_FakeResp):
+        def iter_content(self, chunk_size):
+            raise requests.exceptions.ReadTimeout("body timed out")
+
+    calls = 0
+
+    def get(url, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return BodyTimeoutResp()
+        raise requests.exceptions.ConnectionError("[WinError 10061] connection refused")
+
+    fetcher = Fetcher("ua", retries=1, backoff=0)
+    monkeypatch.setattr(fetcher.session, "get", get)
+    with pytest.raises(ConnectionFailureError):
+        fetcher.fetch_html("https://a.com/")
+    assert calls == 2
+
+
 def test_ssl_error_stays_a_plain_fetch_error(monkeypatch):
     """SSL 握手失败时 TCP 其实连上了：不当连接失败，探测也不会据此误切代理。"""
 
@@ -86,6 +120,18 @@ def test_ssl_error_stays_a_plain_fetch_error(monkeypatch):
     with pytest.raises(FetchError) as excinfo:
         fetcher.fetch_html("https://a.com/")
     assert not isinstance(excinfo.value, ConnectionFailureError)
+
+
+def test_target_hostname_with_proxy_word_is_not_a_proxy_failure(monkeypatch):
+    fetcher = Fetcher("ua", retries=0, backoff=0)
+
+    def disconnected(url, **kwargs):
+        raise requests.exceptions.ConnectionError(f"{url} disconnected")
+
+    monkeypatch.setattr(fetcher.session, "get", disconnected)
+    with pytest.raises(FetchError) as excinfo:
+        fetcher.fetch_html("https://proxy-book.example.com/", "http://127.0.0.1:7890")
+    assert not isinstance(excinfo.value, http.ProxyError)
 
 
 # ---------- 常驻线程池 ----------

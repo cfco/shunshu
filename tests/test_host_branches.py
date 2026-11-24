@@ -8,7 +8,6 @@ IS_WINDOWS 一律用 monkeypatch 改模块全局，所以分支必须写在函�
 from __future__ import annotations
 
 import os
-import shlex
 import sys
 from pathlib import Path
 
@@ -62,13 +61,14 @@ def test_xdg_autostart_detects_drift(linux_autostart, tmp_path):
 
 
 def test_linux_command_quotes_a_path_with_spaces(linux_autostart, monkeypatch, tmp_path):
-    """Exec 行按 shell 规则转义：带空格的解释器路径不能被拆成两个参数。"""
+    """Exec 不是 shell：带空格的解释器路径必须用 Desktop Entry 的双引号规则。"""
     interpreter = tmp_path / "my python"
     interpreter.write_text("")
     monkeypatch.setattr(sys, "executable", str(interpreter))
 
     command = linux_autostart.current_command()
-    assert command == f"{shlex.quote(str(interpreter))} -m shunshu run --boot-delay=60"
+    quoted = str(interpreter).replace("\\", "\\\\")
+    assert command == (f'"{quoted}" "-m" "shunshu" "run" "--boot-delay=60"')
     assert linux_autostart._entry_path(command) == interpreter
 
 
@@ -225,12 +225,54 @@ def test_linux_browser_falls_back_to_xdg_open(monkeypatch):
     from shunshu import browser
 
     calls: list[list[str]] = []
+
+    def launch(command):
+        calls.append(command)
+        return not calls[:-1]
+
     monkeypatch.setattr(browser, "IS_WINDOWS", False)
-    monkeypatch.setattr(browser.webbrowser, "open", lambda _url: False)
-    monkeypatch.setattr(browser.subprocess, "run",
-                        lambda command, **_k: calls.append(list(command)) or FakeResult())
+    monkeypatch.delenv("BROWSER", raising=False)
+    monkeypatch.setattr(browser, "_launch", launch)
     assert browser.open_in_default_browser("https://a.com/b") is True
     assert calls == [["xdg-open", "https://a.com/b"]]
+
+
+def test_linux_browser_launch_is_bounded(monkeypatch):
+    from shunshu import browser
+
+    class SlowLauncher:
+        def __init__(self):
+            self.timeouts = []
+
+        def wait(self, timeout):
+            self.timeouts.append(timeout)
+            raise browser.subprocess.TimeoutExpired("browser", timeout)
+
+    proc = SlowLauncher()
+    reaped = []
+    monkeypatch.setattr(browser.subprocess, "Popen", lambda *a, **k: proc)
+    monkeypatch.setattr(browser, "_reap", reaped.append)
+    monkeypatch.setattr(browser.webbrowser, "open",
+                        lambda *a, **k: pytest.fail("Linux 不能走会无限等待的 webbrowser"))
+    assert browser._launch(["browser"]) is True
+    assert proc.timeouts == [browser._LAUNCH_GRACE_SECONDS]
+    assert reaped == [proc]
+
+
+def test_linux_browser_uses_browser_env_before_xdg_open(monkeypatch):
+    from shunshu import browser
+
+    calls = []
+
+    def launch(command):
+        calls.append(command)
+        return len(calls) == 1
+
+    monkeypatch.setattr(browser, "IS_WINDOWS", False)
+    monkeypatch.setenv("BROWSER", "firefox --new-window %s")
+    monkeypatch.setattr(browser, "_launch", launch)
+    assert browser.open_in_default_browser("https://a.com/b") is True
+    assert calls == [["firefox", "--new-window", "https://a.com/b"]]
 
 
 def test_windows_browser_still_prefers_startfile(monkeypatch):
@@ -262,7 +304,7 @@ def test_open_data_dir_on_linux_uses_xdg_open(app_state, monkeypatch):
     monkeypatch.setattr(tray, "IS_WINDOWS", False)
     monkeypatch.setattr(tray.subprocess, "run",
                         lambda command, **_k: calls.append(list(command)) or FakeResult())
-    tray.TrayApp(app_state).act_open_data_dir()
+    tray.TrayApp(app_state)._open_data_dir()
     assert calls == [["xdg-open", str(app_state.paths.root)]]
 
 
@@ -277,8 +319,28 @@ def test_open_data_dir_reports_a_missing_launcher(app_state, monkeypatch):
         raise FileNotFoundError(command[0])
 
     monkeypatch.setattr(tray.subprocess, "run", missing)
-    tray.TrayApp(app_state).act_open_data_dir()
+    tray.TrayApp(app_state)._open_data_dir()
     assert "打不开数据目录" in popped[0][0]["title"]
+
+
+def test_external_menu_actions_are_dispatched_to_background(app_state, monkeypatch):
+    from shunshu import tray
+
+    calls = []
+    app = tray.TrayApp(app_state)
+    monkeypatch.setattr(app, "_start_bg", lambda fn, *args: calls.append((fn, args)))
+    monkeypatch.setattr(tray, "read_text",
+                        lambda: pytest.fail("菜单线程不能同步读剪贴板"))
+    monkeypatch.setattr(tray, "open_in_default_browser",
+                        lambda url: pytest.fail("菜单线程不能同步等浏览器"))
+
+    app.act_add_from_clipboard()
+    app.act_add_source_from_clipboard("n1")
+    app.act_open_latest("n1")
+    app.act_open_data_dir()
+
+    assert [fn.__name__ for fn, _args in calls] == [
+        "_add_from_clipboard", "_add_source_from_clipboard", "_open_latest", "_open_data_dir"]
 
 
 # ---------- 托盘后端留痕 ----------

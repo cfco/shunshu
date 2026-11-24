@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import asdict, dataclass, field
 from posixpath import normpath
@@ -59,8 +60,9 @@ def _to_int(value, default: int = 0) -> int:
     if isinstance(value, bool):
         return default
     try:
-        return int(float(value))
-    except (TypeError, ValueError):
+        number = float(value)
+        return int(number) if math.isfinite(number) else default
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -70,8 +72,9 @@ def _to_opt_int(value) -> int | None:
     if value is None or isinstance(value, bool):
         return None
     try:
-        return int(float(value))
-    except (TypeError, ValueError):
+        number = float(value)
+        return int(number) if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -326,7 +329,8 @@ class Source:
         payload = {k: v for k, v in data.items() if k in known}
         # novels.json 是要给人手改的：这几个字段写成 null、数字或漏了引号，都只是这一条不好使，
         # 不该让 AttributeError 冒到加载循环外面把整个工具拦在启动阶段
-        for key in ("id", "toc_url", "site", "title", "proxy"):
+        for key in ("id", "toc_url", "site", "title", "proxy", "latest_title", "latest_url",
+                    "status", "status_detail", "last_error", "created_at"):
             payload[key] = str(payload.get(key) or "")
         if payload.get("selector"):
             payload["selector"] = str(payload["selector"])
@@ -337,8 +341,10 @@ class Source:
         # 逃出兜底就掀掉整轮（漏记账、不弹卡，日志只剩一行「轮询异常」，托盘看着正常）。
         # `"false"` 这类真值字符串也一样：不转成 bool 就永远停不掉一个源
         for key in ("chapter_count", "consecutive_failures", "pages_followed"):
-            payload[key] = _to_int(payload.get(key))
+            payload[key] = max(0, _to_int(payload.get(key)))
         payload["latest_number"] = _to_opt_int(payload.get("latest_number"))
+        if payload["latest_number"] is not None:
+            payload["latest_number"] = max(0, payload["latest_number"])
         for key in ("enabled", "baseline_set"):
             payload[key] = _to_bool(payload.get(key))
         return cls(**payload)
@@ -427,6 +433,7 @@ class Novel:
         payload = {k: v for k, v in data.items() if k in known}
         payload["title"] = str(payload.get("title") or "")
         payload["primary_id"] = str(payload.get("primary_id") or "")
+        payload["created_at"] = str(payload.get("created_at") or "")
         payload["id"] = str(payload.get("id") or "")
         # 来源被写成字符串（少打一对花括号）时丢掉那一条，别把整本带下水
         raw_sources = payload.get("sources")
@@ -442,7 +449,7 @@ class Novel:
             if isinstance(entry, dict) and entry.get("k"):
                 entries.append(ChapterEntry(k=str(entry["k"]), t=str(entry.get("t") or ""),
                                             u=str(entry.get("u") or ""), s=str(entry.get("s") or ""),
-                                            n=entry.get("n"), ts=str(entry.get("ts") or "")))
+                                            n=_to_opt_int(entry.get("n")), ts=str(entry.get("ts") or "")))
         payload["chapter_index"] = entries
         return cls(**payload)
 

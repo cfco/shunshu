@@ -21,6 +21,7 @@ class Scheduler:
         self._busy = threading.Lock()
         # 每个来源的下一轮最早可检查时间戳（秒），用于退避
         self._next_due: dict[str, float] = {}
+        self._due_sources: dict[str, object] = {}
         self.last_round_at: float | None = None
 
     def next_wait_seconds(self) -> float:
@@ -29,7 +30,17 @@ class Scheduler:
 
     def due_skip_ids(self, now: float) -> set[str]:
         """返回所有还没到退避结束时间、本轮应该跳过的来源 id。"""
+        current = {source.id: source for source in self.state.sources}
+        for sid in list(self._next_due):
+            source = current.get(sid)
+            if source is None or not source.enabled or self._due_sources.get(sid) is not source:
+                self._next_due.pop(sid, None)
+                self._due_sources.pop(sid, None)
         return {sid for sid, due in self._next_due.items() if due > now}
+
+    def forget(self, source_id: str) -> None:
+        self._next_due.pop(source_id, None)
+        self._due_sources.pop(source_id, None)
 
     def after_round(self, outcomes, skipped: set[str] | None = None) -> None:
         """根据本轮结果更新每个来源的退避时间表。
@@ -52,9 +63,11 @@ class Scheduler:
                 # 连续失败越多，跳过越长；封顶 8 倍间隔，避免永远跳不过去
                 factor = min(2 ** (source.consecutive_failures - threshold + 1), 8)
                 self._next_due[source.id] = now + interval * factor
+                self._due_sources[source.id] = source
             else:
                 # 成功或失败次数还没到阈值，清掉退避
                 self._next_due.pop(source.id, None)
+                self._due_sources.pop(source.id, None)
 
     def wait_for_stop(self, seconds: float) -> bool:
         """等这么多秒；期间点了「退出」就提前返回 True，调用方据此跳过启动那一轮。"""

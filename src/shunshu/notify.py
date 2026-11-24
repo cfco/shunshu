@@ -28,8 +28,11 @@ class Notifier:
         # 还挂在屏幕上的卡片：键（哪本书 / 哪句提示）→ (卡片进程, 槽位号)。卡片活到被看过
         # 为止，父进程只能靠自己攥着进程句柄来知道谁还在、谁占了哪个槽位；插入顺序＝从旧到新
         self._live: dict[str, tuple[object | None, int]] = {}
-        # 已经被人看过（卡片自己退出的）的键，等主程序来收走并清它的补弹账
-        self._acked: set[str] = set()
+        self._generations: dict[str, int] = {}
+        self._card_keys: dict[str, frozenset[str]] = {}
+        self._generation = 0
+        # 已经被人看过（卡片自己退出的）的键及其章节快照，等主程序来收走并清它的补弹账
+        self._acked: dict[str, set[str]] = {}
         # 定时轮与添加书源首轮可能在两条线程上同时弹卡：分配与记账必须互斥，否则
         # 两边各自数出同一个槽位号，两张卡叠在同一位置
         self._lock = threading.Lock()
@@ -45,13 +48,17 @@ class Notifier:
         # 日志记的就是卡片上显示的那几行：alerts.log 要能对上现场，别记另一套章节
         record = [row["t"] for row in rows]
         return self._present(make_payload(alert.title(), chapters=rows, novel=novel.id),
-                             record, novel.id, rows[0]["u"])
+                             record, novel.id, rows[0]["u"], {entry.k for entry in alert.entries})
 
     def notify_many(self, alerts: list[NovelAlert]) -> bool:
         """每本一张卡片，各自占一个空着的槽位（popup 再按屏幕高度自动换列），不合并成一条。"""
-        for alert in alerts:
-            self.notify_alert(alert)
-        return bool(alerts)
+        results = [self.notify_alert(alert) for alert in alerts]
+        return bool(alerts) and all(results)
+
+    def has_live(self, key: str) -> bool:
+        with self._lock:
+            self._collect_acks()
+            return key in self._live
 
     def show(self, title: str, lines: list[str], url: str = "") -> bool:
         """普通提示（启动摘要、菜单操作反馈）：只有文字，没有可点章节。
@@ -62,30 +69,38 @@ class Notifier:
         shown = lines[:_CARD_LINES]  # 卡片只显示这几行，日志也记这几行，现场才对得上
         payload = make_payload(title, lines=shown)
         self._record(title, shown, launch)
-        return self._spawn(payload, title)
+        return self._spawn(payload, title, set())
 
     # ---------- 内部 ----------
 
-    def _present(self, payload: dict, record: list[str], key: str, url: str) -> bool:
+    def _present(self, payload: dict, record: list[str], key: str, url: str,
+                 chapter_keys: set[str] | None = None) -> bool:
         launch = _safe_url(url)
         self._record(payload["title"], record, launch)
-        return self._spawn(payload, key)
+        return self._spawn(payload, key, chapter_keys or set())
 
-    def _reserve(self, key: str) -> int:
+    def _reserve(self, key: str, chapter_keys: set[str]) -> tuple[int, int, frozenset[str]] | None:
         """给这张卡腾出槽位：同一本书的旧卡先收掉，整屏摆满就收掉最旧那张。
 
         先把槽位记成 (None, index) 占住，弹完再由 _settle 补上进程或把槽位还回去——
         占住的过程不能被别的线程插进来，否则两边会数出同一个号。
         """
         with self._lock:
+            if not self.enabled:
+                return None
             self._collect_acks()
             self._retire(key)
             while len(self._live) >= _MAX_LIVE_CARDS:
                 self._retire(next(iter(self._live)))
             used = {index for _proc, index in self._live.values()}
             index = next(i for i in range(len(used) + 1) if i not in used)
+            self._generation += 1
+            generation = self._generation
             self._live[key] = (None, index)
-            return index
+            self._generations[key] = generation
+            snapshot = frozenset(chapter_keys)
+            self._card_keys[key] = snapshot
+            return index, generation, snapshot
 
     def _collect_acks(self) -> None:
         """把已经消失的卡片从账上摘掉，自己退出去的那张记成「看过了」。
@@ -102,8 +117,10 @@ class Notifier:
             if code is None:
                 continue          # 还挂在屏幕上
             del self._live[key]
+            self._generations.pop(key, None)
+            snapshot = self._card_keys.pop(key, frozenset())
             if code == 0:
-                self._acked.add(key)
+                self._acked.setdefault(key, set()).update(snapshot)
             elif not self.enabled:
                 continue          # 正在退出，被我们 terminate 的那些不算异常
             else:
@@ -113,9 +130,12 @@ class Notifier:
 
     def take_acked(self) -> list[str]:
         """主程序每轮来收一次：这些键的卡片已经被用户看过了，可以清补弹的账。"""
+        return sorted(self.take_acked_chapters())
+
+    def take_acked_chapters(self) -> dict[str, set[str]]:
         with self._lock:
             self._collect_acks()
-            acked = sorted(self._acked)
+            acked = {key: set(keys) for key, keys in self._acked.items()}
             self._acked.clear()
             return acked
 
@@ -123,24 +143,40 @@ class Notifier:
         """退出时把还挂着的卡片一起收掉：不留没人认领的窗口，下次启动按「没看过」补弹。"""
         # 先关闸：正在跑的那一轮可能在我收完窗口之后才 notify_many，那时再 spawn 就是一张
         # 永远没人划过、也没人收的无主卡片（主进程已经退出了，句柄跟着没了）
-        self.enabled = False
         with self._lock:
+            self.enabled = False
             live, self._live = self._live, {}
+            self._generations.clear()
+            self._card_keys.clear()
             self._acked.clear()   # 正在退出了，别把这一轮的 ack 留给下一份 Notifier
         for proc, _index in live.values():
             if proc is not None:
                 self._close(proc)
 
-    def _settle(self, key: str, proc, index: int) -> None:
+    def _settle(self, key: str, proc, index: int, generation: int,
+                snapshot: frozenset[str]) -> None:
+        stale = False
+        seen = False
         with self._lock:
-            if proc is None:
-                self._live.pop(key, None)  # 没弹出来（或弹完就自己退了），槽位还回去
+            if not self.enabled or self._generations.get(key) != generation:
+                stale = True
+                seen = bool(self.enabled and proc is not None and proc.poll() == 0)
+                if seen:
+                    self._acked.setdefault(key, set()).update(snapshot)
+            elif proc is None:
+                self._live.pop(key, None)
+                self._generations.pop(key, None)
+                self._card_keys.pop(key, None)
             else:
                 self._live[key] = (proc, index)
+        if stale and proc is not None and not seen:
+            self._close(proc)
 
     def _retire(self, key: str) -> None:
         """把一张卡从账上摘掉，顺手关掉它（账上没有就什么都不做）。"""
         proc, _index = self._live.pop(key, (None, -1))
+        self._generations.pop(key, None)
+        self._card_keys.pop(key, None)
         if proc is None:
             return  # 别的线程正在弹的那张，进程还没起来
         self._close(proc)
@@ -152,13 +188,14 @@ class Notifier:
         except OSError:
             pass  # 刚好已经自己退出的进程，TerminateProcess 会报错，结果一样：卡片不在了
 
-    def _spawn(self, payload: dict, key: str) -> bool:
+    def _spawn(self, payload: dict, key: str, chapter_keys: set[str]) -> bool:
         """弹不出来时把原因补记一行：现场只有 alerts.log 一份东西可看。"""
-        if not self.enabled:
+        reserved = self._reserve(key, chapter_keys)
+        if reserved is None:
             return False
-        index = self._reserve(key)
+        index, generation, snapshot = reserved
         error, proc = spawn_card(payload, index)
-        self._settle(key, proc, index)
+        self._settle(key, proc, index, generation, snapshot)
         if error:
             self._record(f"{payload['title']} · 卡片没弹出", [error], "")
             return False
@@ -207,7 +244,7 @@ def spawn_card(payload: dict, index: int = 0) -> tuple[str, object | None]:
     except subprocess.TimeoutExpired:
         return "", proc   # 活过了启动窗口就算弹出来了（卡片会挂到被点或被划过）
     if code is None or code == 0:
-        return "", None   # 已经自己退出了，账上没什么可记
+        return "", proc   # 正常退出也要交回句柄，父进程才能把它记成「已经看过」
     return f"卡片进程秒退 exit={code}，命令 {command[1:3]}", None
 
 

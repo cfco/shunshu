@@ -37,6 +37,11 @@ def test_parenthetical_notes_are_dropped_for_matching():
     assert key_for("第120章 风雪夜归人(加更)") == key_for("第120章 风雪夜归人")
 
 
+def test_semantic_parentheses_remain_part_of_chapter_identity():
+    assert key_for("第1章 归来（上）") != key_for("第1章 归来（下）")
+    assert key_for("第1章 归来（上）") == key_for("第1章 归来（上）（求月票）")
+
+
 def test_chapter_without_any_title_falls_back_to_number():
     assert key_for("第120章") == "000120|#120"
     assert key_for("第121章") != key_for("第120章")

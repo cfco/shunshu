@@ -112,11 +112,11 @@ def check_source(novel: Novel, source: Source, rules: Rules, fetcher: Fetcher,
                       f"一次出现 {len(new)} 个新章节标识，疑似章节重编号，已记录不提醒")
 
     latest = chapters[-1]
+    _history(paths, novel, source, "update", new, latest)
     _commit(novel, source, loaded, chapters, latest, rules=rules)
     source.status = STATUS_UPDATED
     source.status_detail = f"新增 {len(new)} 章"
     display = new[-rules.cfg.history_display_cap:]
-    _history(paths, novel, source, "update", new, latest)
     return Outcome(novel=novel, source=source, status=STATUS_UPDATED, new_chapters=display,
                    new_count=len(new), latest=latest, message=f"更新 {len(new)} 章",
                    all_new=new)
@@ -156,13 +156,15 @@ def _failure(novel: Novel, source: Source, status: str, message: str, *, exc: st
 def _baseline(novel: Novel, source: Source, loaded: LoadResult, chapters: list[Chapter],
               rules: Rules, paths: Paths | None) -> Outcome:
     latest = chapters[-1]
+    if loaded.toc.book_title and not novel.title:
+        novel.title = loaded.toc.book_title
+    _history(paths, novel, source, "baseline", [], latest)
     _commit(novel, source, loaded, chapters, latest, rules=rules)
     source.baseline_set = True
     source.status = STATUS_BASELINE
     source.status_detail = "首次记录，未提醒"
     # 刚添加时要把「最近 5 章」弹出来给人确认认对了书，所以基线也带一份快照
     recent = list(reversed(chapters))[:rules.cfg.history_display_cap]
-    _history(paths, novel, source, "baseline", [], latest)
     return Outcome(novel=novel, source=source, status=STATUS_BASELINE, recent=recent,
                    latest=latest, message="首次记录（不提醒）",
                    known_keys=[match_key(c.number, c.title) for c in chapters])
@@ -178,25 +180,30 @@ def _no_change(novel: Novel, source: Source, loaded: LoadResult, chapters: list[
 
 
 def _continues_sequence(new: list[Chapter], latest_number: int | None) -> bool:
-    """新章编号是否全部紧接在已知的最新章之后（=断档追赶，不是整站重编号）。
+    """新章是否从已知最新章节的下一章开始持续向后（=断档追赶，不是整站重编号）。
 
-    任何一章编号缺失或比已知最新章还小就返回 False，维持「只记录不提醒」的保守口径——
-    宁可少报一次改版误报，也不能把真断档当重编号吞掉，那是永久漏提醒。
+    首章必须紧接已知最新章；后面允许站方缺章，避免把真实断档当成重编号吞掉。
+    任何一章编号缺失、重复或比已知最新章还小就返回 False。
     """
     if latest_number is None or not new:
         return False
-    return all(chapter.number is not None and chapter.number > latest_number for chapter in new)
+    numbers = []
+    for chapter in new:
+        if chapter.number is None:
+            return False
+        numbers.append(chapter.number)
+    return numbers[0] == latest_number + 1 and numbers == sorted(set(numbers))
 
 
 def _reset(novel: Novel, source: Source, loaded: LoadResult, chapters: list[Chapter],
            new: list[Chapter], rules: Rules, paths: Paths | None, why: str) -> Outcome:
     """目录重置/重编号：只更新状态和记录，不弹窗，避免整站改版刷屏。"""
     latest = chapters[-1]
+    _history(paths, novel, source, "toc_reset", new[:50], latest)
     _commit(novel, source, loaded, chapters, latest, rules=rules)
     source.status = STATUS_TOC_RESET
     source.status_detail = why
     source.last_error = None
-    _history(paths, novel, source, "toc_reset", new[:50], latest)
     return Outcome(novel=novel, source=source, status=STATUS_TOC_RESET, latest=latest, message=why)
 
 

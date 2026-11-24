@@ -271,25 +271,39 @@ class AppState:
         with self._lock:
             return self._absorb_card_acks()
 
+    def _save_novels_safely(self) -> None:
+        try:
+            save_novels(self.paths, self._novels)
+        except OSError as exc:
+            try:
+                append_text(self.paths.runtime_log,
+                            f"{now_stamp()} 书架保存失败: {type(exc).__name__}: {exc}")
+            except OSError:
+                pass
+
     def _absorb_card_acks(self) -> int:
-        """卡片被鼠标划过或被点掉就是「看过了」：把这本书的补弹账清掉。调用方需已持锁。
+        """卡片被鼠标划过或被点掉就是「看过了」：把这本书的补弹账清掉。
 
         谁还挂在屏幕上只有 `Notifier` 知道（它攥着卡片进程句柄），所以每轮去收一次；
         被新章顶掉、被封顶淘汰的那些不算看过，收回来的是空的。
         """
-        acked = set(self.notifier.take_acked())
-        if not acked:
-            return 0
-        changed = 0
-        for novel in self._novels:
-            if novel.id in acked and novel.unseen_keys:
-                novel.unseen_keys = []
-                changed += 1
-        if changed:
-            save_novels(self.paths, self._novels)
-        return changed
+        with self._lock:
+            acked = self.notifier.take_acked_chapters()
+            if not acked:
+                return 0
+            changed = 0
+            for novel in self._novels:
+                keys = acked.get(novel.id)
+                if keys and novel.unseen_keys:
+                    remaining = [key for key in novel.unseen_keys if key not in keys]
+                    if remaining != novel.unseen_keys:
+                        novel.unseen_keys = remaining
+                        changed += 1
+            if changed:
+                self._save_novels_safely()
+            return changed
 
-    def _mark_unseen(self, alerts: list[NovelAlert]) -> None:
+    def _mark_unseen(self, alerts: list[NovelAlert], *, save: bool = True) -> None:
         """把这一轮弹出去的更新记成「还没人看过」：重启把窗口冲掉后靠它补弹。
 
         记的是**这次报上来的那几章**（不是卡片上显示的前 5 行——那 5 行里混着更早的章，
@@ -303,11 +317,31 @@ class AppState:
                 if alert.added:
                     continue
                 keys = [entry.k for entry in alert.entries][:_UNSEEN_KEEP]
-                if keys and keys != alert.novel.unseen_keys:
-                    alert.novel.unseen_keys = keys
+                merged = list(dict.fromkeys([*keys, *alert.novel.unseen_keys]))
+                if merged != alert.novel.unseen_keys:
+                    alert.novel.unseen_keys = merged[:_UNSEEN_KEEP]
                     changed += 1
-            if changed:
+            if changed and save:
                 save_novels(self.paths, self._novels)
+
+    def _notify(self, alerts: list[NovelAlert]) -> None:
+        pending = self.pending_unseen_alerts()
+        pending_by_id = {alert.novel.id: alert for alert in pending}
+        for alert in alerts:
+            old = pending_by_id.get(alert.novel.id)
+            if old is None or alert.added:
+                continue
+            keys = {entry.k for entry in alert.entries}
+            alert.entries.extend(entry for entry in old.entries if entry.k not in keys)
+        self._mark_unseen(alerts, save=False)
+        fresh_ids = {alert.novel.id for alert in alerts}
+        retry = [alert for alert in pending if alert.novel.id not in fresh_ids]
+        self._absorb_card_acks()
+        retry = [alert for alert in retry if not self.notifier.has_live(alert.novel.id)]
+        self._absorb_card_acks()
+        retry = [alert for alert in retry if alert.novel.unseen_keys]
+        self.notifier.notify_many([*alerts, *retry])
+        self._absorb_card_acks()
 
     def pending_unseen_alerts(self) -> list[NovelAlert]:
         """上次弹过、但没人点过也没被鼠标划过的更新：按原样再弹一遍。"""
@@ -457,12 +491,11 @@ class AppState:
                                                   prefetch=html or None))
             for outcome in outcomes:
                 self._log(outcome)
-            alerts = self._collect([novel], outcomes)
+            alerts = self._collect([novel], outcomes, notify=notify)
         # 弹卡放到整轮锁外：spawn 每张卡要等最多 0.5 秒确认没秒退，持锁会把定时轮和
         # 另一次添加堵在 _round_lock 上
         if notify:
-            self.notifier.notify_many(alerts)
-            self._mark_unseen(alerts)
+            self._notify(alerts)
         # 代理重探要敲网络（最坏能拖到一分钟），放到整轮锁外做：不然用户在重探进行时
         # 添加小说，check_one 会一直等这把锁，添加看起来像卡住了。重探只改 proxy 和
         # 失败计数、不碰抓取状态，与随后开始的下一轮并发也无害。
@@ -485,12 +518,11 @@ class AppState:
             ordered = [results[s.id] for n in novels for s in n.sources if s.id in results]
             for outcome in ordered:
                 self._log(outcome)
-            alerts = self._collect(novels, ordered)
+            alerts = self._collect(novels, ordered, notify=notify)
         # 弹卡放到整轮锁外：spawn 每张卡要等最多 0.5 秒确认没秒退，持锁会把「添加小说」的
         # 首轮检查和下一轮都堵在 _round_lock 上（一次大批更新能堵好几秒）
         if notify:
-            self.notifier.notify_many(alerts)
-            self._mark_unseen(alerts)
+            self._notify(alerts)
         # 定时轮里发现代理彻底失效（到退避阈值）也自动重探一次：放到整轮锁外做，理由同
         # check_one。重探成功会清掉失败计数，调度器随后算退避时自然不再跳过这个来源。
         # 只认真敲过门的来源：被退避跳过的那一轮 outcome 仍带着 proxy_error 状态与到阈值的
@@ -498,7 +530,8 @@ class AppState:
         self._reprobe_dead_proxies([o for o in ordered if o.source.id not in skip_ids])
         return ordered
 
-    def _collect(self, novels: list[Novel], outcomes: list[Outcome]) -> list[NovelAlert]:
+    def _collect(self, novels: list[Novel], outcomes: list[Outcome], *,
+                 notify: bool = False) -> list[NovelAlert]:
         """把「各来源各自的新章」压成「这本书要提醒什么」，记账并存盘，返回要弹的卡片。
 
         只记账、不弹卡：弹卡由调用方放到整轮锁外做（spawn 每张卡要阻塞确认没秒退，
@@ -506,8 +539,16 @@ class AppState:
         以后还能再报一遍。
         """
         with self._lock:
+            current_novels = {id(novel) for novel in self._novels}
+            current_sources = {(id(novel), id(source))
+                               for novel in self._novels for source in novel.sources}
+            novels = [novel for novel in novels if id(novel) in current_novels]
+            outcomes = [outcome for outcome in outcomes
+                        if (id(outcome.novel), id(outcome.source)) in current_sources]
             alerts = collect_alerts(novels, outcomes, keep=self._rules.cfg.notified_keys_keep)
-            save_novels(self.paths, self._novels)
+            if notify:
+                self._mark_unseen(alerts, save=False)
+            self._save_novels_safely()
             self.last_alerts = alerts
         return alerts
 

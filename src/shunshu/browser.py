@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import os
+import shlex
 import subprocess
+import threading
 import webbrowser
 
 from .host import IS_WINDOWS
 from .http import assert_http_url
 
 _BROWSER_TIMEOUT_SECONDS = 10.0
+_LAUNCH_GRACE_SECONDS = 0.5
 
 
 def open_in_default_browser(url: str) -> bool:
@@ -23,6 +27,8 @@ def open_in_default_browser(url: str) -> bool:
         return False
     if IS_WINDOWS and _startfile(target):
         return True
+    if not IS_WINDOWS:
+        return _posix_browser(target)
     if _webbrowser(target):
         return True
     return _fallback_command(target)
@@ -45,6 +51,45 @@ def _webbrowser(url: str) -> bool:
         return bool(webbrowser.open(url))
     except Exception:
         return False
+
+
+def _reap(proc) -> None:
+    try:
+        proc.wait()
+    except OSError:
+        pass
+
+
+def _launch(command: list[str]) -> bool:
+    try:
+        proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        try:
+            return proc.wait(timeout=_LAUNCH_GRACE_SECONDS) == 0
+        except subprocess.TimeoutExpired:
+            threading.Thread(target=_reap, args=(proc,), daemon=True).start()
+            return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _posix_browser(url: str) -> bool:
+    commands = []
+    for entry in os.environ.get("BROWSER", "").split(os.pathsep):
+        if not entry.strip():
+            continue
+        try:
+            command = shlex.split(entry)
+        except ValueError:
+            continue
+        if not command:
+            continue
+        if any("%s" in part for part in command):
+            commands.append([part.replace("%s", url) for part in command])
+        else:
+            commands.append([*command, url])
+    commands.append(["xdg-open", url])
+    return any(_launch(command) for command in commands)
 
 
 def _fallback_command(url: str) -> bool:

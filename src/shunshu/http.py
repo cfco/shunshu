@@ -14,7 +14,7 @@ _META_CHARSET = re.compile(rb"""charset\s*=\s*["']?\s*([A-Za-z0-9_\-]+)""", re.I
 _HTML_ESSENCE = re.compile(rb"<\s*(?:html|head|body|meta|div|table|dl|ul|p|a)\b", re.I)
 
 PROXY_SCHEMES = ("http", "https", "socks5")
-_PROXY_TELL = re.compile(r"proxy|socks", re.I)
+_SOCKS_CONNECTION = re.compile(r"^\s*SOCKS(?:HTTP|HTTPS)?Connection\(", re.I)
 
 
 class FetchError(Exception):
@@ -37,7 +37,7 @@ def proxy_label(proxy: str) -> str:
     """给日志和菜单看的代理名：去掉账号密码，避免凭据落进 data/shunshu.log。"""
     parts = urlsplit((proxy or "").strip())
     if not parts.scheme or not parts.hostname:
-        return (proxy or "").strip()
+        return "<代理地址格式不对>"
     port = f":{parts.port}" if _has_port(parts) else ""
     return f"{parts.scheme.lower()}://{parts.hostname}{port}"
 
@@ -80,6 +80,24 @@ def _deepest_error(exc: BaseException, depth: int = 0) -> BaseException:
         if isinstance(candidate, BaseException) and candidate is not exc:
             return _deepest_error(candidate, depth + 1)
     return exc
+
+
+def _is_socks_proxy_error(exc: Exception, proxy: str) -> bool:
+    if urlsplit(proxy).scheme.lower() != "socks5":
+        return False
+    current = exc
+    for _ in range(7):
+        kind = f"{type(current).__module__}.{type(current).__name__}".lower()
+        if "socks" in kind or _SOCKS_CONNECTION.match(str(current)):
+            return True
+        nested = getattr(current, "reason", None)
+        if nested is None:
+            nested = next((item for item in getattr(current, "args", ())
+                           if isinstance(item, BaseException)), None)
+        if nested is None or nested is current:
+            break
+        current = nested
+    return False
 
 
 def _proxy_hint(exc: Exception) -> str:
@@ -237,6 +255,7 @@ class Fetcher:
         last_error = "未知错误"
         # 最后一次失败是不是"连接没建立"：决定最终抛 ConnectionFailureError 还是普通 FetchError
         connection_failed = False
+        received_response = False
         deadline = time.monotonic() + self.url_budget_seconds
         for attempt in range(self.retries + 1):
             if attempt:
@@ -245,9 +264,11 @@ class Fetcher:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise self._budget_error()
+            received_response = False
             try:
                 resp = self.session.get(url, timeout=min(self.timeout, remaining), stream=True,
                                         allow_redirects=True, proxies=endpoints)
+                received_response = True
                 try:
                     if resp.status_code >= 500:
                         # 5xx 多为站点临时故障，退避后值得再试一次
@@ -288,12 +309,11 @@ class Fetcher:
                 last_error = f"{type(exc).__name__}: {exc}"
                 connection_failed = False
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-                # socks 走不通时 requests 只报 ConnectionError，但句子里一定带着 proxy/socks 这个词；
-                # 站点自己断链（RemoteDisconnected）不含它，仍按网络错误重试
-                if endpoints and _PROXY_TELL.search(str(exc)):
+                # SOCKS 适配器失败要看异常链，不能在包含目标 URL 的整段文本里搜 proxy/socks
+                if not received_response and endpoints and _is_socks_proxy_error(exc, proxy):
                     raise ProxyError(f"{proxy_label(proxy)} 走不通：{_proxy_hint(exc)}") from exc
                 last_error = f"{type(exc).__name__}: {exc}"
-                connection_failed = True
+                connection_failed = not received_response
             except requests.RequestException as exc:
                 # SSL 等其它请求异常：尝试重试用尽后按普通 FetchError 报（站点给不出干净响应，
                 # 但区别于"连不上"，代理探测不会据此切代理）

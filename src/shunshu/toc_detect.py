@@ -20,10 +20,11 @@ _PAGE_TEXT_RE = re.compile(r"^\s*(\d{1,4})\s*$")
 _LAST_PAGE_TEXTS = {"末页", "最后一页", "最后", "末"}
 _NEXT_PAGE_TEXTS = {"下一页", "下页", "next", "下頁", "下一頁"}
 _PAGE_NAV_TEXTS = {"首页", "上一页", "下一页", "末页", "下页", "上页", "next", "prev", "last"}
-_PAGE_FILE_RE = re.compile(r"(?:^|/)_+\d{1,4}(?:\.\w+)?$", re.I)
 _PAGE_QUERY_RE = re.compile(r"(?:page|p|pg|id_page)=\d+", re.I)
-_PAGE_DIR_RE = re.compile(r"/\d{1,4}/$")
-_PAGE_HINT_CLASS = re.compile(r"(?:^|[\s,_-])(?:pages?|fenye|pag(?:e)?_?bar|bar|pagebreak)(?:$|[\s,_-])", re.I)
+_PAGE_HINT_CLASS = re.compile(
+    r"(?:^|[\s,_-])(?:pages?|fenye|pag(?:e)?_?bar|pagetype|pagination|pagebreak)(?:$|[\s,_-])",
+    re.I,
+)
 _SKIP_TAGS = {"script", "style", "noscript", "textarea", "svg"}
 _FILE_SUFFIX_RE = re.compile(r"\.(?:html?|shtml|jhtml|php|aspx?)$", re.I)
 _TITLE_SPLIT_RE = re.compile(r"[_|—/《》\[\]（）()]+")
@@ -105,8 +106,7 @@ def clean_title(raw: str, rules: Rules) -> str:
 
 def _in_junk_node(anchor: Tag) -> bool:
     node = anchor
-    for _ in range(6):
-        node = node.parent
+    for _ in range(7):
         if node is None:
             return False
         if node.name in _SKIP_TAGS:
@@ -115,6 +115,7 @@ def _in_junk_node(anchor: Tag) -> bool:
         hint = " ".join([*classes, node.get("id") or ""])
         if hint.strip() and AD_NODE_HINT.search(hint):
             return True
+        node = node.parent
     return False
 
 
@@ -148,10 +149,10 @@ def _is_page_link(info: LinkInfo, page_url: str) -> bool:
     parts = urlsplit(info.url)
     if _PAGE_QUERY_RE.search(parts.query or ""):
         return True
-    if _PAGE_FILE_RE.search(parts.path):
+    if _PAGE_QUERY_RE.search(parts.query or ""):
         return True
-    if _PAGE_DIR_RE.search(parts.path) and site_key(info.url) == site_key(page_url):
-        return True
+    return bool(info.anchor.find_parent(class_=_PAGE_HINT_CLASS) or
+                info.anchor.find_parent(id_=_PAGE_HINT_CLASS))
     return bool(info.anchor.find_parent(class_=_PAGE_HINT_CLASS) or
                 info.anchor.find_parent(id_=_PAGE_HINT_CLASS))
 
@@ -419,16 +420,19 @@ def parse_page(html: str, page_url: str, rules: Rules) -> Page:
     return Page(url=page_url, soup=soup, links=links, by_anchor=by_anchor, book_title=detect_book_title(soup, rules))
 
 
-def find_page_urls(page: Page, rules: Rules) -> tuple[str | None, list[tuple[int, str]]]:
+def find_page_urls(page: Page, rules: Rules,
+                   container: Container | None = None) -> tuple[str | None, list[tuple[int, str]]]:
     """返回 (该跟进的那一页, 数字页链接列表)。
 
     优先「末页」文字链接，其次最大数字页；两样都没有时退回「下一页」——
     只挂一个「下一页」的两页站，不跟这一页就永远看不到最新章节。
     """
     numeric: dict[int, str] = {}
+    outside_numeric: dict[int, str] = {}
     last: str | None = None
     nxt: str | None = None
     base = urlsplit(page.url)
+    chapter_anchors = {id(info.anchor) for info in container.links} if container else set()
     for info in page.links:
         if not info.url or site_key(info.url) != site_key(page.url):
             continue
@@ -446,10 +450,34 @@ def find_page_urls(page: Page, rules: Rules) -> tuple[str | None, list[tuple[int
             nxt = info.url
             continue
         m = _PAGE_TEXT_RE.match(info.text)
-        if m and abs(len(parts.path) - len(base.path)) <= 8:
-            num = int(m.group(1))
-            if 1 <= num <= 2000:
-                numeric[num] = info.url
+        if not m:
+            continue
+        num = int(m.group(1))
+        if not 1 <= num <= 2000:
+            continue
+        outside = (container is not None and info.drop_reason in (None, "pagination")
+                   and id(info.anchor) not in chapter_anchors
+                   and dir_prefix(info.url) == dir_prefix(page.url))
+        if outside:
+            outside_numeric[num] = info.url
+        if _is_page_link(info, page.url):
+            numeric[num] = info.url
+    if len(outside_numeric) >= 2:
+        numbers = sorted(outside_numeric)
+        runs = []
+        run = [numbers[0]]
+        for number in numbers[1:]:
+            if number == run[-1] + 1:
+                run.append(number)
+            else:
+                if len(run) >= 2:
+                    runs.append(run)
+                run = [number]
+        if len(run) >= 2:
+            runs.append(run)
+        if runs:
+            best = max(runs, key=lambda items: (items[-1], len(items)))
+            numeric.update({number: outside_numeric[number] for number in best})
     candidates = sorted(numeric.items())
     here = normalize_chapter_url(page.url)
     for candidate in (last, nxt):

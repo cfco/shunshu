@@ -1,6 +1,7 @@
 import fixtures
 from conftest import FakeFetcher
 
+from shunshu.app import AppState
 from shunshu.config import Config
 from shunshu.http import FetchError, ProxyError
 from shunshu.models import (
@@ -137,6 +138,21 @@ def test_chapter_renamed_without_new_number_is_not_an_update():
     assert check_source(novel, first(novel), RULES, fetcher, None).status == STATUS_NO_CHANGE
 
 
+def test_upward_renumbering_is_not_mistaken_for_catchup():
+    novel = make_novel()
+    fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()})
+    check_source(novel, first(novel), RULES, fetcher, None)
+    titles = [*fixtures.CHAPTERS[:25], *[f"第{n}章 重编号{n}" for n in range(1001, 1036)]]
+    html = fixtures.normal_html(titles)
+    for i in range(26, 61):
+        html = html.replace(f'href="{i}.html"', f'href="/new/{i}.html"')
+    fetcher.add(fixtures.BASE_URL, html)
+
+    outcome = check_source(novel, first(novel), RULES, fetcher, None)
+    assert outcome.status == STATUS_TOC_RESET
+    assert outcome.new_count == 0
+
+
 def test_site_renumbering_is_recorded_as_toc_reset_without_popup():
     novel = make_novel()
     fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()})
@@ -200,6 +216,45 @@ def test_catchup_after_downtime_is_reported_not_swallowed():
     # 报过就该记账：下一轮不能把这 35 章当成没报过再刷一遍
     again = check_source(novel, first(novel), RULES, fetcher, None)
     assert again.status == STATUS_NO_CHANGE
+
+
+def test_history_write_failure_does_not_consume_the_update(app_state, monkeypatch):
+    """历史先写、状态后提交：日志写失败时下一轮必须仍能把新章报出来。"""
+    import shunshu.monitor as monitor
+
+    fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()})
+    app_state.set_fetcher(fetcher)
+    app_state.add_novel(fixtures.BASE_URL)
+    app_state.run_round(notify=False)
+    fetcher.add(fixtures.BASE_URL, fixtures.normal_html([*fixtures.CHAPTERS, "第61章 别吞我"]))
+    original = monitor.append_jsonl
+    monkeypatch.setattr(monitor, "append_jsonl",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("history disk full")))
+
+    failed = app_state.run_round(notify=False)[0]
+    source = app_state.novels[0].sources[0]
+    assert failed.status == STATUS_CHECK_ERROR
+    assert source.latest_title == "第60章 测试章节0060"
+    assert not any(key.endswith("/61.html") for key in source.notified_keys)
+    assert AppState(app_state.paths).novels[0].sources[0].latest_title == "第60章 测试章节0060"
+
+    monkeypatch.setattr(monitor, "append_jsonl", original)
+    recovered = app_state.run_round(notify=False)[0]
+    assert recovered.status == STATUS_UPDATED
+    assert recovered.new_count == 1
+    assert app_state.last_alerts[0].entries[0].t == "第61章 别吞我"
+
+
+def test_catchup_with_a_missing_chapter_number_is_still_reported():
+    novel = make_novel()
+    fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()})
+    check_source(novel, first(novel), RULES, fetcher, None)
+    added = [f"第{n}章 断档追赶" for n in (61, 62, 64, 65)]
+    fetcher.add(fixtures.BASE_URL, fixtures.normal_html([*fixtures.CHAPTERS, *added]))
+
+    outcome = check_source(novel, first(novel), RULES, fetcher, None)
+    assert outcome.status == STATUS_UPDATED
+    assert outcome.new_count == 4
 
 
 def test_network_error_keeps_previous_state():

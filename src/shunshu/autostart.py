@@ -39,12 +39,18 @@ def _command_parts() -> tuple[str, list[str]]:
     return str(interpreter), ["-m", "shunshu", "run", BOOT_DELAY_ARG]
 
 
+def _desktop_quote(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = escaped.replace("`", "\\`").replace("$", "\\$")
+    return f'"{escaped}"'
+
+
 def current_command() -> str:
     """写进自启配置里的启动命令。"""
     exe, args = _command_parts()
     if IS_WINDOWS:
         return " ".join([f'"{exe}"', *args])
-    return " ".join([shlex.quote(exe), *[shlex.quote(arg) for arg in args]])
+    return " ".join(_desktop_quote(part) for part in [exe, *args])
 
 
 def _entry_path(entry: str) -> Path:

@@ -125,6 +125,11 @@ def test_fetcher_ignores_environment_proxy_by_default(monkeypatch):
     assert seen.get("proxies") == {}, "没写 proxy 时不能把环境代理传给 requests"
 
 
+def test_proxy_label_redacts_credentials_even_without_scheme():
+    label = proxy_label("reader:secretpwd@127.0.0.1:7890")
+    assert "secretpwd" not in label and "reader" not in label
+
+
 def test_fetcher_passes_manual_proxy_to_requests(monkeypatch):
     """来源手写了 proxy 时，proxies 必须原样带到这一次请求（只影响这一个来源）。"""
     fetcher = Fetcher("test-ua", retries=0)
@@ -554,6 +559,168 @@ def test_replaced_and_evicted_cards_are_not_counted_as_seen(paths: Paths, monkey
 
     notifier.show("第0张卡", ["换了一轮内容"])
     assert notifier.take_acked() == [], "同一句提示被新卡顶掉也不算看过"
+
+
+def test_close_all_during_spawn_leaves_no_orphan_card(monkeypatch):
+    import threading
+    from shunshu.notify import Notifier
+
+    started = threading.Event()
+    release = threading.Event()
+    proc = FakeProc()
+
+    def blocked_spawn(payload, index=0):
+        started.set()
+        if not release.wait(5):
+            raise RuntimeError("test timeout")
+        return "", proc
+
+    monkeypatch.setattr("shunshu.notify.spawn_card", blocked_spawn)
+    notifier = Notifier(enabled=True)
+    worker = threading.Thread(target=lambda: notifier.show("退出中弹出的卡", ["内容"]))
+    worker.start()
+    assert started.wait(5)
+    notifier.close_all()
+    release.set()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    assert proc.terminated
+    assert notifier._live == {}
+
+
+def test_same_key_concurrent_spawn_keeps_only_the_new_process(monkeypatch):
+    import threading
+    from shunshu.notify import Notifier
+
+    started = threading.Event()
+    release = threading.Event()
+    first = FakeProc()
+    second = FakeProc()
+    calls = 0
+
+    def spawn(payload, index=0):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("test timeout")
+            return "", first
+        return "", second
+
+    monkeypatch.setattr("shunshu.notify.spawn_card", spawn)
+    notifier = Notifier(enabled=True)
+    worker = threading.Thread(target=lambda: notifier.show("同一本书", ["旧内容"]))
+    worker.start()
+    assert started.wait(5)
+    assert notifier.show("同一本书", ["新内容"]) is True
+    release.set()
+    worker.join(5)
+
+    assert first.terminated
+    assert not second.terminated
+    assert notifier._live["同一本书"][0] is second
+    assert len(notifier._live) == 1
+
+
+def test_old_card_ack_contains_only_its_own_chapters(monkeypatch):
+    from shunshu.models import ChapterEntry, Novel, NovelAlert, Source
+    from shunshu.notify import Notifier
+
+    popped = capture_cards(monkeypatch)
+    source = Source(id="b1", toc_url="https://x.com/", site="x.com")
+    novel = Novel(id="b1", title="书", sources=[source])
+    notifier = Notifier(enabled=True)
+
+    def alert(number: int) -> NovelAlert:
+        entry = ChapterEntry(k=f"0000{number}|第{number}章", t=f"第{number}章",
+                             u=f"https://x.com/{number}", s="b1", n=number)
+        novel.chapter_index = [entry]
+        return NovelAlert(novel=novel, entries=[entry])
+
+    notifier.notify_alert(alert(61))
+    popped[0][2].exited = True
+    notifier.notify_alert(alert(62))
+
+    assert notifier.take_acked_chapters() == {"b1": {"000061|第61章"}}
+    assert notifier.has_live("b1") is True
+
+
+def test_spawn_card_keeps_handle_when_user_closes_during_grace(monkeypatch):
+    import importlib
+    from shunshu import notify
+
+    notify = importlib.reload(notify)
+
+    class QuickExit:
+        def wait(self, timeout):
+            return 0
+
+    proc = QuickExit()
+    monkeypatch.setattr(notify, "popup_command", lambda payload, index: ["shunshu", "popup"])
+    monkeypatch.setattr(notify.subprocess, "Popen", lambda *a, **k: proc)
+
+    error, handle = notify.spawn_card({"title": "测试"}, 0)
+    assert error == ""
+    assert handle is proc
+
+
+def test_stale_generation_that_exited_normally_still_reports_ack(monkeypatch):
+    import threading
+    from shunshu.models import ChapterEntry, Novel, NovelAlert, Source
+    from shunshu.notify import Notifier
+
+    started = threading.Event()
+    release = threading.Event()
+    old = FakeProc(exited=True, code=0)
+    calls = 0
+
+    def spawn(payload, index=0):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("test timeout")
+            return "", old
+        return "", FakeProc()
+
+    monkeypatch.setattr("shunshu.notify.spawn_card", spawn)
+    source = Source(id="b1", toc_url="https://x.com/", site="x.com")
+    novel = Novel(id="b1", title="书", sources=[source])
+    notifier = Notifier(enabled=True)
+
+    def alert(number: int) -> NovelAlert:
+        entry = ChapterEntry(k=f"0000{number}|第{number}章", t=f"第{number}章",
+                             u=f"https://x.com/{number}", s="b1", n=number)
+        novel.chapter_index = [entry]
+        return NovelAlert(novel=novel, entries=[entry])
+
+    worker = threading.Thread(target=lambda: notifier.notify_alert(alert(61)))
+    worker.start()
+    assert started.wait(5)
+    assert notifier.notify_alert(alert(62)) is True
+    release.set()
+    worker.join(5)
+
+    assert notifier.take_acked_chapters() == {"b1": {"000061|第61章"}}
+    assert notifier.has_live("b1") is True
+
+
+def test_card_that_exits_normally_during_grace_is_acked(monkeypatch):
+    from shunshu.models import ChapterEntry, Novel, NovelAlert, Source
+    from shunshu.notify import Notifier
+
+    source = Source(id="b1", toc_url="https://x.com/", site="x.com")
+    entry = ChapterEntry(k="000061|新章", t="第61章 新章", u="https://x.com/61", s="b1")
+    novel = Novel(id="b1", title="书", sources=[source], chapter_index=[entry])
+    monkeypatch.setattr("shunshu.notify.spawn_card",
+                        lambda payload, index=0: ("", FakeProc(exited=True, code=0)))
+    notifier = Notifier(enabled=True)
+
+    assert notifier.notify_alert(NovelAlert(novel=novel, entries=[entry])) is True
+    assert notifier.take_acked_chapters() == {"b1": {entry.k}}
 
 
 def test_swiped_away_card_reports_its_key_as_seen(paths: Paths, monkeypatch):

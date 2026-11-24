@@ -6,8 +6,6 @@
 
 from __future__ import annotations
 
-import shlex
-
 import pytest
 
 from conftest import capture_cards
@@ -33,8 +31,9 @@ def test_source_mode_command_carries_the_delay(monkeypatch, tmp_path):
     monkeypatch.setattr(autostart, "is_packaged", lambda: False)
     monkeypatch.setattr(autostart.sys, "executable", str(interpreter))
 
+    quoted = str(interpreter).replace("\\", "\\\\")
     assert autostart.current_command() == (
-        f"{shlex.quote(str(interpreter))} -m shunshu run --boot-delay=60")
+        f'"{quoted}" "-m" "shunshu" "run" "--boot-delay=60"')
     assert autostart.BOOT_DELAY_SECONDS == 60
 
 
@@ -103,6 +102,23 @@ def test_manual_start_does_not_wait(app_state, monkeypatch):
     tray._startup_then_loop()
 
     assert order == ["round", "loop"]  # boot_delay=0：连等都不试
+
+
+def test_startup_notification_failure_still_enters_poll_loop(app_state, monkeypatch):
+    """启动摘要写日志失败不能杀掉唯一轮询线程，托盘也不能变成永远不检查。"""
+    from shunshu.tray import TrayApp
+
+    tray = TrayApp(app_state)
+    monkeypatch.setattr(tray.scheduler, "run_once", lambda **kwargs: [])
+    monkeypatch.setattr(app_state.notifier, "show",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("alerts disk full")))
+    monkeypatch.setattr(tray, "_flash", lambda *a, **k: None)
+    loops = []
+    monkeypatch.setattr(tray.scheduler, "run_forever", lambda: loops.append(1))
+
+    tray._startup_then_loop()
+    assert loops == [1]
+    assert "启动后处理异常" in app_state.paths.runtime_log.read_text(encoding="utf-8")
 
 
 def test_quit_during_the_wait_skips_the_round_and_the_loop(app_state, monkeypatch):

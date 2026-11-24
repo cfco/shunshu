@@ -189,6 +189,106 @@ def test_quit_settles_a_card_swiped_just_before(app_state: AppState, monkeypatch
     assert AppState(app_state.paths).novels[0].unseen_keys == []
 
 
+def test_failed_card_is_retried_next_round_without_another_update(app_state: AppState, monkeypatch):
+    """卡片进程没起来时，新章留在补弹账里；下一轮无更新也要重试。"""
+    import shunshu.notify as notify
+
+    popped = capture_cards(monkeypatch)
+    _book_with_one_new_chapter(app_state)
+    real_spawn = notify.spawn_card
+    monkeypatch.setattr(notify, "spawn_card", lambda payload, index=0: ("起进程失败", None))
+    app_state.run_round()
+    assert app_state.novels[0].unseen_keys
+    assert AppState(app_state.paths).novels[0].unseen_keys
+
+    monkeypatch.setattr(notify, "spawn_card", real_spawn)
+    app_state.run_round()
+    assert len(popped) == 1
+    assert popped[0][0]["title"].startswith("《测试这本书》更新 1 章")
+    app_state.run_round()
+    assert len(popped) == 1, "卡片还活着时不能每轮重复弹"
+
+
+def test_old_card_ack_does_not_clear_a_new_update(app_state: AppState, monkeypatch):
+    popped = capture_cards(monkeypatch)
+    fetcher = _book_with_one_new_chapter(app_state)
+    app_state.run_round()
+    popped[0][2].exited = True
+
+    fetcher.add(fixtures.BASE_URL, fixtures.normal_html(
+        [*fixtures.CHAPTERS, "第61章 没看的那一章", "第62章 新的一章"]))
+    app_state.run_round()
+
+    keys = app_state.novels[0].unseen_keys
+    assert len(keys) == 1
+    assert keys[0] == app_state.last_alerts[0].entries[0].k
+    assert app_state.last_alerts[0].entries[0].t == "第62章 新的一章"
+    assert AppState(app_state.paths).novels[0].unseen_keys == keys
+
+
+def test_shelf_save_failure_does_not_block_the_card(app_state: AppState, monkeypatch):
+    import shunshu.app as app_module
+
+    popped = capture_cards(monkeypatch)
+    _book_with_one_new_chapter(app_state)
+    original = app_module.save_novels
+    monkeypatch.setattr(app_module, "save_novels",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+
+    app_state.run_round()
+    assert len(popped) == 1
+    assert app_state.novels[0].unseen_keys
+    assert "书架保存失败" in app_state.paths.runtime_log.read_text(encoding="utf-8")
+    assert AppState(app_state.paths).novels[0].unseen_keys == []
+
+    monkeypatch.setattr(app_module, "save_novels", original)
+    app_state.run_round()
+    assert AppState(app_state.paths).novels[0].unseen_keys == app_state.novels[0].unseen_keys
+    assert len(popped) == 1, "保存恢复后原卡仍活着，不重复弹"
+
+
+def test_card_acked_between_pending_snapshot_and_live_check_is_not_repopped(app_state, monkeypatch):
+    popped = capture_cards(monkeypatch)
+    _book_with_one_new_chapter(app_state)
+    app_state.run_round()
+    original = app_state.notifier.has_live
+
+    def ack_then_check(key):
+        popped[0][2].exited = True
+        return original(key)
+
+    monkeypatch.setattr(app_state.notifier, "has_live", ack_then_check)
+    app_state.run_round()
+
+    assert len(popped) == 1
+    assert app_state.novels[0].unseen_keys == []
+    assert AppState(app_state.paths).novels[0].unseen_keys == []
+
+
+def test_ack_save_failure_does_not_block_the_next_update(app_state, monkeypatch):
+    import shunshu.app as app_module
+
+    popped = capture_cards(monkeypatch)
+    fetcher = _book_with_one_new_chapter(app_state)
+    app_state.run_round()
+    popped[0][2].exited = True
+    fetcher.add(fixtures.BASE_URL, fixtures.normal_html(
+        [*fixtures.CHAPTERS, "第61章 没看的那一章", "第62章 保存失败也要弹"]))
+    original = app_module.save_novels
+    monkeypatch.setattr(app_module, "save_novels",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+
+    app_state.run_round()
+    assert len(popped) == 2
+    assert app_state.last_alerts[0].entries[0].t == "第62章 保存失败也要弹"
+    assert "书架保存失败" in app_state.paths.runtime_log.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(app_module, "save_novels", original)
+    app_state.run_round()
+    assert AppState(app_state.paths).novels[0].unseen_keys == app_state.novels[0].unseen_keys
+    assert len(popped) == 2
+
+
 def test_round_without_notify_leaves_nothing_to_repop(app_state: AppState, monkeypatch):
     """没弹卡的一轮（notify=False）不该记账：不然没弹过的章节会被当成「弹过没看」补弹。"""
     capture_cards(monkeypatch)
@@ -222,6 +322,20 @@ def test_startup_does_not_repop_a_book_it_just_alerted(app_state: AppState, monk
     popped_now = len(popped)
     tray._repop_unseen()
     assert len(popped) == popped_now, "这本书刚弹过，不该再补一张"
+
+
+def test_startup_repop_absorbs_an_ack_collected_by_live_check(app_state, monkeypatch):
+    from shunshu.tray import TrayApp
+
+    popped = capture_cards(monkeypatch)
+    _book_with_one_new_chapter(app_state)
+    app_state.run_round()
+    popped[0][2].exited = True
+    tray = TrayApp(app_state)
+
+    tray._repop_unseen()
+    assert len(popped) == 1
+    assert app_state.novels[0].unseen_keys == []
 
 
 def test_quit_closes_the_cards_on_screen(app_state: AppState, monkeypatch):
@@ -415,6 +529,48 @@ def test_interval_supports_all_four_options(app_state: AppState):
         assert scheduler.next_wait_seconds() == minutes * 60.0
 
 
+def test_deleting_a_book_during_fetch_does_not_pop_its_card(app_state, monkeypatch):
+    import threading
+    import fixtures
+    from shunshu import notify
+
+    class BlockingFetcher:
+        def __init__(self):
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.block = False
+
+        def fetch_html(self, url, proxy=""):
+            if self.block:
+                self.block = False
+                self.started.set()
+                if not self.release.wait(5):
+                    raise RuntimeError("test timeout")
+                return fixtures.normal_html([*fixtures.CHAPTERS, "第61章 删除后才回来"])
+            return fixtures.normal_html()
+
+    popped = capture_cards(monkeypatch)
+    fetcher = BlockingFetcher()
+    app_state.set_fetcher(fetcher)
+    novel = app_state.add_novel(fixtures.BASE_URL)
+    app_state.run_round(notify=False)
+    fetcher.block = True
+    results = []
+    worker = threading.Thread(target=lambda: results.extend(app_state.run_round()))
+    worker.start()
+    assert fetcher.started.wait(5)
+    app_state.remove_novel(novel.id)
+    app_state.save_novels()
+    fetcher.release.set()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    assert results[0].status == STATUS_UPDATED
+    assert app_state.novels == []
+    assert popped == []
+    assert app_state.last_alerts == []
+
+
 def test_repeated_failures_are_skipped_by_backoff(app_state: AppState):
     novel = app_state.add_novel(fixtures.BASE_URL)
     app_state.set_fetcher(FakeFetcher({}))  # 全部 URL 报网络错误
@@ -441,6 +597,41 @@ def test_success_clears_backoff(app_state: AppState):
     outcome = scheduler.run_once(force=True)[0]
     assert outcome.source.consecutive_failures == 0
     assert scheduler.due_skip_ids(__import__("time").time()) == set()
+
+
+def test_readded_source_does_not_inherit_old_backoff(app_state):
+    url = "https://book.example/1/"
+    novel = app_state.add_novel(url)
+    source = novel.sources[0]
+    source.consecutive_failures = app_state.cfg.failure_backoff_threshold
+    scheduler = Scheduler(app_state)
+    from shunshu.models import Outcome
+    scheduler.after_round([Outcome(novel=novel, source=source, status=STATUS_NET_ERROR)])
+    assert source.id in scheduler.due_skip_ids(__import__("time").time())
+
+    app_state.remove_novel(novel.id)
+    app_state.save_novels()
+    replacement = app_state.add_novel(url)
+    assert replacement.sources[0].id == source.id
+    assert replacement.sources[0].id not in scheduler.due_skip_ids(__import__("time").time())
+
+
+def test_resuming_source_clears_its_backoff(app_state):
+    from shunshu.tray import TrayApp
+
+    novel = app_state.add_novel("https://book.example/1/")
+    source = novel.sources[0]
+    source.consecutive_failures = app_state.cfg.failure_backoff_threshold
+    scheduler = Scheduler(app_state)
+    from shunshu.models import Outcome
+    scheduler.after_round([Outcome(novel=novel, source=source, status=STATUS_NET_ERROR)])
+    tray = TrayApp(app_state)
+    tray.scheduler = scheduler
+    app_state.set_source_enabled(novel.id, source.id, False)
+    tray.act_toggle_source(novel.id, source.id)
+
+    assert source.enabled is True
+    assert source.id not in scheduler.due_skip_ids(__import__("time").time())
 
 
 def test_after_round_leaves_skipped_source_due_untouched(app_state: AppState):

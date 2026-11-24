@@ -24,6 +24,8 @@ from pathlib import Path
 
 # git ls-remote --tags 的输出里，一个 tag 会出现普通行与 peeled 行（v0.17.0^{}），都算同一个号
 TAG_LINE = re.compile(r"refs/tags/v(\d+\.\d+\.\d+)\b")
+VERSION = re.compile(r"\d+\.\d+\.\d+")
+TAG = re.compile(r"v(\d+\.\d+\.\d+)")
 # pyproject 里第一个 ^version = 就是 [project] 的 version（它排在 name 下面、别的段之前）
 PYPROJECT_VERSION = re.compile(r'(?m)^version = "[^"]*"')
 LOCK_NAME = re.compile(r'^name = "(?P<name>[^"]+)"$')
@@ -84,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tags", help="git ls-remote --tags origin 的输出文件；不给就当成没发过任何版")
+    parser.add_argument("--tag", help="tag 事件：必须发布这个 tag 的同号包，不再自动升版")
     parser.add_argument("--pyproject", default="pyproject.toml")
     parser.add_argument("--lock", default="uv.lock")
     parser.add_argument("--set-version", help="照 plan job 的结论直接用这个号（不再找空闲号）")
@@ -93,7 +96,14 @@ def main(argv: list[str] | None = None) -> int:
     pyproject = Path(args.pyproject).read_text(encoding="utf-8")
     try:
         current = read_current_version(pyproject)
-        if args.set_version:
+        if args.tag is not None:
+            matched = TAG.fullmatch(args.tag)
+            if not matched:
+                raise ValueError(f"tag 必须是 vX.Y.Z，现在是 {args.tag!r}")
+            version = matched.group(1)
+        elif args.set_version is not None:
+            if not VERSION.fullmatch(args.set_version):
+                raise ValueError(f"版本号必须是 X.Y.Z 三段数字，现在是 {args.set_version!r}")
             version = args.set_version
         else:
             tags_text = Path(args.tags).read_text(encoding="utf-8") if args.tags else ""

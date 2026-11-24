@@ -311,11 +311,11 @@ def test_tray_add_source_from_clipboard_then_baselines_quietly(app_state: AppSta
     app = TrayApp(app_state)
     app._check_new_source = lambda novel_id, source_id: None
 
-    app.act_add_source_from_clipboard(novel.id)
+    app._add_source_from_clipboard(novel.id)
     assert [s.toc_url for s in novel.sources] == [fixtures.BASE_URL, url_b]
     assert cards == [], "追加来源不该再弹一张「已添加」卡"
 
-    app.act_add_source_from_clipboard(novel.id)
+    app._add_source_from_clipboard(novel.id)
     assert len(novel.sources) == 2, "同一网址不能挂两次"
     assert any("已在书架里" in str(c["lines"]) + c["title"] for c in cards)
 

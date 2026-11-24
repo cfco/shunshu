@@ -143,6 +143,40 @@ def test_site_proxies_values_are_normalized_to_text():
     assert cfg.site_proxies == {"book.example.com": "7890", "m.book.example.com": ""}
 
 
+def test_nonfinite_numbers_fall_back_instead_of_crashing_startup(paths: Paths):
+    paths.novels.write_text(json.dumps({"novels": [{
+        "id": "n1", "title": "书", "sources": [{
+            "id": "s1", "toc_url": "https://x.com/", "chapter_count": 1e309,
+            "consecutive_failures": float("nan"), "latest_number": float("inf"),
+            "latest_title": {"bad": 1}, "latest_url": 123,
+        }],
+    }]}), encoding="utf-8")
+    novel = load_novels(paths)[0]
+    source = novel.sources[0]
+    assert source.chapter_count == 0
+    assert source.consecutive_failures == 0
+    assert source.latest_number is None
+    assert source.latest_title == "{'bad': 1}"
+    assert source.latest_url == "123"
+
+
+def test_config_rejects_nonfinite_numbers_and_clamps_ratios():
+    cfg = Config.from_dict({
+        "poll_minutes": 1e309,
+        "request_timeout_seconds": float("nan"),
+        "toc_reset_new_ratio": -1,
+        "toc_reset_overlap_ratio": 2,
+        "order_trend_threshold": 0.1,
+        "history_display_cap": 0,
+    })
+    assert cfg.poll_minutes == Config().poll_minutes
+    assert cfg.request_timeout_seconds == Config().request_timeout_seconds
+    assert cfg.toc_reset_new_ratio == 0.0
+    assert cfg.toc_reset_overlap_ratio == 1.0
+    assert cfg.order_trend_threshold == 0.5
+    assert cfg.history_display_cap == 1
+
+
 def test_broken_config_json_is_quarantined_and_defaults_rewritten(tmp_path, monkeypatch):
     """config.json 改坏：备份原文件，重写一份干净默认值，工具照常启动。"""
     monkeypatch.setenv("SHUNSHU_DATA_DIR", str(tmp_path / "data"))

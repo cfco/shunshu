@@ -93,7 +93,7 @@ def _follow_last_page(fetcher: Fetcher, page, container: Container, rules: Rules
     """
     if rules.cfg.max_pages_followed < 1:
         return None
-    last_url, numeric = find_page_urls(page, rules)
+    last_url, numeric = find_page_urls(page, rules, container)
     if last_url is None and len(numeric) >= 2:
         last_url = numeric[-1][1]
     if not last_url:

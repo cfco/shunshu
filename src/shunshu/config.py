@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import asdict, dataclass, field
@@ -147,14 +148,18 @@ def _coerce_field(key: str, value):
     托盘还在、日志不再写、永远不再检查，且没有任何提示。
     """
     if key in _INT_FIELDS:
+        if isinstance(value, bool):
+            return None
         try:
-            return int(float(value))
-        except (TypeError, ValueError):
+            number = float(value)
+            return int(number) if math.isfinite(number) else None
+        except (TypeError, ValueError, OverflowError):
             return None
     if key in _FLOAT_FIELDS:
         try:
-            return float(value)
-        except (TypeError, ValueError):
+            number = float(value)
+            return number if math.isfinite(number) else None
+        except (TypeError, ValueError, OverflowError):
             return None
     if key in _LIST_FIELDS:
         return [str(item) for item in value] if isinstance(value, (list, tuple)) else None
@@ -237,6 +242,13 @@ class Config:
         cfg.request_retries = min(max(cfg.request_retries, 0), 5)
         cfg.notified_keys_keep = max(0, cfg.notified_keys_keep)
         cfg.max_report_new_chapters = max(1, cfg.max_report_new_chapters)
+        cfg.history_display_cap = max(1, cfg.history_display_cap)
+        cfg.min_container_links = max(1, cfg.min_container_links)
+        cfg.min_chapterish_links = max(1, cfg.min_chapterish_links)
+        cfg.max_pages_followed = max(0, cfg.max_pages_followed)
+        cfg.toc_reset_overlap_ratio = min(max(cfg.toc_reset_overlap_ratio, 0.0), 1.0)
+        cfg.toc_reset_new_ratio = min(max(cfg.toc_reset_new_ratio, 0.0), 1.0)
+        cfg.order_trend_threshold = min(max(cfg.order_trend_threshold, 0.5), 1.0)
         return cfg
 
     def compiled(self) -> Rules:

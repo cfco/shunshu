@@ -1,5 +1,9 @@
 import fixtures
 import pytest
+from conftest import FakeFetcher
+
+from shunshu.config import Config
+from shunshu.reader import load_toc
 
 from shunshu.toc_detect import (
     TocDetectError,
@@ -79,6 +83,90 @@ def test_unresolvable_page_raises_with_candidates(rules):
     with pytest.raises(TocDetectError) as exc:
         _container(fixtures.no_container_html(), rules=rules)
     assert exc.value.candidates, "识别失败时必须给出候选容器"
+
+
+def test_ad_class_on_anchor_itself_is_filtered():
+    html = ('<html><head><title>测试这本书</title></head><body><div class="chapterlist"><dl>'
+            + fixtures.toc_links([f"第{i}章 正章" for i in range(1, 21)])
+            + '<dd><a class="ad" href="/99.html">第99章 假章</a></dd>'
+            + '</dl></div></body></html>')
+    result = load_toc(FakeFetcher({fixtures.BASE_URL: html}), fixtures.BASE_URL, Config().compiled())
+    assert len(result.toc.chapters) == 20
+    assert result.toc.latest.title == "第20章 正章"
+    assert any(item.reason == "ad_container" and "假章" in item.text for item in result.dropped)
+
+
+def test_plain_numbered_chapters_are_not_followed_as_pages():
+    html = ('<html><head><title>无题书</title></head><body><div class="chapterlist"><dl>'
+            + ''.join(f'<dd><a href="{i}.html">{i}</a></dd>' for i in range(1, 21))
+            + '</dl></div></body></html>')
+    fetcher = FakeFetcher({fixtures.BASE_URL: html})
+    result = load_toc(fetcher, fixtures.BASE_URL, Config().compiled())
+    assert fetcher.calls == [fixtures.BASE_URL]
+    assert len(result.toc.chapters) == 20
+    assert result.toc.pages_followed == 1
+
+
+def test_numbered_chapters_with_page_like_urls_inside_container_are_kept():
+    html = ('<html><head><title>无题书</title></head><body><div class="chapterlist"><dl>'
+            + ''.join(f'<dd><a href="_{i}.html">{i}</a></dd>' for i in range(1, 21))
+            + '</dl></div></body></html>')
+    fetcher = FakeFetcher({fixtures.BASE_URL: html})
+    result = load_toc(fetcher, fixtures.BASE_URL, Config().compiled())
+    assert fetcher.calls == [fixtures.BASE_URL]
+    assert len(result.toc.chapters) == 20
+    assert result.toc.latest.number == 20
+
+
+def test_plain_numeric_pagination_outside_chapter_container_is_followed(rules):
+    html = ('<html><head><title>测试这本书</title></head><body>'
+            '<div class="chapterlist"><dl>'
+            + fixtures.toc_links([f"第{i}章 正章" for i in range(1, 21)])
+            + '</dl></div><div class="nav"><a href="21.html">21</a><a href="22.html">22</a></div>'
+            '</body></html>')
+    last_page = ('<html><head><title>测试这本书</title></head><body>'
+                 '<div class="chapterlist"><dl><dd><a href="23.html">第23章 最新章节</a></dd></dl></div>'
+                 '</body></html>')
+    fetcher = FakeFetcher({fixtures.BASE_URL: html, fixtures.BASE_URL + "22.html": last_page})
+
+    result = load_toc(fetcher, fixtures.BASE_URL, rules)
+    assert fetcher.calls == [fixtures.BASE_URL, fixtures.BASE_URL + "22.html"]
+    assert result.toc.pages_followed == 2
+    assert result.toc.latest.title == "第23章 最新章节"
+
+
+def test_mixed_numeric_page_url_styles_outside_container_are_followed(rules):
+    html = ('<html><head><title>测试这本书</title></head><body>'
+            '<div class="chapterlist"><dl>'
+            + fixtures.toc_links([f"第{i}章 正章" for i in range(1, 21)])
+            + '</dl></div><div class="nav"><a href="21.html">21</a>'
+            '<a href="_22.html">22</a><a href="23.html">23</a></div>'
+            '</body></html>')
+    last_page = ('<html><head><title>测试这本书</title></head><body>'
+                 '<div class="chapterlist"><dl><dd><a href="24.html">第24章 最新章节</a></dd></dl></div>'
+                 '</body></html>')
+    fetcher = FakeFetcher({fixtures.BASE_URL: html, fixtures.BASE_URL + "23.html": last_page})
+
+    result = load_toc(fetcher, fixtures.BASE_URL, rules)
+    assert fetcher.calls == [fixtures.BASE_URL, fixtures.BASE_URL + "23.html"]
+    assert result.toc.latest.title == "第24章 最新章节"
+
+
+def test_numeric_pagination_uses_the_last_continuous_run(rules):
+    html = ('<html><head><title>测试这本书</title></head><body>'
+            '<div class="chapterlist"><dl>'
+            + fixtures.toc_links([f"第{i}章 正章" for i in range(1, 21)])
+            + '</dl></div><div class="nav"><a href="1.html">1</a>'
+            '<a href="21.html">21</a><a href="_22.html">22</a><a href="23.html">23</a></div>'
+            '</body></html>')
+    last_page = ('<html><head><title>测试这本书</title></head><body>'
+                 '<div class="chapterlist"><dl><dd><a href="24.html">第24章 最新章节</a></dd></dl></div>'
+                 '</body></html>')
+    fetcher = FakeFetcher({fixtures.BASE_URL: html, fixtures.BASE_URL + "23.html": last_page})
+
+    result = load_toc(fetcher, fixtures.BASE_URL, rules)
+    assert fetcher.calls == [fixtures.BASE_URL, fixtures.BASE_URL + "23.html"]
+    assert result.toc.latest.title == "第24章 最新章节"
 
 
 def test_manual_selector_can_be_used(rules):

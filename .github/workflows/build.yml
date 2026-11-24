@@ -2,14 +2,14 @@
 #
 # 触发方式：
 #   1. push 到 main 分支 → 跑测试 + 打包 + 按 pyproject.toml 的版本号自动发布 Release
-#   2. push tag v*       → 同上，Release 挂在这个 tag 上
+#   2. push tag vX.Y.Z   → 发布该 tag 的同号包，不再自动升版
 #   3. 手动 dispatch      → 和 main 分支一样
 #
 # 也就是说：不需要在本地手动打 tag，改完代码把版本号往上推一次，Release 就跟着更新；就算忘了抬
 # 版本号，这一版也已经发过了，CI 照样往后走一个空闲号发成新包。
 #
-# 发版号由最前面的 plan job 定，规则是**每次 push 都发一个没发过的号，绝不覆盖已经发出去的包**：
-# pyproject 那个号还没打过 tag 就直接用它（正常发版仍是「改版本号 + push」），tag 已经存在就 patch
+# 发版号由最前面的 plan job 定，规则是**每次 push 主分支都发一个没发过的号，绝不覆盖已经发出去的包**：
+# tag 事件直接使用 tag 中的版本；主分支 push 时 pyproject 那个号还没打过 tag 就直接用它
 # 往后找第一个空闲的号。于是忘抬版本号又推一次 = 多发一份新包，而不是把上一次 Release 的内容悄悄
 # 换掉——旧包的下载链接永远指向它当初那份东西。
 #
@@ -18,7 +18,7 @@
 #     ├── shunshu.exe                          主程序 + popup 子命令，同一个 exe
 #     └── 运行时依赖（含 zhconv 词库、Tk、pystray/PIL 后端）
 #   shunshu-{版本}-windows-amd64-onefile.exe ← 单文件模式：一个 exe 拷走即用
-#   shunshu-{版本}-linux-x86_64.tar.gz       ← Ubuntu 26.04/26.10 解压即用（容器里编的那份）
+#   shunshu-{版本}-linux-x86_64.tar.gz       ← Ubuntu 26.10 解压即用（容器里编的那份）
 #   shunshu-{版本}-linux-amd64.deb           同一套东西搬进 /opt/shunshu + 软链 + .desktop
 #   shunshu-{版本}-py3-none-any.whl          ← 别的发行版用的纯 Python wheel（gi 走目标机 apt）
 #   install-linux.sh                           一条命令装好：apt 依赖 → 系统 python3 的 venv → 自检托盘后端
@@ -62,7 +62,9 @@ jobs:
           mkdir -p .tmp
           # ls-remote 不用 GitHub API（匿名调用限流很紧），tag 列表一次就够
           git ls-remote --tags origin > .tmp/tags.txt
-          version=$(python3 scripts/plan_release.py --tags .tmp/tags.txt)
+          TAG_ARG=""
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then TAG_ARG="--tag=$GITHUB_REF_NAME"; fi
+          version=$(python3 scripts/plan_release.py --tags .tmp/tags.txt ${TAG_ARG:+"$TAG_ARG"})
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "本次发版：v$version（pyproject 里写的是 v$(sed -n 's/^version = \"\([^\"]*\)\".*/\1/p' pyproject.toml | head -1)）"
 
@@ -191,6 +193,8 @@ jobs:
         run: |
           if ("${{ github.ref }}" -like "refs/tags/v*") {
             $name = "${{ github.ref_name }}"
+            $version = (Select-String -Path pyproject.toml -Pattern '^version = "(.+?)"').Matches.Groups[1].Value
+            if ($name -ne "v$version") { throw "tag $name 与产物版本 v$version 不一致" }
           } else {
             $version = (Select-String -Path pyproject.toml -Pattern '^version = "(.+?)"').Matches.Groups[1].Value
             $name = "v$version"
@@ -245,7 +249,7 @@ jobs:
     # 抢着建同名 tag；needs plan 是为了拿到与 Windows 完全相同的发版号（两边必须落在同一个 Release）
     needs: [build, plan]
     # Windows job 失败也照样出 Linux 包：两个平台的编译不该互相绑死
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
     container:
       image: ubuntu:26.10
       options: --user root
@@ -546,7 +550,7 @@ jobs:
           Section: utils
           Priority: optional
           Maintainer: cfco <minyaohua@gmail.com>
-          Depends: python3-gi, python3-tk, gir1.2-gtk-3.0, gir1.2-glib-2.0, gir1.2-freedesktop, libgtk-3-0t64, python3-xlib, gir1.2-appindicator3-0.1 | gir1.2-ayatanaappindicator3-0.1
+          Depends: python3 (>= 3.14), python3 (<< 3.15), python3-gi, python3-tk, gir1.2-gtk-3.0, gir1.2-glib-2.0, gir1.2-freedesktop, libgtk-3-0t64, python3-xlib, gir1.2-appindicator3-0.1 | gir1.2-ayatanaappindicator3-0.1
           Description: 小说目录页更新监控（托盘常驻 + 弹窗提醒）
            抓小说目录页、认出章节容器、有新章就在右上角弹卡片。没有窗口界面，
            添加、删除、改间隔全在托盘右键菜单里。数据目录 ~/.local/share/shunshu。
@@ -583,7 +587,11 @@ jobs:
         id: tag
         run: |
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            name="${{ github.ref_name }}"
+            if [[ "$name" != "v${{ steps.version.outputs.value }}" ]]; then
+              echo "tag $name 与产物版本 v${{ steps.version.outputs.value }} 不一致" >&2; exit 1
+            fi
+            echo "name=$name" >> "$GITHUB_OUTPUT"
           else
             echo "name=v${{ steps.version.outputs.value }}" >> "$GITHUB_OUTPUT"
           fi

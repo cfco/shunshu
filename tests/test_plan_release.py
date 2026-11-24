@@ -108,6 +108,31 @@ def test_main_without_apply_leaves_the_files_alone(tmp_path, capsys):
     assert read_current_version(pyproject.read_text(encoding="utf-8")) == "0.17.0"
 
 
+def test_tag_event_keeps_the_exact_version_even_if_already_taken(tmp_path, capsys):
+    pyproject = tmp_path / "pyproject.toml"
+    tags = tmp_path / "tags.txt"
+    pyproject.write_text(PYPROJECT, encoding="utf-8")
+    tags.write_text(LS_REMOTE, encoding="utf-8")
+
+    code = main(["--tag", "v0.17.0", "--tags", str(tags), "--pyproject", str(pyproject)])
+    assert code == 0
+    assert capsys.readouterr().out.strip() == "0.17.0"
+
+
+@pytest.mark.parametrize("tag", ["0.17.0", "v0.17", "v0.17.0-extra", ""])
+def test_invalid_tag_is_rejected(tmp_path, tag):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(PYPROJECT, encoding="utf-8")
+    assert main(["--tag", tag, "--pyproject", str(pyproject)]) == 2
+
+
+@pytest.mark.parametrize("version", ["", "0.17", "v0.17.0", "0.17.0-extra"])
+def test_empty_or_invalid_planned_version_is_rejected(tmp_path, version):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(PYPROJECT, encoding="utf-8")
+    assert main(["--set-version", version, "--pyproject", str(pyproject)]) == 2
+
+
 def test_main_set_version_forces_the_plan_jobs_choice(tmp_path, capsys):
     """两个 build job 用 plan 的结论改写自己检出里的文件，不能再各算一次。"""
     pyproject = tmp_path / "pyproject.toml"

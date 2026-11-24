@@ -26,7 +26,7 @@ uv run shunshu
 每次 push 到 `main` 都自动出包并发布到 **Releases**，Linux 有两种拿法：
 
 ```bash
-# 一（Ubuntu 26.04 / 26.10，下载即用）：deb 顺带把系统侧依赖 apt 装好
+# 一（Ubuntu 26.10，下载即用）：deb 顺带把系统侧依赖 apt 装好
 sudo apt install ./shunshu-<版本>-linux-amd64.deb
 shunshu
 
@@ -35,7 +35,7 @@ curl -fsSL https://github.com/cfco/shunshu/releases/latest/download/install-linu
 bash /tmp/install-linux.sh
 ```
 
-**deb 与 tar.gz 在 `ubuntu:26.10` 的容器里编，而且 `gi` 不再打进包里。** 这条线翻了两次车才看清：v0.16.0 在 24.04 的 runner 上编，Nuitka 的 gi 插件把编译机那份 `gi` 连系统整目录的 typelib 快照一起打进产物，运行时又把 `GI_TYPELIB_PATH` 指向快照——装到 Ubuntu 26.10 上启动就崩成一句没有文字的 `AssertionError`（`gi/overrides/Gdk.py` 里 `assert g_type != TYPE_NONE`：Gdk 的 typelib 读到了，本机 `libgdk-3` 却给不出 `GdkColor` 的 GType），而 CI 在编译机上永远全绿。换成「在 26.10 容器里编」之后，**同一个容器里照样崩**，这次是 `unix_signal_add_full was set deprecated but wasn't added to __all__`——3.57 的 `gi/overrides` 与新版 glib 把 `unix_*` 拆到 `GLibUnix-2.0` 这件事对不上号。同一套 apt 的 gi 在 wheel 那条路上一直是全绿的，所以现在的做法是产物里根本不带 gi：`--disable-plugins=gi` + `--nofollow-import-to=gi`，运行时 `packaging.expose_system_gi()` 只在 Linux 打包态把 `/usr/lib/python3/dist-packages` 挂到 `sys.path` 末尾，`gi` 与 `_gi.so` 全用 apt 那一份（deb 的 `Depends` 因此必须有 `python3-gi`）。剩下的约束是包的 ABI 绑在编译容器的 python 小版本上（26.10 是 3.14），所以 tar.gz/deb 只保证 26.04/26.10；跨发行版或换了 python 小版本就用同一个 Release 里的 wheel + `install-linux.sh`，CI 每轮也会在同一个 26.10 容器里把那条命令原样跑一遍。
+**deb 与 tar.gz 在 `ubuntu:26.10` 的容器里编，而且 `gi` 不再打进包里。** 这条线翻了两次车才看清：v0.16.0 在 24.04 的 runner 上编，Nuitka 的 gi 插件把编译机那份 `gi` 连系统整目录的 typelib 快照一起打进产物，运行时又把 `GI_TYPELIB_PATH` 指向快照——装到 Ubuntu 26.10 上启动就崩成一句没有文字的 `AssertionError`（`gi/overrides/Gdk.py` 里 `assert g_type != TYPE_NONE`：Gdk 的 typelib 读到了，本机 `libgdk-3` 却给不出 `GdkColor` 的 GType），而 CI 在编译机上永远全绿。换成「在 26.10 容器里编」之后，**同一个容器里照样崩**，这次是 `unix_signal_add_full was set deprecated but wasn't added to __all__`——3.57 的 `gi/overrides` 与新版 glib 把 `unix_*` 拆到 `GLibUnix-2.0` 这件事对不上号。同一套 apt 的 gi 在 wheel 那条路上一直是全绿的，所以现在的做法是产物里根本不带 gi：`--disable-plugins=gi` + `--nofollow-import-to=gi`，运行时 `packaging.expose_system_gi()` 只在 Linux 打包态把 `/usr/lib/python3/dist-packages` 挂到 `sys.path` 末尾，`gi` 与 `_gi.so` 全用 apt 那一份（deb 的 `Depends` 因此必须有 `python3-gi`）。剩下的约束是包的 ABI 绑在编译容器的 python 小版本上（26.10 是 3.14），所以 tar.gz/deb 只保证 Ubuntu 26.10 / Python 3.14，deb 的 `Depends` 会明确挡住 Python 3.12；跨发行版或换了 python 小版本就用同一个 Release 里的 wheel + `install-linux.sh`，CI 每轮也会在同一个 26.10 容器里把那条命令原样跑一遍。
 
 源码态开发要右键菜单，也得用系统解释器建 venv（`gi` 只有那一份）：
 
@@ -162,7 +162,7 @@ python3 -m venv --system-site-packages .venv && .venv/bin/pip install -e .
 
 不需要手动打包也不需要手动打 tag：CI（`.github/workflows/build.yml`）每次 push 到 `main` 都会跑测试、Windows 用 Nuitka 编 standalone 目录与单文件 exe、Linux 在 `ubuntu:26.10` 容器里编 tar.gz 与 deb（外加一份 wheel + `install-linux.sh`），然后自动发布到 **Releases**（tag 不存在时由 CI 建）。
 
-**每次 push 发的都是一个没发过的号，不会覆盖已经发出去的包。** 最前面的 `plan` job 用 `git ls-remote --tags` 对一遍：`pyproject.toml` 里那个号还没打过 tag 就直接用它（所以发版动作仍是「改版本号 + push」，**顺带在变更记录里补一条那版的说明**——发布页正文就是 `scripts/release_notes.py` 从下面「变更记录」里取的那一条，GitHub 自动生成的 notes 关掉了）；号已经被占用（这一版发过了，或者忘抬版本号又推了一次）就 patch 往后找第一个空闲的号，两个 build job 再照它改写自己检出里的 `pyproject.toml` 与 `uv.lock`——wheel 的文件名与元数据、deb 的 `Version`、产物里那个 `VERSION` 都从 pyproject 取，所以必须与 Release 的 tag 是同一个号。自动往后走的那些 patch 号在变更记录里没有条目，正文退成「本次提交的第一行 + 一句提醒」，不判失败。手动打 `v*` tag 也能触发，用于补发某个版本。
+**每次 push 主分支发的都是一个没发过的号，不会覆盖已经发出去的包。** 最前面的 `plan` job 用 `git ls-remote --tags` 对一遍：`pyproject.toml` 里那个号还没打过 tag 就直接用它（所以发版动作仍是「改版本号 + push」，**顺带在变更记录里补一条那版的说明**——发布页正文就是 `scripts/release_notes.py` 从下面「变更记录」里取的那一条，GitHub 自动生成的 notes 关掉了）；号已经被占用（这一版发过了，或者忘抬版本号又推了一次）就 patch 往后找第一个空闲的号，两个 build job 再照它改写自己检出里的 `pyproject.toml` 与 `uv.lock`——wheel 的文件名与元数据、deb 的 `Version`、产物里那个 `VERSION` 都从 pyproject 取，所以必须与 Release 的 tag 是同一个号。自动往后走的那些 patch 号在变更记录里没有条目，正文退成「本次提交的第一行 + 一句提醒」，不判失败。手动打 `vX.Y.Z` tag 也能触发，用于补发某个版本；tag 事件直接发布 tag 的同号包，不再自动升版，发布前还会硬核对 tag 与产物版本一致。
 
 每次 push 都自动出这几个包，按需取用：
 
@@ -170,8 +170,8 @@ python3 -m venv --system-site-packages .venv && .venv/bin/pip install -e .
 | --- | --- | --- |
 | `shunshu-<版本>-windows-amd64.zip` | folder 模式：`shunshu.exe` + 依赖目录，解压即用 | 启动最快，首次运行不解包 |
 | `shunshu-<版本>-windows-amd64-onefile.exe` | 单个 exe | 拷一个文件就走；首次运行解包到 `%LOCALAPPDATA%` 下按版本固定的缓存目录 |
-| `shunshu-<版本>-linux-x86_64.tar.gz` | folder 模式：`shunshu` 二进制 + 依赖目录，解压即用 | Ubuntu 26.04 / 26.10（在 `ubuntu:26.10` 容器里编，gi 与 typelib 快照按这一版对齐） |
-| `shunshu-<版本>-linux-amd64.deb` | 同一个目录搬进 `/opt/shunshu` + `/usr/bin/shunshu` 软链 + `.desktop` | 同上；系统侧依赖写在 `Depends` 里，apt 会一起装 |
+| `shunshu-<版本>-linux-x86_64.tar.gz` | folder 模式：`shunshu` 二进制 + 依赖目录，解压即用 | Ubuntu 26.10 / Python 3.14（在 `ubuntu:26.10` 容器里编，运行时用目标机 apt 的 gi） |
+| `shunshu-<版本>-linux-amd64.deb` | 同一个目录搬进 `/opt/shunshu` + `/usr/bin/shunshu` 软链 + `.desktop` | 仅 Ubuntu 26.10 / Python 3.14；`Depends` 明确约束 `python3 >= 3.14, << 3.15`，系统侧依赖由 apt 一起装 |
 | `shunshu-<版本>-py3-none-any.whl` | 纯 Python wheel（没有 C 扩展） | 别的发行版：`gi`、GTK3、Tk 全用 apt 那套，同一个包通吃 3.12/3.13/3.14 |
 | `install-linux.sh` | 一条命令装好：apt 依赖 → 系统 python3 的 venv → 装 wheel → 自检托盘后端 | 配合上面的 wheel；每次发版在 `ubuntu:26.10` 容器里把这条命令原样跑一遍 |
 
@@ -234,6 +234,7 @@ xvfb-run -a .venv-linux/bin/python -m pytest tests -q  # CI 里那条：apt 解�
 
 ## 变更记录
 
+- **0.20.0（2026-11-24）**：一轮完整审计的 20 项修复，重点是“不再漏提醒”和“不再发错包”。① **提醒链路**：历史日志先写、状态后提交，写失败不会把新章吞成已处理；卡片启动失败会留在补弹账里，下一轮无更新也重试，后续更新合并旧账而不是覆盖；启动摘要/菜单/弹卡异常不再杀掉唯一轮询线程，`run_forever()` 一定接上。② **卡片并发**：每次弹卡带代际与章节快照，退出交叠、同键并发不再留无主卡或覆盖句柄；旧卡回执只清它对应的章节，不误清新卡；0.5 秒内正常关闭也记回执。③ **抓取与目录**：正文读取超时不再误判成连接失败去切代理；`<a class="ad">` 自身也过滤；纯数字章节不再当数字分页；只删明确的推广括号，“归来（上/下）”不再合并；向上重编号不再冒充断档追赶；目标域名含 proxy/socks 不再误报代理故障；非法代理凭据不再进日志。④ **状态边界**：抓取中删除小说不再弹旧卡；`1e309`/NaN 不再掀掉启动；手改的最新章节文本字段统一归一；显示上限与重置阈值夹到合法区间；删除重加、暂停恢复不再继承陈旧退避。⑤ **Linux 交互**：`.desktop` 的 `Exec=` 改用规范双引号，不再套 shell 单引号；浏览器走有界启动，剪贴板、打开章节、打开数据目录完整移出菜单线程。⑥ **发布**：tag 事件发布 tag 的同号包并在发布前硬核对；plan 失败时 Ubuntu job 直接跳过，空版本号直接报错；deb 明确约束 Python 3.14，撤回 Ubuntu 26.04 的错误兼容声明。⑦ 用例 328 → 376（含 1 条跳过），独立复核又补修 10 项边界回归（并发旧卡回执、保存失败仍弹卡、跨重试响应状态、纯数字分页、ack 竞态、ack 保存失败、混合分页网址、启动补弹重弹、容器内数字章节、分页连续段）；全量测试、编译检查、`git diff --check` 通过；本机 Windows standalone 与 onefile 均已按 CI 参数编译，并分别通过真实 `popup` 子进程冒烟。真实 Linux 托盘宿主、浏览器关联和 GitHub Actions 实际发布仍未在本机执行，需 CI/真机复核。
 - **0.19.6（2026-11-05）**：Linux 二进制这条路走通了，顺手把「探针只会绿」这个隐患补上。① **0.19.5 现场**：`ubuntu:26.10` 容器里编出的 tar.gz/deb 冒烟报 `托盘后端: _appindicator（有右键菜单）`，产物里 `import gi ok: /usr/lib/python3/dist-packages/gi/__init__.py`，Gtk／AppIndicator3／AyatanaAppIndicator3／DBus 四个 `require_version` 全 ok，卡片子进程活着——从 v0.19.0「gi 不再进产物」开始的这条链第一次全绿（Windows 同轮也绿，328 条用例在 26.10 上全过）。② **探针现在真能失败**：`Probe system gi inside a Nuitka bundle` 原来贴完输出就结束（`|| true` 收退出码，探针自己在 import 失败时也 `SystemExit(0)`），产物里取不到 gi 时这步照样绿，要等整包编译 + 冒烟才红；现在输出照旧进摘要，随后按 `result.txt` 判两条硬门槛——`产物里 import gi ok` 与 `require_version Gtk ok`，缺一条当场失败，少白等八分钟。③ **两处过期说法**：deb 打包注释里「typelib 仍然不搬、快照对齐」是 v0.19.0 之前的前提（gi 早就不进产物，没有快照可搬），改成「系统依赖一律走 Depends」；冒烟那行「已写进 Release 说明」实际只进 step summary（Release 正文来自 README 变更记录），改成「记在本步骤摘要里」。④ 运行时与产物不变：Linux tar.gz/deb/wheel + `install-linux.sh`、Windows zip/onefile 照旧；本次只动 CI 与注释，用例仍 328 条。⑤ 真机上「图标显不显示、右键菜单点得开吗、GNOME 要不要装 AppIndicator 扩展、Wayland 下卡片位置」仍只能真机看。
 - **0.19.5（2026-11-05）**：闸门放开后 `import gi` 真开始执行了，接着缺的是标准库。① **v0.19.4 现场**：`打包态=True；/usr/lib/python3/dist-packages 在 sys.path=True；import gi: ModuleNotFoundError: No module named 'asyncio'`——`excluded-module-usage` 那道闸门已经过了（不再是 `Module 'gi' was actively excluded`），PyGObject 3.57 的 gi 要 asyncio，而 **gi 不在冻结图里，它依赖链上的标准库 Nuitka 也一并看不见**。② **改**：`Nuitka compile` 加 `--include-package=asyncio`（探针产物同一组参数一起加，不然探针和整包条件不一致会误导）；`packaging.expose_system_gi()` 的 docstring 补上这第二层「看不见的依赖」。③ **不再一轮试一个模块**：探针步骤现在同时在 venv 里把 `import gi + Gtk + pystray` 真正拉起来的模块全列出（分标准库/非标准库两行，进 step summary），下次再缺就照那张表一次补齐。④ **另一件已经证明的事**：`_xorg` 那串 `Failed to dock icon` / `AssertionError` 是 xvfb 上没有 tray owner 必然 dock 不上，pystray 自己捕获后打印的噪音——进程活到了被 timeout 收掉，0.19.2 那句 latin-1 崩已经不再出现。⑤ 冒烟门槛仍要求 `_appindicator|_gtk`；用例仍 328 条。
 - **0.19.4（2026-11-05）**：Linux 产物退到 `_xorg` 的根因抓到了，解法 Nuitka 自己写在报错里。① **证据**：v0.19.3 冒烟日志里 `gi_probe()` 那行是 `打包态=True；/usr/lib/python3/dist-packages 在 sys.path=True；import gi: ImportError: Module 'gi' was actively excluded from Nuitka compilation. Disable with '--no-deployment-flag=excluded-module-usage'` —— 路径挂上了也没用，Nuitka 对 `--nofollow-import-to` 的模块**运行时一起拒绝 import**，这道默认闸门就叫 `excluded-module-usage`。同一容器里 venv 那侧 `Gtk ok／AppIndicator3 ok／AyatanaAppIndicator3 ok／DBus ok`、328 条用例全过，缺的从来不是 apt 包。② **改**：`Nuitka compile` 加 `--no-deployment-flag=excluded-module-usage`，并把这条前提写进 `packaging.expose_system_gi()` 的 docstring，免得下次又只盯着 `sys.path`。③ **顺带修掉一条假绿**：`Probe system gi` 那步在 v0.19.3 里「成功」但探针根本没跑——Linux 上不加 `--output-filename` 时产物叫 `probe.bin`，`probe: not found` 被那句 `|| true` 吞了；现在补 `--output-filename=probe`，并且「产物不在预期路径」直接判失败、把目录列出来。④ 冒烟门槛仍要求 `_appindicator|_gtk`，这一版是冻结产物第一次真有机会选到带右键菜单的后端（`_xorg` 那条 latin-1 崩已在 0.19.2 修掉）。⑤ 用例仍 328 条；真机上的托盘显示与卡片位置仍只能真机看。

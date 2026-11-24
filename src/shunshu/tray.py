@@ -137,6 +137,9 @@ class TrayApp:
     # ---------- 菜单动作 ----------
 
     def act_add_from_clipboard(self, icon=None, item=None) -> None:
+        self._start_bg(self._add_from_clipboard)
+
+    def _add_from_clipboard(self) -> None:
         url = extract_url(read_text())
         if not url:
             self._flash("没有可识别的链接", "请先在浏览器里复制小说目录页的网址")
@@ -156,6 +159,9 @@ class TrayApp:
 
     def act_add_source_from_clipboard(self, novel_id: str, icon=None, item=None) -> None:
         """往已有的一本挂第二个来源：剪贴板里是另一个站的目录页网址。"""
+        self._start_bg(self._add_source_from_clipboard, novel_id)
+
+    def _add_source_from_clipboard(self, novel_id: str) -> None:
         url = extract_url(read_text())
         if not url:
             self._flash("没有可识别的链接", "请先在浏览器里复制另一个目录页的网址")
@@ -188,6 +194,9 @@ class TrayApp:
             self._flash("已重新加载配置", "data/config.json 与 data/novels.json 已生效")
 
     def act_open_latest(self, novel_id: str, icon=None, item=None) -> None:
+        self._start_bg(self._open_latest, novel_id)
+
+    def _open_latest(self, novel_id: str) -> None:
         novel = self.state.novel(novel_id)
         chapter = novel.latest_chapter() if novel else None
         if chapter is None:
@@ -200,7 +209,11 @@ class TrayApp:
     def act_toggle_novel(self, novel_id: str, icon=None, item=None) -> None:
         novel = self.state.novel(novel_id)
         if novel is not None:
-            self.state.set_novel_enabled(novel.id, not all(s.enabled for s in novel.sources))
+            enabled = not all(s.enabled for s in novel.sources)
+            self.state.set_novel_enabled(novel.id, enabled)
+            if enabled:
+                for source in novel.sources:
+                    self.scheduler.forget(source.id)
             self._rebuild_menu()
 
     def act_delete_novel(self, novel_id: str, icon=None, item=None) -> None:
@@ -227,7 +240,10 @@ class TrayApp:
         source = novel.source(source_id) if novel else None
         if source is None:
             return
-        self.state.set_source_enabled(novel_id, source_id, not source.enabled)
+        enabled = not source.enabled
+        self.state.set_source_enabled(novel_id, source_id, enabled)
+        if enabled:
+            self.scheduler.forget(source_id)
         self._rebuild_menu()
 
     def act_delete_source(self, novel_id: str, source_id: str, icon=None, item=None) -> None:
@@ -277,6 +293,9 @@ class TrayApp:
         self._rebuild_menu()
 
     def act_open_data_dir(self, icon=None, item=None) -> None:
+        self._start_bg(self._open_data_dir)
+
+    def _open_data_dir(self) -> None:
         target = str(self.state.paths.root)
         try:
             if IS_WINDOWS:
@@ -367,7 +386,10 @@ class TrayApp:
         排在启动摘要之后弹：补的那几张才是主角，压在最新一层才不会被摘要卡盖住。
         这一轮启动检查刚弹过的书要跳过——那张卡已经在了，再弹一张只会把前一张顶掉。
         """
-        just_popped = {alert.novel.id for alert in self.state.last_alerts}
+        self.state.settle_card_acks()
+        just_popped = {alert.novel.id for alert in self.state.last_alerts
+                       if self.notifier.has_live(alert.novel.id)}
+        self.state.settle_card_acks()
         pending = [alert for alert in self.state.pending_unseen_alerts()
                    if alert.novel.id not in just_popped]
         if pending:
@@ -568,25 +590,37 @@ class TrayApp:
         if self.boot_delay and self._wait_for_boot():
             return
         try:
-            outcomes = self.scheduler.run_once(force=True)
-            failed = ""
+            try:
+                outcomes = self.scheduler.run_once(force=True)
+                failed = ""
+            except Exception as exc:
+                outcomes = []
+                failed = repr(exc)
+                self._flash("启动检查失败", failed)
+            lines = self.state.startup_lines(outcomes)
+            self._status_hint = lines[0] if lines else self._status_hint
+            self._sync_icon_state()
+            self._rebuild_menu()
+            # 启动轮崩了不能顺着 startup_lines 的空结果写成「书架为空」：那是另一句假话，
+            # 还会把刚弹的失败卡盖掉（同一标题去重，后一张顶掉前一张）
+            body = [*getattr(self.state, "load_warnings", []), *lines[1:]]
+            if failed:
+                body = [f"启动检查失败：{failed}"]
+            launch = next((o.latest.url for o in outcomes if o.latest), "")
+            self.notifier.show("顺手 · 启动检查", body or ["书架为空"], launch)
+            self._repop_unseen()
         except Exception as exc:
-            outcomes = []
-            failed = repr(exc)
-            self._flash("启动检查失败", failed)
-        lines = self.state.startup_lines(outcomes)
-        self._status_hint = lines[0] if lines else self._status_hint
-        self._sync_icon_state()
-        self._rebuild_menu()
-        # 启动轮崩了不能顺着 startup_lines 的空结果写成「书架为空」：那是另一句假话，
-        # 还会把刚弹的失败卡盖掉（同一标题去重，后一张顶掉前一张）
-        body = [*getattr(self.state, "load_warnings", []), *lines[1:]]
-        if failed:
-            body = [f"启动检查失败：{failed}"]
-        launch = next((o.latest.url for o in outcomes if o.latest), "")
-        self.notifier.show("顺手 · 启动检查", body or ["书架为空"], launch)
-        self._repop_unseen()
-        self.scheduler.run_forever()
+            try:
+                append_text(self.state.paths.runtime_log,
+                            f"{now_stamp()} 启动后处理异常: {type(exc).__name__}: {exc}")
+            except OSError:
+                pass
+            try:
+                self._flash("启动提示失败", f"{type(exc).__name__}: {exc}")
+            except Exception:
+                pass
+        finally:
+            self.scheduler.run_forever()
 
     def _wait_for_boot(self) -> bool:
         """开机自启那一等：等代理客户端起来再跑启动那一轮。
