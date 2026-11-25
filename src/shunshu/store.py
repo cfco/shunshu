@@ -5,8 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import threading
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -86,19 +89,22 @@ class Paths:
         self.candidates.mkdir(parents=True, exist_ok=True)
 
 
-def quarantine_broken_json(path: Path, reason: str) -> Path | None:
-    """把读不动的 JSON 改名隔离成 .bak，腾出位置让上层重写一份干净默认值。
-
-    文件名带时间戳：连续两次改坏也不会覆盖掉前一份现场。返回备份路径，失败返回 None。
-    """
-    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+def _backup_target(path: Path) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
     backup = path.with_name(f"{path.name}.{stamp}.bak")
-    try:
-        path.replace(backup)
-    except OSError:
-        return None
-    LAST_LOAD_WARNINGS.append(
-        f"{path.name} 已损坏（{reason}），原文件备份为 {backup.name}，本次按空数据启动")
+    suffix = 2
+    while backup.exists():
+        backup = path.with_name(f"{path.name}.{stamp}-{suffix}.bak")
+        suffix += 1
+    return backup
+
+
+def quarantine_broken_json(path: Path, reason: str) -> Path:
+    """把坏 JSON 改名隔离成 .bak；备份失败必须抛出，不能接着按空数据启动。"""
+    backup = _backup_target(path)
+    # 改名失败（占用/权限/只读）会连同原 OSError 一起交给上层，原文件保持不动。
+    path.replace(backup)
+    LAST_LOAD_WARNINGS.append(f"{path.name} 已损坏（{reason}），原文件备份为 {backup.name}")
     try:
         append_text(path.parent / "shunshu.log", f"{now_stamp()} 配置降级：{path} {reason}")
     except OSError:
@@ -106,14 +112,22 @@ def quarantine_broken_json(path: Path, reason: str) -> Path | None:
     return backup
 
 
+def backup_json_copy(path: Path, reason: str) -> Path:
+    """过滤坏条目时复制现场，原文件留到下一次正常保存，崩溃也不会丢掉幸存数据。"""
+    backup = _backup_target(path)
+    shutil.copy2(path, backup)
+    LAST_LOAD_WARNINGS.append(f"{path.name} 含损坏条目（{reason}），原文件备份为 {backup.name}")
+    return backup
+
+
 def load_novels(paths: Paths) -> list[Novel]:
-    """读书架；novels.json 不存在返回空书架，手改坏了就隔离备份并按空书架启动。"""
-    if not paths.novels.exists():
-        return []
+    """读书架；坏内容隔离备份，读取/备份失败则抛错，绝不把失败当成空书架。"""
     with _LOCK:
         try:
             raw = json.loads(paths.novels.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except FileNotFoundError:
+            return []
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             quarantine_broken_json(paths.novels, f"{type(exc).__name__}: {exc}")
             return []
     if not isinstance(raw, (dict, list)):
@@ -121,41 +135,59 @@ def load_novels(paths: Paths) -> list[Novel]:
         return []
     items = raw.get("novels", raw) if isinstance(raw, dict) else raw
     if not isinstance(items, list):
-        LAST_LOAD_WARNINGS.append(
-            f"novels.json 里没有 novels 数组（是 {type(items).__name__}），本次按空书架启动")
+        quarantine_broken_json(
+            paths.novels, f"顶层结构缺少 novels 数组（novels 是 {type(items).__name__}）")
         return []
     novels: list[Novel] = []
     seen_novel_ids: set[str] = set()
     seen_source_ids: set[str] = set()
+    filtered = False
     for item in items:
         # 单本写坏不连累整架：跳过那一条并留警告，其余照常加载
         if not isinstance(item, dict):
             LAST_LOAD_WARNINGS.append(f"novels.json 里有一条不是对象（{type(item).__name__}），已跳过")
+            filtered = True
             continue
+        raw_sources = item.get("sources")
+        if isinstance(raw_sources, list) and any(not isinstance(s, dict) for s in raw_sources):
+            LAST_LOAD_WARNINGS.append("novels.json 的 sources 里有非对象条目，已跳过")
+            filtered = True
+        raw_index = item.get("chapter_index")
+        if isinstance(raw_index, list) and any(
+                not isinstance(e, dict) or not e.get("k") for e in raw_index):
+            LAST_LOAD_WARNINGS.append("novels.json 的 chapter_index 里有坏条目，已跳过")
+            filtered = True
         try:
             novel = Novel.from_dict(item)
         except (TypeError, ValueError, AttributeError) as exc:
             LAST_LOAD_WARNINGS.append(
                 f"novels.json 里有一条读不出来（{type(exc).__name__}: {exc}），已跳过")
+            filtered = True
             continue
         if not novel.id:
             LAST_LOAD_WARNINGS.append("novels.json 里有一条没有 id，已跳过")
+            filtered = True
             continue
         if novel.id in seen_novel_ids:
             LAST_LOAD_WARNINGS.append(f"《{novel.title or novel.id}》整本重复（id 一样），已跳过")
+            filtered = True
             continue
         seen_novel_ids.add(novel.id)
         # 小说 id 与来源 id 各查各的：add_novel 让新书的 novel.id 等于首源 id，
         # 混在一个集合里会让每本书的第一个来源都「自己跟自己重复」
-        _repair_sources(novel, seen_source_ids)
+        filtered = _repair_sources(novel, seen_source_ids) or filtered
         if not novel.sources and item.get("sources"):
             LAST_LOAD_WARNINGS.append(
                 f"《{novel.title or novel.id}》的 sources 里没有一条能用（写坏的已跳过）")
+            filtered = True
         novels.append(novel)
+    if filtered:
+        # 返回过滤后的书架前先留原现场；备份失败就抛错，不进入可写状态。
+        backup_json_copy(paths.novels, "存在坏条目、重复 id 或不可用来源，已过滤")
     return novels
 
 
-def _repair_sources(novel: Novel, seen_source_ids: set[str]) -> None:
+def _repair_sources(novel: Novel, seen_source_ids: set[str]) -> bool:
     """补齐来源 id、丢掉抓不了的来源，并把重复的 id 挡在门外。
 
     id 本就是目录页 URL 的 sha1 前 12 位，缺了就按 toc_url 补算。整个来源块被复制进
@@ -163,20 +195,24 @@ def _repair_sources(novel: Novel, seen_source_ids: set[str]) -> None:
     另一本书从此永远不更新，所以这里就当坏数据挡掉。
     """
     kept: list[Source] = []
+    filtered = False
     for source in novel.sources:
         if not source.toc_url:
             LAST_LOAD_WARNINGS.append(
                 f"《{novel.title or novel.id}》有个来源没有 toc_url，已跳过该来源")
+            filtered = True
             continue
         if not source.id:
             source.id = source_id_for(source.toc_url)
         if source.id in seen_source_ids:
             LAST_LOAD_WARNINGS.append(
                 f"《{novel.title or novel.id}》的来源 {source.site or source.id} id 重复，已跳过该来源")
+            filtered = True
             continue
         seen_source_ids.add(source.id)
         kept.append(source)
     novel.sources = kept
+    return filtered
 
 
 def save_novels(paths: Paths, novels: list[Novel]) -> None:
@@ -221,12 +257,55 @@ def _rotate_if_needed(path: Path) -> None:
         pass
 
 
-def append_jsonl(path: Path, record: dict) -> None:
-    with _LOCK:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _rotate_if_needed(path)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+@contextmanager
+def _jsonl_file_lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    with lock_path.open("a+b") as fh:
+        if os.name == "nt":
+            import msvcrt
+
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b"\0")
+                fh.flush()
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _append_jsonl(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_if_needed(path)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def append_jsonl(path: Path, record: dict, *, cross_process: bool = False) -> None:
+    if cross_process:
+        with _jsonl_file_lock(path):
+            with _LOCK:
+                _append_jsonl(path, record)
+    else:
+        with _LOCK:
+            _append_jsonl(path, record)
+
+
+# shortcut: Nuitka 4.2.2 standalone 在 popup 里编译 cross_process 关键字参数会段错误。
+def append_read_jsonl(path: Path, record: dict) -> None:
+    append_jsonl(path, record, cross_process=True)
 
 
 def _tail_lines(path: Path) -> list[str]:
@@ -275,43 +354,71 @@ def read_jsonl(path: Path, limit: int = 50) -> list[dict]:
     return out
 
 
-def drain_jsonl(path: Path) -> list[dict]:
-    """读空一个 jsonl：卡片进程写的已读记录，主程序吸收后就不能再重复算。"""
-    if not path.exists():
-        return []
-    with _LOCK:
-        # 先改名再取走：读和清之间卡片可能刚好追加一条，改名是原子的，不会把那条丢掉
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.draining")
+def _recover_draining(path: Path) -> None:
+    for snapshot in sorted(path.parent.glob(f"{path.name}.*.draining")):
+        data = snapshot.read_bytes()
+        current = path.read_bytes() if path.exists() else b""
+        if data and not current.startswith(data):
+            path.write_bytes(data + current)
+        snapshot.unlink()
+
+
+def drain_jsonl(path: Path, commit: Callable[[list[dict]], None] | None = None, *,
+                cross_process: bool = False) -> list[dict]:
+    """读空 jsonl；commit 成功后才截断，失败保留主文件和恢复快照。
+
+    read.jsonl 的卡片写入与吸收共用跨进程锁，堵住旧句柄在读取/截断之间迟写的窗口。
+    """
+    guard = _jsonl_file_lock(path) if cross_process else nullcontext()
+    with guard, _LOCK:
+        _recover_draining(path)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.draining")
         try:
-            path.rename(tmp)
-        except OSError:
+            fh = path.open("r+b")
+        except FileNotFoundError:
             return []
-        try:
-            with tmp.open("rb") as fh:
-                data = fh.read()
-                # 读完到删除之间卡片又写了一条的：同一个句柄接着读能拿到，
-                # 原样搬回正主文件交给下一轮吸收，别连着 .draining 一起 unlink 掉
-                late = fh.read()
-        except OSError:
-            return []
-        if late:
+        with fh:
+            data = fh.read()
+            tmp.write_bytes(data)
+            out: list[dict] = []
+            text = data.decode("utf-8-sig", "replace")
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            if commit is not None and out:
+                commit(out)
+            fh.seek(0)
+            current = fh.read()
+            if not current.startswith(data):
+                raise OSError("read.jsonl 在吸收期间被改写，拒绝截断")
+            snapshot_tmp = tmp.with_name(tmp.name + ".tmp")
+            snapshot_tmp.write_bytes(current)
+            os.replace(snapshot_tmp, tmp)
+            tail = current[len(data):]
             try:
-                with path.open("ab") as fh:
-                    fh.write(late)
+                fh.seek(0)
+                fh.write(tail)
+                fh.truncate(len(tail))
             except OSError:
-                pass
-        tmp.unlink(missing_ok=True)
-        text = data.decode("utf-8-sig", "replace")
-    out: list[dict] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+                try:
+                    fh.seek(0)
+                    fh.write(current)
+                    fh.truncate(len(current))
+                except OSError:
+                    pass
+                raise
         try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return out
+            tmp.unlink()
+        except OSError:
+            pass
+        if commit is None and not tail:
+            path.unlink()
+        return out
 
 
 def append_text(path: Path, text: str) -> None:

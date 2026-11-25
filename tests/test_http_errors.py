@@ -12,16 +12,23 @@ from shunshu.http import ConnectionFailureError, Fetcher, FetchError
 class _FakeResp:
     """给 Fetcher.session.get 打桩用的最小响应对象。"""
 
-    def __init__(self, status_code: int = 200, ctype: str = "text/html; charset=utf-8"):
+    def __init__(self, status_code: int = 200, ctype: str = "text/html; charset=utf-8",
+                 body: bytes = b"<html><body>ok</body></html>", location: str | None = None):
         self.status_code = status_code
         self.headers = {"Content-Type": ctype}
+        if location is not None:
+            self.headers["Location"] = location
         self.encoding = "utf-8"
+        self.body = body
+        self.read = False
+        self.closed = False
 
     def close(self) -> None:
-        pass
+        self.closed = True
 
     def iter_content(self, chunk_size):
-        return [b"<html><body>ok</body></html>"] if self.status_code < 400 else []
+        self.read = True
+        return [self.body] if self.status_code < 400 else []
 
 
 def test_4xx_fails_immediately_without_any_retry(monkeypatch):
@@ -132,6 +139,144 @@ def test_target_hostname_with_proxy_word_is_not_a_proxy_failure(monkeypatch):
     with pytest.raises(FetchError) as excinfo:
         fetcher.fetch_html("https://proxy-book.example.com/", "http://127.0.0.1:7890")
     assert not isinstance(excinfo.value, http.ProxyError)
+
+
+# ---------- 手动重定向与硬读取时限 ----------
+
+def test_redirect_body_is_not_read_and_final_page_is_capped(monkeypatch):
+    redirect = _FakeResp(302, body=b"x" * 10_000, location="/final")
+    final = _FakeResp(200, body=b"x" * 101)
+    responses = iter([redirect, final])
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        return next(responses)
+
+    fetcher = Fetcher("ua", retries=0, max_bytes=100)
+    monkeypatch.setattr(fetcher.session, "get", get)
+    with pytest.raises(FetchError, match="100 字节上限"):
+        fetcher.fetch_html("https://a.com/start")
+    assert [url for url, _ in calls] == ["https://a.com/start", "https://a.com/final"]
+    assert all(kwargs["allow_redirects"] is False and kwargs["stream"] is True for _, kwargs in calls)
+    assert redirect.closed and not redirect.read, "跳转响应只能关闭，不能读正文"
+    assert final.closed and final.read
+
+
+def test_redirect_location_must_be_http_and_redirect_count_is_limited(monkeypatch):
+    calls = []
+
+    def bad_location(url, **kwargs):
+        calls.append(url)
+        return _FakeResp(302, location="javascript:alert(1)")
+
+    fetcher = Fetcher("ua", retries=2, backoff=0)
+    monkeypatch.setattr(fetcher.session, "get", bad_location)
+    with pytest.raises(FetchError, match="Location"):
+        fetcher.fetch_html("https://a.com/")
+    assert calls == ["https://a.com/"], "非法 Location 立即失败，不重试"
+
+    calls.clear()
+
+    def loop(url, **kwargs):
+        calls.append(url)
+        return _FakeResp(302, location="/again")
+
+    monkeypatch.setattr(fetcher.session, "get", loop)
+    with pytest.raises(FetchError, match="30 次上限"):
+        fetcher.fetch_html("https://a.com/")
+    assert len(calls) == http._MAX_REDIRECTS + 1
+
+
+def test_redirect_without_location_is_treated_as_final_response(monkeypatch):
+    resp = _FakeResp(302)
+    fetcher = Fetcher("ua", retries=0)
+    monkeypatch.setattr(fetcher.session, "get", lambda *a, **k: resp)
+    assert "ok" in fetcher.fetch_html("https://a.com/")
+    assert resp.read
+
+
+def test_final_5xx_after_redirect_still_retries(monkeypatch):
+    responses = iter([
+        _FakeResp(302, location="/final"), _FakeResp(503),
+        _FakeResp(302, location="/final"), _FakeResp(200),
+    ])
+    fetcher = Fetcher("ua", retries=1, backoff=0)
+    monkeypatch.setattr(fetcher.session, "get", lambda *a, **k: next(responses))
+    assert "ok" in fetcher.fetch_html("https://a.com/")
+
+
+def test_blocking_body_read_is_interrupted_by_total_budget(monkeypatch):
+    import threading
+    import time as real_time
+
+    class BlockingResp(_FakeResp):
+        def __init__(self):
+            super().__init__()
+            self.release = threading.Event()
+
+        def close(self):
+            super().close()
+            self.release.set()
+
+        def iter_content(self, chunk_size):
+            self.read = True
+            if not self.release.wait(2):
+                raise AssertionError("watchdog 没有关闭响应")
+            raise requests.exceptions.ConnectionError("closed by watchdog")
+
+    resp = BlockingResp()
+    fetcher = Fetcher("ua", timeout=1, retries=0)
+    fetcher.url_budget_seconds = 0.05
+    monkeypatch.setattr(fetcher.session, "get", lambda *a, **k: resp)
+    started = real_time.monotonic()
+    with pytest.raises(FetchError, match="总时限"):
+        fetcher.fetch_html("https://slow.example/")
+    assert real_time.monotonic() - started < 0.5
+    assert resp.closed
+
+
+def test_blocking_response_headers_are_bounded_by_total_budget(monkeypatch):
+    import threading
+    import time as real_time
+
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocking_get(url, **kwargs):
+        try:
+            release.wait(2)
+            return _FakeResp()
+        finally:
+            finished.set()
+
+    fetcher = Fetcher("ua", timeout=1, retries=0)
+    fetcher.url_budget_seconds = 0.05
+    monkeypatch.setattr(fetcher.session, "get", blocking_get)
+    started = real_time.monotonic()
+    try:
+        with pytest.raises(FetchError, match="总时限"):
+            fetcher.fetch_html("https://slow.example/")
+        assert real_time.monotonic() - started < 0.5
+    finally:
+        release.set()
+        assert finished.wait(1)
+
+
+def test_response_returned_after_deadline_is_closed_without_reading(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(http, "time", clock)
+    resp = _FakeResp()
+
+    def get(url, **kwargs):
+        clock.now += 100
+        return resp
+
+    fetcher = Fetcher("ua", retries=0)
+    monkeypatch.setattr(fetcher.session, "get", get)
+    with pytest.raises(FetchError, match="总时限"):
+        fetcher.fetch_html("https://slow.example/")
+    assert resp.closed and not resp.read
 
 
 # ---------- 常驻线程池 ----------

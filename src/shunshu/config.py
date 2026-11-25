@@ -236,7 +236,7 @@ class Config:
         cfg.failure_backoff_threshold = max(1, cfg.failure_backoff_threshold)
         cfg.request_timeout_seconds = min(max(cfg.request_timeout_seconds, 1.0), 300.0)
         cfg.retry_backoff_seconds = max(0.0, cfg.retry_backoff_seconds)
-        cfg.same_host_delay_seconds = max(0.0, cfg.same_host_delay_seconds)
+        cfg.same_host_delay_seconds = min(max(cfg.same_host_delay_seconds, 0.0), 300.0)
         cfg.max_response_bytes = max(10_000, cfg.max_response_bytes)
         cfg.concurrency = min(max(cfg.concurrency, 1), 32)
         cfg.request_retries = min(max(cfg.request_retries, 0), 5)
@@ -297,7 +297,7 @@ def _compile(patterns: list[str], flags: int) -> list[re.Pattern]:
     for pattern in patterns:
         try:
             out.append(re.compile(pattern, flags))
-        except re.error:
+        except (re.error, OverflowError, RecursionError):
             continue  # 用户手改名单写错正则时不至于让整个工具起不来
     return out
 
@@ -307,19 +307,15 @@ def config_path() -> Path:
 
 
 def load_config() -> Config:
-    """读 config.json；文件不存在就生成默认配置，手改坏了就隔离备份并退回默认值。
-
-    损坏时不让工具起不来：原文件改名成带时间戳的 .bak，重写一份干净默认配置，
-    降级说明经 store.LAST_LOAD_WARNINGS 交给托盘弹卡。
-    """
+    """读 config.json；坏内容隔离后退回默认值，读取/备份失败必须向上抛出。"""
     path = config_path()
-    if not path.exists():
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
         cfg = Config()
         save_config(cfg)
         return cfg
-    try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         from .store import quarantine_broken_json
 
         quarantine_broken_json(path, f"{type(exc).__name__}: {exc}")

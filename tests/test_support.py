@@ -459,6 +459,38 @@ def test_notifier_records_alerts_log(paths: Paths, monkeypatch):
     assert "第9章 新" in text
 
 
+def test_notifier_spawns_when_alerts_log_is_a_directory(tmp_path, paths, monkeypatch):
+    from shunshu.models import ChapterEntry, NovelAlert
+
+    fallback = tmp_path / "fallback"
+    monkeypatch.setattr("shunshu.notify.tempfile.gettempdir", lambda: str(fallback))
+    paths.alerts_log.mkdir()
+    spawned = capture_cards(monkeypatch)
+    notifier = Notifier(alerts_path=paths.alerts_log, enabled=True)
+
+    assert notifier.show("普通提示", ["内容"]) is True
+    source = Source(id="b1", toc_url="https://x.com/1/", site="x.com")
+    entry = ChapterEntry(k="000009|第9章", t="第9章", u="https://x.com/9", s="b1")
+    novel = Novel(id="b1", title="书", sources=[source], primary_id="b1", chapter_index=[entry])
+    assert notifier.notify_alert(NovelAlert(novel=novel, entries=[entry])) is True
+
+    assert spawned[0][0]["title"] == "普通提示"
+    assert spawned[1][0]["title"].startswith("《书》更新 1 章")
+    text = (fallback / "shunshu-alerts.log").read_text(encoding="utf-8")
+    assert "普通提示" in text and "《书》更新 1 章" in text
+
+
+@pytest.mark.parametrize("error_type", [OSError, UnicodeError])
+def test_notifier_silently_ignores_log_failure(paths, monkeypatch, error_type):
+    def fail_log(path, text):
+        raise error_type("模拟日志不可写")
+
+    monkeypatch.setattr("shunshu.store.append_text", fail_log)
+    spawned = capture_cards(monkeypatch)
+    assert Notifier(alerts_path=paths.alerts_log).show("书", ["第9章 新"]) is True
+    assert len(spawned) == 1
+
+
 def test_notifier_can_be_silenced(paths: Paths, monkeypatch):
     calls = []
     monkeypatch.setattr("shunshu.notify.spawn_card",
@@ -747,6 +779,16 @@ def test_close_all_leaves_no_card_on_screen(paths: Paths, monkeypatch):
     assert notifier._live == {}
 
 
+def test_close_all_returns_acks_before_clearing_them(monkeypatch):
+    popped = capture_cards(monkeypatch)
+    notifier = Notifier(enabled=True)
+    notifier.show("已经划过", ["内容"])
+    popped[0][2].exited = True
+
+    assert notifier.close_all() == {"已经划过": set()}
+    assert notifier.take_acked_chapters() == {}, "交回调用方后，本地账本要清空"
+
+
 def test_card_stays_until_the_pointer_passes_over_it():
     """没人点、鼠标也没划过的卡片不许自己消失；划过去再离开就算看完了。"""
     from conftest import FakePointerRoot
@@ -785,8 +827,8 @@ def test_pointer_resting_on_a_new_card_is_not_a_pass():
     assert root.destroyed
 
 
-def test_second_instance_backs_off_with_a_card(tmp_path, monkeypatch):
-    """重复启动不该多出第二个托盘图标：拿不到互斥体时 run() 提示完就退出。"""
+def test_second_instance_backs_off_with_only_a_log(tmp_path, monkeypatch):
+    """重复启动只留日志：弹卡会占 0 号槽，盖住原实例的更新卡。"""
     from shunshu import instance, tray
     from shunshu.app import AppState
     from shunshu.store import Paths
@@ -794,14 +836,31 @@ def test_second_instance_backs_off_with_a_card(tmp_path, monkeypatch):
     assert instance.acquire_singleton("Local\\shunshu-test-single") is True
     assert instance.acquire_singleton("Local\\shunshu-test-single") is True, "同一个进程不该把自己当成第二个实例"
 
-    cards = []
-    monkeypatch.setattr("shunshu.notify.spawn_card",
-                        lambda payload, index=0: cards.append(payload) or ("", FakeProc()))
+    cards = capture_cards(monkeypatch)
     monkeypatch.setattr(tray, "acquire_singleton", lambda: False)
-    app = tray.TrayApp(AppState(Paths(tmp_path / "data")))
+    state = AppState(Paths(tmp_path / "data"))
+    app = tray.TrayApp(state)
     app.run()
     assert app.icon is None, "第二个实例不能建托盘图标"
-    assert cards and "已经在运行" in cards[0]["title"]
+    assert cards == [], "第二个实例不能弹卡抢占原实例的槽位"
+    assert "已经在运行" in state.paths.runtime_log.read_text(encoding="utf-8")
+
+
+def test_second_instance_survives_runtime_log_failure(tmp_path, monkeypatch):
+    from shunshu import tray
+    from shunshu.app import AppState
+    from shunshu.store import Paths
+
+    def fail_log(_path, _text):
+        raise OSError("runtime log is read-only")
+
+    cards = capture_cards(monkeypatch)
+    monkeypatch.setattr(tray, "acquire_singleton", lambda: False)
+    monkeypatch.setattr(tray, "append_text", fail_log)
+    app = tray.TrayApp(AppState(Paths(tmp_path / "data")))
+    app.run()
+    assert app.icon is None
+    assert cards == []
 
 
 def test_status_labels_are_chinese():
@@ -884,7 +943,7 @@ def test_card_survives_read_log_write_failure(paths, monkeypatch):
 
     from shunshu.popup import make_payload, open_chapter
 
-    def busy(path, record):
+    def busy(path, record, **kwargs):
         raise OSError(f"模拟文件被占用: {_os.fspath(path)}")
 
     monkeypatch.setattr("shunshu.store.append_jsonl", busy)
@@ -983,3 +1042,34 @@ def test_show_logs_only_the_lines_the_card_displays(paths: Paths, monkeypatch):
     text = paths.alerts_log.read_text(encoding="utf-8")
     assert lines[0] in text and lines[_CARD_LINES] not in text
     assert "https://book.example.com/1/9.html" in text, "跳转地址仍然要留档"
+
+
+def test_run_forever_survives_unwritable_runtime_log(tmp_path, app_state, monkeypatch):
+    import threading
+    from shunshu.scheduler import Scheduler
+
+    app_state.paths.runtime_log.mkdir()
+    blocked_temp = tmp_path / "not-a-directory"
+    blocked_temp.write_text("blocked", encoding="utf-8")
+    monkeypatch.setattr("shunshu.scheduler.tempfile.gettempdir", lambda: str(blocked_temp))
+    scheduler = Scheduler(app_state)
+    monkeypatch.setattr(scheduler._wake, "wait", lambda timeout: False)
+    rounds = 0
+
+    def fail_round():
+        nonlocal rounds
+        rounds += 1
+        if rounds == 2:
+            scheduler.stop()
+        raise RuntimeError("模拟轮询失败")
+
+    monkeypatch.setattr(scheduler, "run_once", fail_round)
+    worker = threading.Thread(target=scheduler.run_forever, daemon=True)
+    worker.start()
+    try:
+        worker.join(5)
+        assert not worker.is_alive(), "运行日志不可写不能杀死轮询线程"
+    finally:
+        scheduler.stop()
+        worker.join(5)
+    assert rounds == 2, "异常轮之后必须继续跑下一轮"

@@ -68,6 +68,11 @@ def check_source(novel: Novel, source: Source, rules: Rules, fetcher: Fetcher,
     except ValueError as exc:
         return _failure(novel, source, STATUS_PARSE_FAILED, str(exc), exc=str(exc))
 
+    if loaded.incomplete:
+        return _failure(novel, source, STATUS_PARSE_FAILED,
+                        "末页抓取或目录识别失败，已保留原有进度",
+                        exc="incomplete last page", fatal_count=True)
+
     chapters = _apply_manual_keys(source, loaded)
     if not chapters:
         return _failure(novel, source, STATUS_PARSE_FAILED, "过滤后没有剩余章节，疑似整站改版",
@@ -85,13 +90,16 @@ def check_source(novel: Novel, source: Source, rules: Rules, fetcher: Fetcher,
     if not source.baseline_set or not source.latest_url:
         return _baseline(novel, source, loaded, chapters, rules, paths)
 
+    # 连续编号追赶要先于重叠率判断，否则滚动目录积压多章会被 _reset 静默记账。
+    continues_sequence = _continues_sequence(new, source.latest_number)
+
     # 分母用「上一轮目录里的章数」，不是累计 notified_keys：滚动式目录只列最近十几章，
     # 而 notified_keys 会把离开目录的老章再留最多 500 条，拿它当分母 overlap 只会一路下跌，
     # 跌破阈值后每轮都判「疑似改版」→ 这本书从此再不提醒，且托盘只有一行灰字
     previous = source.chapter_count or len(known)
     still_there = len(known & keys_now)
     overlap = min(1.0, still_there / previous) if previous else 1.0
-    if previous >= 5 and overlap < rules.cfg.toc_reset_overlap_ratio:
+    if previous >= 5 and not continues_sequence and overlap < rules.cfg.toc_reset_overlap_ratio:
         why = (f"上一轮目录 {previous} 章里只剩 {still_there} 章还在，"
                "目录疑似被重置或整站改版，已记录不提醒")
         return _reset(novel, source, loaded, chapters, new, rules, paths, why)
@@ -107,7 +115,7 @@ def check_source(novel: Novel, source: Source, rules: Rules, fetcher: Fetcher,
     # 关机几天或被退避跳过几轮之后回来，一次追平 31+ 章是常态：新章编号全部紧接在
     # 已知的最新章之后就是断档追赶，照报。原来这里直接判重编号并 _commit 记账，
     # 那批章被写进「已提醒过」，一条没报就永久静默（用户最在意的漏提醒）
-    if too_many and not grew_pages and not _continues_sequence(new, source.latest_number):
+    if too_many and not grew_pages and not continues_sequence:
         return _reset(novel, source, loaded, chapters, new, rules, paths,
                       f"一次出现 {len(new)} 个新章节标识，疑似章节重编号，已记录不提醒")
 
@@ -383,7 +391,7 @@ def collect_alerts(novels: list[Novel], outcomes: list[Outcome], *, keep: int = 
 
         baselines = [o for o in own if o.status == STATUS_BASELINE]
         for outcome in baselines:
-            novel.mark_alerted(outcome.known_keys, keep=keep)
+            novel.mark_baseline(outcome.known_keys, keep=keep)
 
         added = not novel.chapter_index and bool(baselines)
         if added:

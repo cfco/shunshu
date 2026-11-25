@@ -53,20 +53,20 @@ def current_command() -> str:
     return " ".join(_desktop_quote(part) for part in [exe, *args])
 
 
-def _entry_path(entry: str) -> Path:
-    """从已写下的命令里取出「指的那个程序」，用来判断路径是不是漂移了。"""
-    text = (entry or "").strip()
-    if IS_WINDOWS:
-        if text.startswith('"'):
-            end = text.find('"', 1)
-            if end > 0:
-                return Path(text[1:end])
-        return Path(text.split(" ")[0])
+def _entry_parts(entry: str) -> tuple[Path, list[str]]:
+    """解析完整命令；Windows 保留路径反斜杠，Linux 按 desktop 的引号规则解析。"""
     try:
-        parts = shlex.split(text)
+        parts = shlex.split((entry or "").strip(), posix=not IS_WINDOWS)
     except ValueError:
-        return Path("")  # Exec 里引号没闭合：当成漂移，重写一次就好
-    return Path(parts[0]) if parts else Path("")
+        return Path(""), []  # 引号没闭合：当成漂移，重写一次就好
+    if IS_WINDOWS:
+        parts = [part[1:-1] if len(part) >= 2 and part[0] == part[-1] == '"' else part
+                 for part in parts]
+    return (Path(parts[0]) if parts else Path(""), parts[1:])
+
+
+def _entry_path(entry: str) -> Path:
+    return _entry_parts(entry)[0]
 
 
 # ---------- Windows：注册表 Run 项 ----------
@@ -172,18 +172,17 @@ def is_enabled() -> bool:
 
 
 def needs_repair() -> bool:
-    """自启里指的解释器/程序已不是当前这个（比如换了解释器或打包后搬了目录）。
-
-    只比程序、不比参数：升级新加进命令的开关（`--boot-delay`）不会由这里补上，
-    要在托盘里取消再勾一次「开机自启」。
-    """
+    """程序路径或参数与当前命令不一致就重写；同一程序的等价路径仍可共用。"""
     entry = read_entry()
     if entry is None:
         return False
+    entry_exe, entry_args = _entry_parts(entry)
+    expected_exe, expected_args = _command_parts()
     try:
-        return not _entry_path(entry).samefile(_entry_path(current_command()))
+        same_program = entry_exe.samefile(expected_exe)
     except OSError:
         return True
+    return not same_program or entry_args != expected_args
 
 
 def enable() -> bool:

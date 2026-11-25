@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import tempfile
 import threading
 import time
+from pathlib import Path
 
 from .app import AppState
 
@@ -101,7 +103,14 @@ class Scheduler:
             except Exception as exc:  # 单轮异常不能让循环停掉
                 from .store import append_text, now_stamp
 
-                append_text(self.state.paths.runtime_log, f"{now_stamp()} 轮询异常: {exc!r}")
+                text = f"{now_stamp()} 轮询异常: {exc!r}"
+                try:
+                    append_text(self.state.paths.runtime_log, text)
+                except (OSError, UnicodeError):
+                    try:
+                        append_text(Path(tempfile.gettempdir()) / "shunshu-runtime.log", text)
+                    except (OSError, UnicodeError):
+                        pass  # 日志故障不能杀死唯一的轮询线程
 
     def stop(self) -> None:
         """请求循环退出。"""

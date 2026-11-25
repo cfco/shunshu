@@ -189,6 +189,28 @@ def test_mark_alerted_keeps_only_the_most_recent_keys():
     assert novel.alerted_keys == ["k7", "k8", "k9", "k10"], "已有的键要挪到最新位置，不重复记"
 
 
+def test_mark_baseline_keeps_500_recent_keys_over_1000_old_keys():
+    from shunshu.models import Novel
+
+    recent = [f"recent-{i:03d}" for i in range(500)]
+    baseline = [f"old-{i:04d}" for i in range(1000)]
+    novel = Novel(id="a", alerted_keys=recent.copy())
+
+    novel.mark_baseline(baseline, keep=500)
+
+    assert novel.alerted_keys == recent
+
+
+def test_mark_baseline_orders_and_deduplicates_without_losing_recent():
+    from shunshu.models import Novel
+
+    novel = Novel(id="a", alerted_keys=["r1", "r2"])
+    novel.mark_baseline(["b1", "r1", "b2", "b1"], keep=3)
+    assert novel.alerted_keys == ["b2", "r1", "r2"]
+    novel.mark_baseline(["b3"], keep=0)
+    assert novel.alerted_keys == []
+
+
 def test_novel_display_title_is_simplified():
     """书名也统一简体显示，存下来的仍是源站原文。"""
     from shunshu.models import Novel

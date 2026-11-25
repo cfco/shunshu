@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
+from pathlib import Path
+
+import pytest
 
 import fixtures
 
@@ -12,11 +17,20 @@ from shunshu.config import (
     DEFAULT_TITLE_SUFFIXES,
     Config,
     Rules,
+    _compile,
     load_config,
     normalize_text,
 )
 from shunshu.models import Novel, Source
-from shunshu.store import Paths, load_novels, save_novels, source_id_for
+from shunshu.store import (
+    Paths,
+    append_jsonl,
+    append_read_jsonl,
+    drain_jsonl,
+    load_novels,
+    save_novels,
+    source_id_for,
+)
 
 
 def _make_novel() -> Novel:
@@ -60,6 +74,81 @@ def test_broken_novels_json_is_quarantined_and_emptied(paths: Paths):
     # 隔离后位置腾出来，正常保存/读取立刻恢复
     save_novels(paths, [_make_novel()])
     assert len(load_novels(paths)) == 1
+
+
+def test_invalid_utf8_novels_is_quarantined_byte_for_byte(paths: Paths):
+    from shunshu import store
+
+    raw = b'\xff\xfe{"novels": []}'
+    paths.novels.write_bytes(raw)
+    assert load_novels(paths) == []
+    backups = list(paths.root.glob("novels.json.*.bak"))
+    assert len(backups) == 1 and backups[0].read_bytes() == raw
+    assert not paths.novels.exists()
+    save_novels(paths, [_make_novel()])
+    assert len(load_novels(paths)) == 1
+
+
+def test_novels_read_oserror_keeps_original_and_propagates(paths: Paths, monkeypatch):
+    raw = b'{"novels": []}'
+    paths.novels.write_bytes(raw)
+    real_read = Path.read_text
+
+    def blocked(self, *args, **kwargs):
+        if self == paths.novels:
+            raise OSError("disk read failed")
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", blocked)
+    with pytest.raises(OSError, match="disk read failed"):
+        load_novels(paths)
+    assert paths.novels.read_bytes() == raw
+    assert not list(paths.root.glob("novels.json.*.bak"))
+
+
+@pytest.mark.parametrize("payload", [None, {}, {"novels": None}, {"novels": {}},
+                                     {"novels": "bad"}])
+def test_bad_top_level_novels_structure_is_quarantined(paths: Paths, payload):
+    raw = json.dumps(payload).encode("utf-8")
+    paths.novels.write_bytes(raw)
+    assert load_novels(paths) == []
+    backups = list(paths.root.glob("novels.json.*.bak"))
+    assert len(backups) == 1 and backups[0].read_bytes() == raw
+
+
+def test_filtered_novels_are_backed_up_before_return(paths: Paths):
+    good = _make_novel().to_dict()
+    good["sources"].append("坏来源")
+    raw = json.dumps({"novels": [
+        123,
+        good,
+        dict(good),
+        {"id": "bad-source", "sources": [{"id": "s", "proxy": ""}]},
+    ]}, ensure_ascii=False).encode("utf-8")
+    paths.novels.write_bytes(raw)
+    novels = load_novels(paths)
+    assert [n.id for n in novels] == [good["id"], "bad-source"]
+    assert [s.id for s in novels[0].sources] == [good["sources"][0]["id"]]
+    assert novels[1].sources == []
+    backups = list(paths.root.glob("novels.json.*.bak"))
+    assert len(backups) == 1 and backups[0].read_bytes() == raw
+    assert paths.novels.read_bytes() == raw, "过滤后原文件要留到正常保存，崩溃也不能丢"
+
+
+def test_filtered_novels_backup_failure_aborts_load(paths: Paths, monkeypatch):
+    raw = b'{"novels": [123]}'
+    paths.novels.write_bytes(raw)
+    real_copy = shutil.copy2
+
+    def blocked(src, dst):
+        if src == paths.novels:
+            raise OSError("backup denied")
+        return real_copy(src, dst)
+
+    monkeypatch.setattr("shunshu.store.shutil.copy2", blocked)
+    with pytest.raises(OSError, match="backup denied"):
+        load_novels(paths)
+    assert paths.novels.read_bytes() == raw
 
 
 def test_non_object_novel_entries_are_skipped_not_fatal(paths: Paths):
@@ -190,6 +279,129 @@ def test_broken_config_json_is_quarantined_and_defaults_rewritten(tmp_path, monk
     assert list((tmp_path / "data").glob("config.json.*.bak")), "坏文件得留 .bak 现场"
 
 
+def test_invalid_utf8_config_is_quarantined_byte_for_byte(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHUNSHU_DATA_DIR", str(tmp_path / "data"))
+    root = tmp_path / "data"
+    root.mkdir()
+    path = root / "config.json"
+    raw = b'\xff\xfe{"poll_minutes": 5}'
+    path.write_bytes(raw)
+    assert load_config().poll_minutes == Config().poll_minutes
+    backups = list(root.glob("config.json.*.bak"))
+    assert len(backups) == 1 and backups[0].read_bytes() == raw
+    assert json.loads(path.read_text(encoding="utf-8"))["poll_minutes"] == Config().poll_minutes
+
+
+def test_config_read_oserror_keeps_original_and_propagates(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHUNSHU_DATA_DIR", str(tmp_path / "data"))
+    root = tmp_path / "data"
+    root.mkdir()
+    path = root / "config.json"
+    raw = b'{"poll_minutes": 5}'
+    path.write_bytes(raw)
+    real_read = Path.read_text
+
+    def blocked(self, *args, **kwargs):
+        if self == path:
+            raise OSError("config read failed")
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", blocked)
+    with pytest.raises(OSError, match="config read failed"):
+        load_config()
+    assert path.read_bytes() == raw
+    assert not list(root.glob("config.json.*.bak"))
+
+
+@pytest.mark.parametrize("payload", [None, [], "bad"])
+def test_bad_top_level_config_structure_is_quarantined(tmp_path, monkeypatch, payload):
+    monkeypatch.setenv("SHUNSHU_DATA_DIR", str(tmp_path / "data"))
+    root = tmp_path / "data"
+    root.mkdir()
+    path = root / "config.json"
+    raw = json.dumps(payload).encode("utf-8")
+    path.write_bytes(raw)
+    assert load_config().poll_minutes == Config().poll_minutes
+    backups = list(root.glob("config.json.*.bak"))
+    assert len(backups) == 1 and backups[0].read_bytes() == raw
+
+
+def test_config_quarantine_failure_keeps_original_and_propagates(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHUNSHU_DATA_DIR", str(tmp_path / "data"))
+    root = tmp_path / "data"
+    root.mkdir()
+    path = root / "config.json"
+    raw = b"{broken"
+    path.write_bytes(raw)
+    real_replace = Path.replace
+
+    def blocked(self, target):
+        if self == path:
+            raise OSError("backup denied")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", blocked)
+    with pytest.raises(OSError, match="backup denied"):
+        load_config()
+    assert path.read_bytes() == raw
+
+
+# ---------- read.jsonl 持久化确认 ----------
+
+def test_drain_commit_failure_restores_original_records(paths: Paths):
+    raw = '{"novel":"n1","key":"000001|甲"}\n'.encode("utf-8")
+    log = paths.read_log
+    log.write_bytes(raw)
+
+    def fail(_records):
+        raise OSError("disk full")
+
+    with pytest.raises(OSError, match="disk full"):
+        drain_jsonl(log, commit=fail)
+    assert log.read_bytes() == raw
+    snapshots = list(paths.root.glob("*.draining"))
+    assert len(snapshots) == 1 and snapshots[0].read_bytes() == raw
+    assert drain_jsonl(log) == [{"novel": "n1", "key": "000001|甲"}]
+
+
+def test_drain_keeps_late_writes_from_an_old_handle(paths: Paths):
+    log = paths.read_log
+    log.write_text('{"novel":"n1","key":"000001|甲"}\n', encoding="utf-8")
+    committed = []
+    with log.open("ab") as old_handle:
+        def commit(records):
+            committed.extend(records)
+            old_handle.write('{"novel":"n1","key":"000002|乙"}\n'.encode("utf-8"))
+            old_handle.flush()
+
+        first = drain_jsonl(log, commit=commit)
+        old_handle.write('{"novel":"n1","key":"000003|丙"}\n'.encode("utf-8"))
+        old_handle.flush()
+    assert [r["key"] for r in first] == ["000001|甲"]
+    second = drain_jsonl(log, commit=lambda records: committed.extend(records))
+    assert [r["key"] for r in second] == ["000002|乙", "000003|丙"]
+    assert [r["key"] for r in committed] == ["000001|甲", "000002|乙", "000003|丙"]
+
+
+def test_drain_recovers_snapshot_left_by_a_crash(paths: Paths):
+    log = paths.read_log
+    snapshot = paths.root / "read.jsonl.999.123.draining"
+    snapshot.write_text('{"novel":"n1","key":"000001|甲"}\n', encoding="utf-8")
+
+    assert drain_jsonl(log, cross_process=True) == [{"novel": "n1", "key": "000001|甲"}]
+    assert not snapshot.exists()
+    assert not log.exists()
+
+
+def test_cross_process_read_log_roundtrip(paths: Paths):
+    log = paths.read_log
+    append_read_jsonl(log, {"novel": "n1", "key": "000001|甲"})
+    append_read_jsonl(log, {"novel": "n1", "key": "000002|乙"})
+
+    assert [r["key"] for r in drain_jsonl(log, cross_process=True)] == [
+        "000001|甲", "000002|乙"]
+
+
 # ---------- 名单合并与配置项 ----------
 
 def test_builtin_ad_lists_always_merge_with_user_lists():
@@ -210,6 +422,33 @@ def test_builtin_ad_lists_always_merge_with_user_lists():
         normalize_text(t) for t in DEFAULT_AD_EXACT if normalize_text(t))
     assert len(default_rules.patterns) == len(DEFAULT_AD_PATTERNS)
     assert len(default_rules.suffixes) == len(DEFAULT_TITLE_SUFFIXES)
+
+
+@pytest.mark.parametrize("bad_pattern", [
+    pytest.param("[", id="invalid-syntax"),
+    pytest.param(r"a{999999999999999999999999}", id="repeat-overflow"),
+    pytest.param("(" * 2000 + "a" + ")" * 2000, id="deep-nesting"),
+])
+def test_compile_skips_bad_patterns_and_keeps_valid_ones(bad_pattern):
+    compiled = _compile([r"before", bad_pattern, r"after"], re.I)
+
+    assert [pattern.pattern for pattern in compiled] == ["before", "after"]
+    assert compiled[0].search("BEFORE")
+    assert compiled[1].search("AFTER")
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (-1.0, 0.0),
+    (0.0, 0.0),
+    (2.5, 2.5),
+    (300.0, 300.0),
+    (300.1, 300.0),
+    (1e308, 300.0),
+])
+def test_same_host_delay_is_clamped_to_safe_range(value, expected):
+    cfg = Config.from_dict({"same_host_delay_seconds": value})
+
+    assert cfg.same_host_delay_seconds == expected
 
 
 def test_toc_reset_new_ratio_is_configurable():

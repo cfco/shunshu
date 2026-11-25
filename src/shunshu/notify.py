@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -139,19 +140,22 @@ class Notifier:
             self._acked.clear()
             return acked
 
-    def close_all(self) -> None:
-        """退出时把还挂着的卡片一起收掉：不留没人认领的窗口，下次启动按「没看过」补弹。"""
+    def close_all(self) -> dict[str, set[str]]:
+        """退出时收掉窗口，并交回已确认看过的 ack；调用方忽略返回值仍可正常关机。"""
         # 先关闸：正在跑的那一轮可能在我收完窗口之后才 notify_many，那时再 spawn 就是一张
         # 永远没人划过、也没人收的无主卡片（主进程已经退出了，句柄跟着没了）
         with self._lock:
             self.enabled = False
+            self._collect_acks()
+            acked = {key: set(keys) for key, keys in self._acked.items()}
             live, self._live = self._live, {}
             self._generations.clear()
             self._card_keys.clear()
-            self._acked.clear()   # 正在退出了，别把这一轮的 ack 留给下一份 Notifier
+            self._acked.clear()
         for proc, _index in live.values():
             if proc is not None:
                 self._close(proc)
+        return acked
 
     def _settle(self, key: str, proc, index: int, generation: int,
                 snapshot: frozenset[str]) -> None:
@@ -206,7 +210,14 @@ class Notifier:
             return
         from .store import append_text, now_stamp
 
-        append_text(self.alerts_path, f"{now_stamp()} {title} | {' / '.join(lines)} | {url}")
+        text = f"{now_stamp()} {title} | {' / '.join(lines)} | {url}"
+        try:
+            append_text(self.alerts_path, text)
+        except (OSError, UnicodeError):
+            try:
+                append_text(Path(tempfile.gettempdir()) / f"shunshu-{self.alerts_path.name}", text)
+            except (OSError, UnicodeError):
+                pass  # 日志故障不能拦住弹卡
 
 
 def entry_rows(entries: list[ChapterEntry], read_keys: list[str] | None = None,

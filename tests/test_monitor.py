@@ -2,6 +2,7 @@ import fixtures
 from conftest import FakeFetcher
 
 from shunshu.app import AppState
+from shunshu.align import match_key
 from shunshu.config import Config
 from shunshu.http import FetchError, ProxyError
 from shunshu.models import (
@@ -10,6 +11,7 @@ from shunshu.models import (
     STATUS_NET_ERROR,
     STATUS_PROXY_ERROR,
     STATUS_NO_CHANGE,
+    STATUS_PARSE_FAILED,
     STATUS_TOC_RESET,
     STATUS_UPDATED,
     Chapter,
@@ -49,22 +51,57 @@ def test_load_toc_merges_first_and_last_page():
     assert 1 in numbers and 60 in numbers and 600 in numbers
     assert result.toc.chapters[-1].title == "第六百章 大结局"
     assert result.pages == [fixtures.BASE_URL, fixtures.BASE_URL + "_20.html"]
+    assert result.incomplete is False
 
 
-def test_load_toc_survives_missing_last_page():
+def test_load_toc_marks_an_expected_last_page_that_is_missing():
     result = toc({fixtures.BASE_URL: fixtures.paged_first_html()})
     assert len(result.toc.chapters) == 60
+    assert result.incomplete is True
 
 
 def test_last_page_fetch_failure_leaves_a_log_line(paths):
-    """末页抓不到时留一行日志：光看结果分不清「站点本来就没分页」和「那一页抓挂了」。"""
-    load_toc(FakeFetcher({fixtures.BASE_URL: fixtures.paged_first_html()}),
-             fixtures.BASE_URL, RULES, paths=paths)
+    """末页抓不到时留一行日志，并标记目录结果不完整。"""
+    result = load_toc(FakeFetcher({fixtures.BASE_URL: fixtures.paged_first_html()}),
+                      fixtures.BASE_URL, RULES, paths=paths)
+    assert result.incomplete is True
     text = paths.runtime_log.read_text(encoding="utf-8")
     assert "末页跟进" in text and "没抓到" in text
 
     # 没传 paths 的老用法照常工作，只是不记日志
-    assert toc({fixtures.BASE_URL: fixtures.paged_first_html()}).toc.pages_followed == 1
+    assert toc({fixtures.BASE_URL: fixtures.paged_first_html()}).incomplete is True
+
+
+def test_incomplete_last_page_never_overwrites_previous_source_state():
+    """末页抓不到或认不出时，不能把已记录的第六百章退回首页第六十章。"""
+    last_url = fixtures.BASE_URL + "_20.html"
+    for selector in (None, "div.listmain dl"):
+        for last_html in (None, fixtures.no_container_html()):
+            novel = make_novel()
+            source = first(novel)
+            source.selector = selector
+            fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.paged_first_html(),
+                                   last_url: fixtures.paged_last_html()})
+            assert check_source(novel, source, RULES, fetcher, None).status == STATUS_BASELINE
+            before = (source.latest_title, source.latest_url, source.latest_number,
+                      source.notified_keys.copy(), source.chapter_count, source.pages_followed)
+
+            fetcher.add(fixtures.BASE_URL, fixtures.paged_first_html())
+            if last_html is None:
+                del fetcher.pages[last_url]
+            else:
+                fetcher.add(last_url, last_html)
+            outcome = check_source(novel, source, RULES, fetcher, None)
+
+            assert outcome.status == STATUS_PARSE_FAILED
+            assert outcome.latest.number == 600
+            assert (source.latest_title, source.latest_url, source.latest_number,
+                    source.notified_keys, source.chapter_count,
+                    source.pages_followed) == before
+
+            # 末页恢复后仍从旧进度继续判断，不把首页那 60 章当成新目录
+            fetcher.add(last_url, fixtures.paged_last_html())
+            assert check_source(novel, source, RULES, fetcher, None).status == STATUS_NO_CHANGE
 
 
 def test_first_check_creates_baseline_without_notifying():
@@ -195,6 +232,38 @@ def test_rolling_toc_keeps_alerting_after_many_rounds():
         outcome = check_source(novel, first(novel), RULES, fetcher, None)
         assert outcome.status == STATUS_UPDATED, f"第 {number} 章被误判：{outcome.message}"
         assert [c.title for c in outcome.new_chapters] == [f"第{number}章 滚动更新"]
+
+
+def test_rolling_toc_reports_backlog_despite_low_overlap():
+    """滚动目录积压多章时，编号连续延伸不能先被重叠率判成目录重置。"""
+    novel = make_novel()
+    fetcher = FakeFetcher({})
+    window = [f"第{n}章 起步" for n in range(49, 61)]
+    fetcher.add(fixtures.BASE_URL, _rolling_page(window))
+    assert check_source(novel, first(novel), RULES, fetcher, None).status == STATUS_BASELINE
+
+    added = [f"第{n}章 积压更新" for n in range(61, 70)]
+    window = window[-2:] + added
+    fetcher.add(fixtures.BASE_URL, _rolling_page(window))
+    outcome = check_source(novel, first(novel), RULES, fetcher, None)
+    assert outcome.status == STATUS_UPDATED
+    assert outcome.new_count == len(added)
+    assert [c.title for c in outcome.new_chapters] == added
+
+    assert check_source(novel, first(novel), RULES, fetcher, None).status == STATUS_NO_CHANGE
+
+
+def test_rolling_toc_renumbering_is_still_reset():
+    novel = make_novel()
+    fetcher = FakeFetcher({fixtures.BASE_URL: _rolling_page(
+        [f"第{n}章 起步" for n in range(49, 61)])})
+    assert check_source(novel, first(novel), RULES, fetcher, None).status == STATUS_BASELINE
+
+    fetcher.add(fixtures.BASE_URL, _rolling_page(
+        [f"第{n}章 重编号" for n in range(149, 160)]))
+    outcome = check_source(novel, first(novel), RULES, fetcher, None)
+    assert outcome.status == STATUS_TOC_RESET
+    assert outcome.new_chapters == []
 
 
 def test_catchup_after_downtime_is_reported_not_swallowed():
@@ -541,6 +610,46 @@ def test_baseline_of_a_late_source_does_not_alert(paths):
     assert alert.entries[0].t == "第62章 慢镜像补上"
 
 
+def test_late_source_baseline_keeps_500_recent_alerts_over_1000_old_keys():
+    """慢来源的千章基线只能补去重账，不能挤掉最近 500 章并让镜像重复提醒。"""
+    novel = make_novel()
+    fetcher = FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()})
+    assert check_source(novel, first(novel), RULES, fetcher, None).status == STATUS_BASELINE
+
+    recent_titles = [f"第{i}章 最近提醒{i:04d}" for i in range(61, 561)]
+    fetcher.add(fixtures.BASE_URL, fixtures.normal_html([*fixtures.CHAPTERS, *recent_titles]))
+    updated = check_source(novel, first(novel), RULES, fetcher, None)
+    recent_keys = [match_key(c.number, c.title) for c in updated.all_new]
+    collect_alerts([novel], [updated])
+    assert novel.alerted_keys == recent_keys
+
+    url_b = "https://mirror.example.com/12_3456/"
+    mirror = Source(id=source_id_for(url_b), toc_url=url_b, site="mirror.example.com")
+    novel.sources.append(mirror)
+    old_titles = [f"第{i}章 旧基线{i:04d}" for i in range(1, 1001)]
+    fetcher.add(url_b, fixtures.normal_html(old_titles))
+    late = check_source(novel, mirror, RULES, fetcher, None)
+    assert late.status == STATUS_BASELINE and len(late.known_keys) == 1000
+    assert collect_alerts([novel], [late]) == []
+    assert novel.alerted_keys == recent_keys
+
+    # 慢镜像补报一条最近真正提醒过的章：小说级账本仍必须认得它
+    catchup_titles = old_titles.copy()
+    catchup_titles[60] = recent_titles[0]
+    catchup = fixtures.normal_html(catchup_titles).replace(
+        f'href="61.html">{recent_titles[0]}',
+        f'href="mirror-61.html">{recent_titles[0]}')
+    fetcher.add(url_b, catchup)
+    duplicate = check_source(novel, mirror, RULES, fetcher, None)
+    assert duplicate.status == STATUS_UPDATED
+    assert collect_alerts([novel], [duplicate]) == []
+
+    fetcher.add(url_b, fixtures.normal_html([*catchup_titles, "第1001章 真正更新"]))
+    fresh = check_source(novel, mirror, RULES, fetcher, None)
+    alert = collect_alerts([novel], [fresh])[0]
+    assert [e.t for e in alert.entries] == ["第1001章 真正更新"]
+
+
 def test_first_check_of_a_multi_source_novel_indexes_every_source(paths):
     """新书一次挂两个来源、同轮各自首轮建档：两源的最近章节都要进索引。
 
@@ -603,6 +712,7 @@ def test_a_next_link_elsewhere_on_the_site_is_not_followed():
     """/module.php?go=next 这类假翻页不跟：白敲一次站点一次门，还可能触发风控。"""
     res = load_toc(FakeFetcher({fixtures.BASE_URL: fixtures.normal_html()}), fixtures.BASE_URL, RULES)
     assert res.toc.pages_followed == 1
+    assert res.incomplete is False
 
 
 def test_a_tail_block_with_restarted_numbering_is_still_the_newest():
@@ -741,8 +851,8 @@ def test_handwritten_selector_also_follows_last_page():
     assert result.pages == [fixtures.BASE_URL, fixtures.BASE_URL + "_20.html"]
 
 
-def test_handwritten_selector_falls_back_when_second_page_differs():
-    """第二页结构不同、selector 认不出时退回只用首页，别把整次检查判成解析失败。"""
+def test_handwritten_selector_marks_a_different_second_page_incomplete():
+    """第二页结构不同、selector 认不出时首页仍可解析，但整次目录必须标记不完整。"""
     result = load_toc(FakeFetcher({
         fixtures.BASE_URL: fixtures.paged_first_html(),
         fixtures.BASE_URL + "_20.html": "<html><body><p>这一页没有目录</p></body></html>",
@@ -750,3 +860,4 @@ def test_handwritten_selector_falls_back_when_second_page_differs():
 
     assert result.toc.pages_followed == 1
     assert len(result.toc.chapters) == 60
+    assert result.incomplete is True

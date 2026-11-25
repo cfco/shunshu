@@ -35,6 +35,8 @@ def test_label_prefix_variants_do_not_change_the_key():
 def test_parenthetical_notes_are_dropped_for_matching():
     assert key_for("第120章 风雪夜归人（求月票）") == key_for("第120章 风雪夜归人")
     assert key_for("第120章 风雪夜归人(加更)") == key_for("第120章 风雪夜归人")
+    assert key_for("第120章 风雪夜归人（求推荐票）") == key_for("第120章 风雪夜归人")
+    assert key_for("第120章 风雪夜归人(求推荐票)") == key_for("第120章 风雪夜归人")
 
 
 def test_semantic_parentheses_remain_part_of_chapter_identity():

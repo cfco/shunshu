@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import requests
 
@@ -15,6 +15,8 @@ _HTML_ESSENCE = re.compile(rb"<\s*(?:html|head|body|meta|div|table|dl|ul|p|a)\b"
 
 PROXY_SCHEMES = ("http", "https", "socks5")
 _SOCKS_CONNECTION = re.compile(r"^\s*SOCKS(?:HTTP|HTTPS)?Connection\(", re.I)
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_MAX_REDIRECTS = 30
 
 
 class FetchError(Exception):
@@ -261,13 +263,10 @@ class Fetcher:
             if attempt:
                 # 退避睡的是预算里剩的时间，别越过截止时间
                 time.sleep(min(self.backoff * attempt, max(0.0, deadline - time.monotonic())))
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise self._budget_error()
+            self._check_deadline(deadline)
             received_response = False
             try:
-                resp = self.session.get(url, timeout=min(self.timeout, remaining), stream=True,
-                                        allow_redirects=True, proxies=endpoints)
+                resp = self._get_final_response(url, endpoints, deadline)
                 received_response = True
                 try:
                     if resp.status_code >= 500:
@@ -282,6 +281,7 @@ class Fetcher:
                     body = self._read_capped(resp, deadline)
                 finally:
                     resp.close()
+                self._check_deadline(deadline)
                 ctype = resp.headers.get("Content-Type", "")
                 if body[:2048].strip() and not _HTML_ESSENCE.search(body[:4096]) and "html" not in ctype.lower():
                     raise FetchError(f"响应不是 HTML（Content-Type={ctype or '未知'}），可能是下载链或接口")
@@ -326,6 +326,86 @@ class Fetcher:
             raise ConnectionFailureError(last_error)
         raise FetchError(last_error)
 
+    def _check_deadline(self, deadline: float) -> None:
+        if time.monotonic() >= deadline:
+            raise self._budget_error()
+
+    def _get_response(self, url: str, endpoints: dict[str, str],
+                      deadline: float) -> requests.Response:
+        """在独立线程里等响应头，调用线程到总 deadline 一定退出。"""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise self._budget_error()
+        session = self.session
+        result: dict[str, object] = {}
+        cancelled = threading.Event()
+
+        def request() -> None:
+            try:
+                resp = session.get(url, timeout=min(self.timeout, remaining), stream=True,
+                                   allow_redirects=False, proxies=endpoints)
+                result["resp"] = resp
+                if cancelled.is_set():
+                    resp.close()
+            except BaseException as exc:
+                result["error"] = exc
+
+        worker = threading.Thread(target=request, name="shunshu-headers", daemon=True)
+        worker.start()
+        worker.join(max(0.0, deadline - time.monotonic()))
+        if worker.is_alive():
+            cancelled.set()
+            resp = result.get("resp")
+            close = getattr(resp, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    pass
+            raise self._budget_error()
+        try:
+            self._check_deadline(deadline)
+        except BaseException:
+            resp = result.get("resp")
+            close = getattr(resp, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    pass
+            raise
+        if "error" in result:
+            raise result["error"]
+        return result["resp"]
+
+    def _get_final_response(self, url: str, endpoints: dict[str, str],
+                            deadline: float) -> requests.Response:
+        """手动逐跳跟随重定向；跳转页只关响应，正文留到最终页才限量读取。"""
+        current_url = url
+        for hop in range(_MAX_REDIRECTS + 1):
+            self._check_deadline(deadline)
+            try:
+                resp = self._get_response(current_url, endpoints, deadline)
+            except BaseException:
+                self._check_deadline(deadline)
+                raise
+            try:
+                self._check_deadline(deadline)
+                location = resp.headers.get("Location")
+                if resp.status_code not in _REDIRECT_STATUSES or not location:
+                    return resp
+                if hop == _MAX_REDIRECTS:
+                    raise FetchError(f"重定向超过 {_MAX_REDIRECTS} 次上限")
+                try:
+                    current_url = assert_http_url(urljoin(current_url, location.strip()))
+                except ValueError as exc:
+                    raise FetchError(f"重定向 Location 不是可用的 http(s) 地址: {location!r}") from exc
+            except BaseException:
+                resp.close()
+                raise
+            resp.close()
+        raise AssertionError("不可到达")
+
     def _budget_error(self) -> FetchError:
         """总时限掐断的说法：要和"连不上"一眼分得开，探测不会据此把站推给代理。"""
         return FetchError(f"站点响应太慢：单页累计 {self.url_budget_seconds:g} 秒总时限用尽被掐断"
@@ -334,14 +414,32 @@ class Fetcher:
     def _read_capped(self, resp: requests.Response, deadline: float) -> bytes:
         chunks: list[bytes] = []
         total = 0
-        for chunk in resp.iter_content(chunk_size=65536):
-            # 涓流站每一块都来得比 socket 超时快，单靠 timeout 拦不住，只能逐块对着截止时间算总账
-            if time.monotonic() > deadline:
-                raise self._budget_error()
-            if not chunk:
-                continue
-            chunks.append(chunk)
-            total += len(chunk)
-            if total > self.max_bytes:
-                raise FetchError(f"响应超过 {self.max_bytes} 字节上限，疑似非目录页")
-        return b"".join(chunks)
+
+        def close_at_deadline() -> None:
+            # close 会唤醒阻塞中的 socket 读取；守护线程避免异常 close 卡住进程退出。
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+        watchdog = threading.Timer(max(0.0, deadline - time.monotonic()), close_at_deadline)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            self._check_deadline(deadline)
+            for chunk in resp.iter_content(chunk_size=65536):
+                self._check_deadline(deadline)
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > self.max_bytes:
+                    raise FetchError(f"响应超过 {self.max_bytes} 字节上限，疑似非目录页")
+            self._check_deadline(deadline)
+            return b"".join(chunks)
+        except BaseException:
+            # watchdog 关闭响应可能让 iter_content 抛连接异常，到期时仍统一报总时限。
+            self._check_deadline(deadline)
+            raise
+        finally:
+            watchdog.cancel()

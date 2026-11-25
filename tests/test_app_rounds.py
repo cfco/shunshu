@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import fixtures
 from conftest import FakeFetcher, FakeProc, capture_cards
 
@@ -186,6 +188,26 @@ def test_quit_settles_a_card_swiped_just_before(app_state: AppState, monkeypatch
     app_state.run_round()
     popped[0][2].exited = True          # 用户划过，卡片自己退出了（码 0）
     TrayApp(app_state).act_quit()       # 中间没跑过任何一轮
+    assert AppState(app_state.paths).novels[0].unseen_keys == []
+
+
+def test_quit_absorbs_an_ack_arriving_between_settle_and_close(app_state: AppState, monkeypatch):
+    """第一次收账后卡片才正常退出，close_all 交回的 ack 也必须落盘。"""
+    from shunshu.tray import TrayApp
+
+    popped = capture_cards(monkeypatch)
+    _book_with_one_new_chapter(app_state)
+    app_state.run_round()
+    original_close = app_state.notifier.close_all
+
+    def exit_then_close():
+        popped[0][2].exited = True
+        return original_close()
+
+    monkeypatch.setattr(app_state.notifier, "close_all", exit_then_close)
+    TrayApp(app_state).act_quit()
+
+    assert app_state.novels[0].unseen_keys == []
     assert AppState(app_state.paths).novels[0].unseen_keys == []
 
 
@@ -449,13 +471,60 @@ def test_card_click_flows_through_read_log_into_next_card(app_state: AppState, m
     assert [r["read"] for r in rows] == [False, True, False, False, False]
     assert novel.read_keys == [key62]
     assert AppState(app_state.paths).novels[0].read_keys == novel.read_keys
-    assert app_state.paths.read_log.exists() is False, "吸收完要把 read.jsonl 取走，别重复计数"
+    assert not app_state.paths.read_log.read_bytes(), \
+        "吸收完不能留下记录；保留空文件是为了接住卡片旧句柄的迟写"
 
     fetcher.add(fixtures.BASE_URL, fixtures.normal_html(
         [*fixtures.CHAPTERS, "第61章 读过了", "第62章 刚点开", "第63章 还没看", "第64章 又更新"]))
     app_state.run_round()
     assert novel.read_keys == [key62], "吸收过的记录不能重复追加"
     assert [r["read"] for r in cards[-1]["chapters"]] == [False, False, True, False, False]
+
+
+def test_read_log_is_restored_when_shelf_save_fails(app_state: AppState, monkeypatch):
+    import shunshu.app as app_module
+    from shunshu.store import append_jsonl, load_novels
+
+    novel = app_state.add_novel(fixtures.BASE_URL)
+    app_state.save_novels()
+    key = match_key(61, "第61章 保存失败")
+    append_jsonl(app_state.paths.read_log, {"novel": novel.id, "key": key})
+    original = app_module.save_novels
+    monkeypatch.setattr(app_module, "save_novels",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+
+    with pytest.raises(OSError, match="disk full"):
+        app_state._absorb_read_marks()
+    assert app_state.paths.read_log.read_bytes(), "保存失败后原始已读记录必须可恢复"
+    assert load_novels(app_state.paths)[0].read_keys == []
+
+    monkeypatch.setattr(app_module, "save_novels", original)
+    assert app_state._absorb_read_marks() == 0, "内存已记住，但重试仍必须再次落盘"
+    assert load_novels(app_state.paths)[0].read_keys == [key]
+    assert not app_state.paths.read_log.read_bytes()
+
+
+def test_failed_reload_blocks_writes_until_a_successful_reload(app_state: AppState, monkeypatch):
+    import shunshu.app as app_module
+
+    app_state.add_novel(fixtures.BASE_URL)
+    app_state.save_novels()
+    raw = app_state.paths.novels.read_bytes()
+    original = app_module.load_novels
+    monkeypatch.setattr(app_module, "load_novels",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("read failed")))
+
+    with pytest.raises(OSError, match="read failed"):
+        app_state.reload()
+    with pytest.raises(OSError, match="拒绝覆盖"):
+        app_state.save_novels()
+    with pytest.raises(OSError, match="拒绝覆盖"):
+        app_state.save_config()
+    assert app_state.paths.novels.read_bytes() == raw
+
+    monkeypatch.setattr(app_module, "load_novels", original)
+    app_state.reload()
+    app_state.save_novels()
 
 
 def test_read_state_is_shared_across_sources(app_state: AppState, monkeypatch):

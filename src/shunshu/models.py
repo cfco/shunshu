@@ -413,6 +413,13 @@ class Novel:
         # keep=0 表示一个都不留：[-0:] 会退化成 [0:] 把整份留下来，必须显式清空
         self.alerted_keys = merged[-keep:] if keep > 0 else []
 
+    def mark_baseline(self, keys: list[str], keep: int = 500) -> None:
+        """旧基线只用于去重，不能把最近真正提醒过的章节挤出账本。"""
+        recent = set(self.alerted_keys)
+        baseline = dict.fromkeys(k for k in keys if k not in recent)
+        merged = [*baseline, *self.alerted_keys]
+        self.alerted_keys = merged[-keep:] if keep > 0 else []
+
     def add_to_index(self, entries: list[ChapterEntry], rows: int = 50) -> None:
         """索引只留最近 `rows` 章，新在前；同一章保留最先报它的那个来源。"""
         known = {e.k for e in self.chapter_index}

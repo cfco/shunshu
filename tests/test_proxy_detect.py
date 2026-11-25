@@ -31,14 +31,22 @@ def test_parse_proxy_server_bare_host_port_gets_http_scheme():
     assert parse_proxy_server("127.0.0.1:7890") == ["http://127.0.0.1:7890"]
 
 
-def test_parse_proxy_server_prefixed_mapping_dedupes_same_endpoint_prefers_https():
+def test_parse_proxy_server_target_mapping_uses_http_transport_and_keeps_order():
     raw = "http=127.0.0.1:7890;https=127.0.0.1:7890;socks=127.0.0.1:1080"
-    # 同一 host:port 的 http= / https= 是同一个端口，只留 https 形式（目录页多为 https）；
+    # http=/https= 只映射目标协议，同一端口统一由 HTTP 代理传输，保留先出现的写法。
     # socks= 按 requests 的要求补成 socks5://
     assert parse_proxy_server(raw) == [
-        "https://127.0.0.1:7890",
+        "http://127.0.0.1:7890",
         "socks5://127.0.0.1:1080",
     ]
+    assert parse_proxy_server("https=127.0.0.1:7890;http=127.0.0.1:7890") == [
+        "http://127.0.0.1:7890",
+    ]
+
+
+def test_parse_proxy_server_keeps_explicit_https_url():
+    assert parse_proxy_server("https://127.0.0.1:7890") == ["https://127.0.0.1:7890"]
+    assert parse_proxy_server("https=https://127.0.0.1:7890") == ["https://127.0.0.1:7890"]
 
 
 def test_parse_proxy_server_keeps_full_url_and_dedupes():

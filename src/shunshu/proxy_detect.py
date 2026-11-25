@@ -62,7 +62,7 @@ class ProbeResult:
 
 
 def _endpoint_key(candidate: str) -> tuple[str, int] | None:
-    """按主机名+端口归一：http=/https= 指向同一端口时只探一次（协议差异对 HTTP 代理无意义）。"""
+    """按主机名+端口归一：http=/https= 指向同一端口时只探一次（代理传输协议相同）。"""
     parts = urlsplit(candidate)
     if not parts.hostname:
         return None
@@ -74,14 +74,15 @@ def _endpoint_key(candidate: str) -> tuple[str, int] | None:
 
 
 def parse_proxy_server(raw: str | None) -> list[str]:
-    """把注册表 ProxyServer 的几种写法拆成代理 URL 列表，https 项排在前面（目录页多是 https）。
+    """把注册表 ProxyServer 的几种写法拆成代理 URL 列表，保留书写顺序。
 
     支持的形态：
       "127.0.0.1:7890"
       "http=127.0.0.1:7890;https=127.0.0.1:7890"
       "http://127.0.0.1:7890"
-    已带协议名的原样保留；裸 host:port 按 HTTP 代理补协议。空白与非法项丢弃。
-    同一 host:port 的多个写法只保留一个（优先 https 形式）。
+    http=/https= 指定的是目标协议，不是代理传输协议；裸端点统一按 HTTP 代理补协议。
+    socks= 补 socks5://，显式完整 URL 原样保留。空白与非法项丢弃。
+    同一 host:port 的多个写法只保留先出现的一个。
     """
     text = (raw or "").strip()
     if not text:
@@ -94,9 +95,9 @@ def parse_proxy_server(raw: str | None) -> list[str]:
         scheme, sep, rest = item.partition("=")
         if sep and scheme.lower() in _PREFIXED:
             item = rest.strip()
-            # 注册表写 socks= 时 requests 只认 socks5（本机 socks5 代理占绝大多数）
-            scheme = "socks5" if scheme.lower() == "socks" else scheme.lower()
             if "://" not in item:
+                # 前缀只映射目标协议；只有 socks= 表示代理传输协议
+                scheme = "socks5" if scheme.lower() == "socks" else "http"
                 item = f"{scheme}://{item}"
         elif "://" in item:
             pass  # 已带协议，交给末尾的 hostname 校验
@@ -106,8 +107,6 @@ def parse_proxy_server(raw: str | None) -> list[str]:
             continue  # "=8080" 这种既无协议前缀又不是合法 host:port 的畸形项
         if urlsplit(item).hostname:
             pending.append(item)
-    # https= 与 http= 指向同一端口时，让 https 形式先试
-    pending.sort(key=lambda p: 0 if p.startswith("https://") else 1)
     return _dedupe_by_endpoint(pending)
 
 

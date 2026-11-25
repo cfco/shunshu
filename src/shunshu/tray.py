@@ -308,8 +308,9 @@ class TrayApp:
     def act_quit(self, icon=None, item=None) -> None:
         self.scheduler.stop()
         self.state.settle_card_acks()     # 先收「已经划过」的账，再收窗口
-        # 还挂着的卡片一起收掉：留着就是没人认领的窗口，下次启动会按「没看过」补弹
-        self.notifier.close_all()
+        # 还挂着的卡片一起收掉；这中间正常退出的 ack 由 close_all 交回，不能随账本一起清掉
+        acked = self.notifier.close_all()
+        self.state.settle_card_acks(acked)
         if self.icon is not None:
             self.icon.stop()
 
@@ -548,7 +549,12 @@ class TrayApp:
 
     def run(self) -> None:
         if not acquire_singleton():
-            self._flash("顺手已经在运行", "托盘里已有一个实例，这次不再重复启动")
+            # 第二个实例弹卡会占 0 号槽，盖住原实例的更新卡；只留日志，日志坏了也静默退出
+            try:
+                append_text(self.state.paths.runtime_log,
+                            f"{now_stamp()} 顺手已经在运行，本次启动退出")
+            except (OSError, UnicodeError):
+                pass
             return
         autostart.repair_if_drifted()
         self._log_tray_backend()

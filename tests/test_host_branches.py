@@ -60,6 +60,28 @@ def test_xdg_autostart_detects_drift(linux_autostart, tmp_path):
     assert linux_autostart.needs_repair() is False
 
 
+@pytest.mark.parametrize("subcommand,include_delay,drifted", [
+    ("run", False, True),       # 旧命令缺少 --boot-delay=60
+    ("serve", True, True),      # 子命令写错
+    ("run", True, False),       # 当前完整命令
+])
+def test_xdg_autostart_compares_all_arguments(linux_autostart, subcommand,
+                                               include_delay, drifted):
+    exe, _args = linux_autostart._command_parts()
+    args = ["-m", "shunshu", subcommand]
+    if include_delay:
+        args.append(linux_autostart.BOOT_DELAY_ARG)
+    entry = " ".join(linux_autostart._desktop_quote(part) for part in [exe, *args])
+    desktop = linux_autostart.autostart_file()
+    desktop.parent.mkdir(parents=True)
+    desktop.write_text(linux_autostart._desktop_text(entry), encoding="utf-8")
+
+    assert linux_autostart.needs_repair() is drifted
+    assert linux_autostart.repair_if_drifted() is drifted
+    assert linux_autostart.read_entry() == linux_autostart.current_command()
+    assert linux_autostart.needs_repair() is False
+
+
 def test_linux_command_quotes_a_path_with_spaces(linux_autostart, monkeypatch, tmp_path):
     """Exec 不是 shell：带空格的解释器路径必须用 Desktop Entry 的双引号规则。"""
     interpreter = tmp_path / "my python"
@@ -98,8 +120,11 @@ def test_windows_entry_path_reads_quoted_exe(monkeypatch):
 
     monkeypatch.setattr(autostart, "IS_WINDOWS", True)
     entry = r'"C:\Program Files\shunshu\pythonw.exe" -m shunshu run'
+    assert autostart._entry_parts(entry) == (
+        Path(r"C:\Program Files\shunshu\pythonw.exe"), ["-m", "shunshu", "run"])
     assert autostart._entry_path(entry) == Path(r"C:\Program Files\shunshu\pythonw.exe")
-    assert autostart._entry_path(r"C:\a\pythonw.exe -m shunshu run") == Path(r"C:\a\pythonw.exe")
+    assert autostart._entry_parts(r"C:\a\pythonw.exe -m shunshu run") == (
+        Path(r"C:\a\pythonw.exe"), ["-m", "shunshu", "run"])
 
 
 # ---------- 剪贴板：Linux 借道会话里的命令行工具 ----------

@@ -53,6 +53,8 @@ class AppState:
         # 避免同一个来源被两条线程同时抓、状态互相覆盖。与 AppState._lock 分开：
         # 本锁跨网络请求持有，_lock 只保护数据结构
         self._round_lock = threading.Lock()
+        self._config_writable = False
+        self._novels_writable = False
         self.last_alerts: list[NovelAlert] = []
         # 整个进程共用一个 Notifier：卡片槽位是按「最近 12.5 秒里占了几个位置」算的，
         # 每轮新建一份就等于每轮都从 0 开始数，托盘回执与更新卡全挤在同一个位置
@@ -99,9 +101,19 @@ class AppState:
         with self._round_lock:
             with self._lock:
                 LAST_LOAD_WARNINGS.clear()
-                self._cfg = load_config()
-                self._rules = self._cfg.compiled()
-                self._novels = load_novels(self.paths)
+                try:
+                    cfg = load_config()
+                    rules = cfg.compiled()
+                    novels = load_novels(self.paths)
+                except BaseException:
+                    self._config_writable = False
+                    self._novels_writable = False
+                    raise
+                self._cfg = cfg
+                self._rules = rules
+                self._novels = novels
+                self._config_writable = True
+                self._novels_writable = True
                 old_fetcher = getattr(self, "_fetcher", None)
                 self._fetcher = Fetcher(
                     user_agent=self._cfg.user_agent,
@@ -122,10 +134,14 @@ class AppState:
 
     def save_novels(self) -> None:
         with self._lock:
+            if not self._novels_writable:
+                raise OSError("书架上次加载失败，拒绝覆盖原文件；请先成功重新加载配置")
             save_novels(self.paths, self._novels)
 
     def save_config(self) -> None:
         with self._lock:
+            if not self._config_writable:
+                raise OSError("配置上次加载失败，拒绝覆盖原文件；请先成功重新加载配置")
             save_config(self._cfg)
 
     def add_novel(self, url: str) -> Novel:
@@ -194,7 +210,7 @@ class AppState:
             source = novel.source(source_ident) if novel else None
             if source is not None:
                 novel.primary_id = source.id
-                save_novels(self.paths, self._novels)
+                self.save_novels()
             return source
 
     def set_source_enabled(self, novel_ident: str, source_ident: str, enabled: bool) -> Source | None:
@@ -203,7 +219,7 @@ class AppState:
             source = novel.source(source_ident) if novel else None
             if source is not None:
                 source.enabled = enabled
-                save_novels(self.paths, self._novels)
+                self.save_novels()
             return source
 
     def set_novel_enabled(self, ident: str, enabled: bool) -> Novel | None:
@@ -212,13 +228,13 @@ class AppState:
             if novel is not None:
                 for source in novel.sources:
                     source.enabled = enabled
-                save_novels(self.paths, self._novels)
+                self.save_novels()
             return novel
 
     def set_poll_minutes(self, value: int | str) -> None:
         with self._lock:
             self._cfg.poll_minutes = value
-            save_config(self._cfg)
+            self.save_config()
 
     # ---------- 已读标记 ----------
 
@@ -233,7 +249,7 @@ class AppState:
             if novel is None or key in novel.read_keys:
                 return False
             self._remember_read(novel, key)
-            save_novels(self.paths, self._novels)
+            self.save_novels()
             return True
 
     def _remember_read(self, novel: Novel, key: str) -> None:
@@ -250,30 +266,33 @@ class AppState:
 
     def _absorb_read_marks(self) -> int:
         """卡片进程把点开过的章节写进 data/read.jsonl，这里吸收进书架。调用方需已持锁。"""
-        records = drain_jsonl(self.paths.read_log)
-        if not records:
-            return 0
-        by_id = {n.id: n for n in self._novels}
         changed = 0
-        for record in records:
-            novel = by_id.get(str(record.get("novel") or ""))
-            key = str(record.get("key") or "")
-            if novel is None or not key or key in novel.read_keys:
-                continue
-            self._remember_read(novel, key)
-            changed += 1
-        if changed:
-            save_novels(self.paths, self._novels)
+
+        def commit(records: list[dict]) -> None:
+            nonlocal changed
+            by_id = {n.id: n for n in self._novels}
+            for record in records:
+                novel = by_id.get(str(record.get("novel") or ""))
+                key = str(record.get("key") or "")
+                if novel is None or not key or key in novel.read_keys:
+                    continue
+                self._remember_read(novel, key)
+                changed += 1
+            # 保存失败时 drain 会保留主文件中的记录；重试时即使内存已记住也要再次保存，
+            # 不能因 changed=0 而跳过落盘，把恢复出来的记录再次消费掉。
+            self.save_novels()
+
+        drain_jsonl(self.paths.read_log, commit=commit, cross_process=True)
         return changed
 
-    def settle_card_acks(self) -> int:
-        """托盘退出前主动收一次：刚划过卡片就点退出，别等下一轮、更别下次启动再弹一遍。"""
+    def settle_card_acks(self, acked: dict[str, set[str]] | None = None) -> int:
+        """主动收 ack；也可吸收 close_all 在关机竞态中已经收好的那批。"""
         with self._lock:
-            return self._absorb_card_acks()
+            return self._absorb_card_acks(acked)
 
     def _save_novels_safely(self) -> None:
         try:
-            save_novels(self.paths, self._novels)
+            self.save_novels()
         except OSError as exc:
             try:
                 append_text(self.paths.runtime_log,
@@ -281,14 +300,15 @@ class AppState:
             except OSError:
                 pass
 
-    def _absorb_card_acks(self) -> int:
+    def _absorb_card_acks(self, acked: dict[str, set[str]] | None = None) -> int:
         """卡片被鼠标划过或被点掉就是「看过了」：把这本书的补弹账清掉。
 
         谁还挂在屏幕上只有 `Notifier` 知道（它攥着卡片进程句柄），所以每轮去收一次；
         被新章顶掉、被封顶淘汰的那些不算看过，收回来的是空的。
         """
         with self._lock:
-            acked = self.notifier.take_acked_chapters()
+            if acked is None:
+                acked = self.notifier.take_acked_chapters()
             if not acked:
                 return 0
             changed = 0
@@ -322,7 +342,7 @@ class AppState:
                     alert.novel.unseen_keys = merged[:_UNSEEN_KEEP]
                     changed += 1
             if changed and save:
-                save_novels(self.paths, self._novels)
+                self.save_novels()
 
     def _notify(self, alerts: list[NovelAlert]) -> None:
         pending = self.pending_unseen_alerts()
@@ -395,7 +415,7 @@ class AppState:
                 return ProbeResult(proxy=current, probed=False)
             if not force and remembered is not None:
                 source.proxy = remembered
-                save_novels(self.paths, self._novels)
+                self.save_novels()
                 return ProbeResult(proxy=remembered, probed=False)
             user_agent = self._cfg.user_agent
             max_bytes = self._cfg.max_response_bytes
@@ -413,8 +433,8 @@ class AppState:
             self._cfg.site_proxies[host] = result.proxy
             if source is not None:
                 source.proxy = result.proxy
-            save_config(self._cfg)
-            save_novels(self.paths, self._novels)
+            self.save_config()
+            self.save_novels()
         return result
 
     def _reprobe_dead_proxies(self, outcomes: list[Outcome]) -> None:

@@ -32,6 +32,7 @@ class LoadResult:
     dropped: list[DroppedLink] = field(default_factory=list)
     container_selector: str = ""
     pages: list[str] = field(default_factory=list)
+    incomplete: bool = False
 
 
 def load_toc(fetcher: Fetcher, toc_url: str, rules: Rules, selector: str | None = None,
@@ -47,17 +48,18 @@ def load_toc(fetcher: Fetcher, toc_url: str, rules: Rules, selector: str | None 
     base_html = html if html is not None else fetcher.fetch_html(toc_url, proxy)
     page = parse_page(base_html, toc_url, rules)
     pages: list[tuple[str, Container]] = []
+    incomplete = False
     if selector:
         # 手写 selector 也要跟末页：分页站的最新章节就在最后一页，只敲首页永远看不到
         first = container_by_selector(page, selector)
         pages.append((toc_url, first))
-        followed = _follow_last_page(fetcher, page, first, rules, proxy,
-                                     select=lambda second: container_by_selector(second, selector),
-                                     paths=paths)
+        followed, incomplete = _follow_last_page(
+            fetcher, page, first, rules, proxy,
+            select=lambda second: container_by_selector(second, selector), paths=paths)
     else:
         first = pick_container(page, rules)
         pages.append((toc_url, first))
-        followed = _follow_last_page(fetcher, page, first, rules, proxy, paths=paths)
+        followed, incomplete = _follow_last_page(fetcher, page, first, rules, proxy, paths=paths)
     if followed:
         pages.append(followed)
 
@@ -81,39 +83,34 @@ def load_toc(fetcher: Fetcher, toc_url: str, rules: Rules, selector: str | None 
         pages_followed=len(pages),
     )
     return LoadResult(toc=toc, dropped=dropped, container_selector=pages[0][1].selector,
-                      pages=[url for url, _ in pages])
+                      pages=[url for url, _ in pages], incomplete=incomplete)
 
 
 def _follow_last_page(fetcher: Fetcher, page, container: Container, rules: Rules,
                       proxy: str = "", select=None, paths=None):
-    """跟末页/最大数字页那一页，拿不到或认不出就当没有第二页，不影响首页结果。
-
-    select 给手写 selector 的分支用（第二页仍按同一个 selector 取容器）；
-    默认按首页容器的目录前缀自动打分。paths 给记日志用（拿不到末页时留一行）。
-    """
+    """返回（末页容器, 是否不完整）；没有末页与预期末页失败必须分开。"""
     if rules.cfg.max_pages_followed < 1:
-        return None
+        return None, False
     last_url, numeric = find_page_urls(page, rules, container)
     if last_url is None and len(numeric) >= 2:
         last_url = numeric[-1][1]
     if not last_url:
-        return None
+        return None, False
     try:
         html = fetcher.fetch_html(last_url, proxy)
     except Exception as exc:
-        # 分页页拿不到不影响主流程，首页章节照常参与去重。但要留一行日志：
-        # 光看结果分不清「站点本来就没分页」和「那一页抓挂了」，排障全靠这行
+        # 分页页拿不到不影响首页解析，但整次目录不完整，监控层不能据此覆盖旧进度
         if paths is not None:
             from .store import append_text, now_stamp
 
             append_text(paths.runtime_log,
-                        f"{now_stamp()} [末页跟进] {last_url} 没抓到，按单页目录继续: "
+                        f"{now_stamp()} [末页跟进] {last_url} 没抓到，目录结果不完整: "
                         f"{type(exc).__name__}: {exc}")
-        return None
+        return None, True
     second = parse_page(html, last_url, rules)
     try:
         found = select(second) if select is not None else pick_container(
             second, rules, prefer_prefix=container.modal_prefix)
     except TocDetectError:
-        return None
-    return (last_url, found)
+        return None, True
+    return (last_url, found), False
